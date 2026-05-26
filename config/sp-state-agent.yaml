@@ -1,0 +1,33 @@
+mode: prod
+
+gateway:
+  port: 3000
+  client_token: ${CLIENT_TOKEN}         # Single token (backward compat); or use api_keys below
+  # api_keys:                           # Multi-key support (M3 prep, takes precedence over client_token)
+  #   - key: "sk-user1-xxx"
+  #     name: "user1"
+  #     wallet: "f1abc..."              # Filecoin wallet (M3 settlement)
+  #   - key: "sk-user2-yyy"
+  #     name: "user2"
+  #     wallet: "f1def..."
+  request_timeout_sec: 300              # Timeout for proxied requests to workers (covers model switch ~150s)
+  queue_timeout_sec: 60                 # Max seconds to wait when all workers are mining
+  max_queue_size: 100                   # Max queued requests; 0 = unlimited
+  model_switch_load_factor: 2.0         # Trigger model switch when active_requests > gpu_count * this; 0 = disabled
+  request_log_path: /data/requests.jsonl # Persistent request log for billing (M3 prep)
+
+workers:
+  poll_interval_sec: 5
+  offline_timeout_sec: 30
+  offline_fail_threshold: 3
+
+admin:
+  port: 9091
+  token: ${AGENT_ADMIN_TOKEN}
+
+logging:
+  level: info
+  format: json
+
+metrics:
+  enabled: true
