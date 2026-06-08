@@ -1,0 +1,36 @@
+services:
+  sp-gateway:
+    build: ./sp-state-agent
+    container_name: openmodel-sp-gateway
+    ports:
+      - "3000:3000"   # OpenAI-compatible API gateway
+      - "9091:9091"   # Admin API + Prometheus metrics
+    environment:
+      - CONFIG_PATH=/etc/openmodel/sp-state-agent.yaml
+      - CLIENT_TOKEN=${CLIENT_TOKEN}
+      - AGENT_ADMIN_TOKEN=${AGENT_ADMIN_TOKEN}
+      - DATA_DIR=/data
+    volumes:
+      - ./config:/etc/openmodel:ro
+      - ./data/state-agent:/data
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          cpus: "1.0"
+          memory: 512m
+        reservations:
+          cpus: "0.1"
+          memory: 64m
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:9091/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "50m"
+        max-file: "3"
