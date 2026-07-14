@@ -3,10 +3,10 @@ mode: prod
 gateway:
   port: 3000
   client_token: ${CLIENT_TOKEN}         # Single token (backward compat); or use api_keys below
-  # api_keys:                           # Multi-key support (M3 prep, takes precedence over client_token)
+  # api_keys:                           # Multi-key support (takes precedence over client_token)
   #   - key: "sk-user1-xxx"
   #     name: "user1"
-  #     wallet: "f1abc..."              # Filecoin wallet (M3 settlement)
+  #     wallet: "f1abc..."              # Filecoin wallet (for settlement)
   #   - key: "sk-user2-yyy"
   #     name: "user2"
   #     wallet: "f1def..."
@@ -14,7 +14,12 @@ gateway:
   queue_timeout_sec: 60                 # Max seconds to wait when all workers are mining
   max_queue_size: 100                   # Max queued requests; 0 = unlimited
   model_switch_load_factor: 2.0         # Trigger model switch when active_requests > gpu_count * this; 0 = disabled
-  request_log_path: /data/requests.jsonl # Persistent request log for billing (M3 prep)
+  request_log_path: /data/requests.jsonl # Persistent request log for billing
+  # Abuse controls. All optional; omit/0 = that dimension is unlimited.
+  # rate_per_sec_per_key: 20      # sustained requests/sec per API key (token bucket)
+  # rate_burst_per_key: 40        # max instantaneous burst; default = ceil(rate)
+  # max_concurrent_per_key: 16    # max simultaneous in-flight requests per API key
+  # max_request_bytes: 10485760   # max request body size in bytes (default 10 MiB)
 
 workers:
   poll_interval_sec: 5
@@ -24,6 +29,32 @@ workers:
 admin:
   port: 9091
   token: ${AGENT_ADMIN_TOKEN}
+
+# Public, read-only SP earnings query port. Separate from the admin API (:9091) so
+# exposing it never exposes the admin token's powers (register/settle/pause). Serves
+# ONLY GET /api/v1/sp-earnings-detail/:sp — read-only, no auth, and carries NO client
+# identity (no wallet/api-key). Rate-limited (each call scans the request log).
+# Plain HTTP is acceptable for an invite-only small-amount trial; front with a TLS reverse proxy
+# before exposing to untrusted networks at scale. Requires settlement.enabled.
+# Port 3001 sits next to the client gateway (3000) as the other public-facing port; the
+# code default (9092) is avoided in practice because Prometheus commonly binds it.
+public_query:
+  enabled: true
+  port: 3001
+  rate_per_sec: 20      # global sustained requests/sec; 0 = default 20
+  rate_burst: 40        # token-bucket burst; 0 = 2×rate
+
+# SP fraud-detection sampling. Retains a small fraction of requests
+# (prompt / response / claimed model / token counts) as offline audit evidence
+# (replay comparison, capability probes, composition-anomaly analysis).
+# sample_rate=0 disables it entirely (zero overhead).
+# Note: retained samples contain user content — assess privacy and retention
+# before enabling in production.
+verification:
+  sample_rate: 0          # fraction 0~1; 0 = off. Suggested 0.01~0.05 in production
+  sample_log_path: ""     # JSONL path; empty = off. e.g. /data/verify-samples.jsonl
+  sample_max_mb: 50       # per-file rotation threshold (MB); 0 = default 50
+  sample_backups: 5       # rotated files kept; 0 = default 5
 
 logging:
   level: info

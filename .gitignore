@@ -1,0 +1,8 @@
+/sp-state-agent
+chainctl
+*.test
+.env
+*.key
+data/
+.DS_Store
+release/*.tar*

@@ -1,0 +1,178 @@
+# Prometheus alerting rules for the OpenModel sp-gateway (M3 production).
+#
+# Load via prometheus.yml:
+#   rule_files:
+#     - /etc/prometheus/openmodel-alerts.yml
+#
+# Metrics are exposed at the admin API :9091 /metrics (keep that port on the
+# internal network only). Tune thresholds to your fleet size and settlement
+# interval before going live.
+groups:
+  - name: openmodel-fund-safety
+    rules:
+      # Dead-letter queue is the single most important fund-correctness signal:
+      # records here are billable usage whose SP payout address is unknown, so the
+      # SP is not being paid. A sustained non-zero value means sp_address_map is
+      # missing an entry.
+      - alert: SettlementDeadLetterBacklog
+        expr: openmodel_settlement_deadletter_entries > 0
+        for: 15m
+        labels: {severity: critical}
+        annotations:
+          summary: "Settlement dead-letter queue is non-empty ({{ $value }} records)"
+          description: "Billable records cannot be resolved to an SP payout address. Check sp_address_map and worker MinerAddress registration."
+
+      # Every request-log write failure is a served request that was NOT recorded for
+      # billing (revenue loss) — almost always disk-full or an IO error on the request
+      # log volume. Page immediately.
+      - alert: RequestLogWriteErrors
+        expr: increase(openmodel_request_log_write_errors_total[10m]) > 0
+        for: 1m
+        labels: {severity: critical}
+        annotations:
+          summary: "Request/billing records are being dropped ({{ $value }} in 10m)"
+          description: "logRequest write failures — served requests are not being billed. Check disk space and IO on the request-log volume immediately."
+
+      # The settlement operator pays gas for every batch. If it runs dry, ALL
+      # settlement halts and revenue stops being collected on-chain.
+      - alert: OperatorGasLow
+        expr: openmodel_settlement_operator_balance_low == 1
+        for: 5m
+        labels: {severity: critical}
+        annotations:
+          summary: "Settlement operator gas balance below minimum"
+          description: "Operator FIL balance is below operator_min_balance_fil ({{ $value }}). Top up the operator wallet or settlement will stall."
+
+      # A pending WAL stuck set for a long time means a settlement cycle was
+      # interrupted and replay/RBF is not completing (e.g. tx perpetually stuck).
+      - alert: SettlementWALStuck
+        expr: openmodel_settlement_pending_wal == 1
+        for: 30m
+        labels: {severity: critical}
+        annotations:
+          summary: "Settlement write-ahead-log stuck for >30m"
+          description: "An interrupted settlement is not completing. Check RPC connectivity, operator gas, and settlement logs."
+
+      # Stuck (timed-out) settlement transactions indicate gas-price or RPC issues.
+      - alert: SettlementTxStuckRate
+        expr: increase(openmodel_settlement_tx_total{result="stuck"}[1h]) > 3
+        for: 5m
+        labels: {severity: warning}
+        annotations:
+          summary: "Multiple stuck settlement transactions in the last hour"
+          description: "{{ $value }} settlement txs timed out unmined in 1h. RBF should bump them, but check FEVM gas market and RPC."
+
+      # Reverted settlement transactions should essentially never happen (the
+      # contract is designed to skip bad items, not revert the batch).
+      - alert: SettlementTxReverted
+        expr: increase(openmodel_settlement_tx_total{result="reverted"}[1h]) > 0
+        labels: {severity: critical}
+        annotations:
+          summary: "An on-chain settlement transaction reverted"
+          description: "A settlement batch reverted on-chain. Investigate immediately — this can block the WAL."
+
+      # Reorged settlement transactions are re-submitted automatically (dedup-safe),
+      # but a high rate indicates chain instability worth watching.
+      - alert: SettlementTxReorged
+        expr: increase(openmodel_settlement_tx_total{result="reorged"}[1h]) > 2
+        for: 5m
+        labels: {severity: warning}
+        annotations:
+          summary: "Settlement transactions reorged away repeatedly"
+          description: "{{ $value }} settlement txs were reorged before finality in 1h. They re-submit automatically, but check chain stability / raise confirmation_depth."
+
+      # FIL price stale → settlement is deferred, so revenue is not being collected
+      # and the balance gate is using an old conversion rate.
+      - alert: FILPriceStale
+        expr: openmodel_settlement_fil_price_stale == 1
+        for: 20m
+        labels: {severity: warning}
+        annotations:
+          summary: "FIL price is stale; settlement is deferred"
+          description: "All price sources have been failing. Settlement is paused to avoid mis-billing. Check CoinGecko/Binance reachability or switch to manual price."
+
+      # Stablecoin depeg: the token has drifted outside its peg band. Settlement
+      # stops collecting it and it stops counting toward spendable credit until it
+      # re-pegs; operators may want to top up FIL or notify users to switch tokens.
+      - alert: StablecoinDepegged
+        expr: openmodel_settlement_stablecoin_depegged == 1
+        for: 5m
+        labels: {severity: critical}
+        annotations:
+          summary: "Stablecoin {{ $labels.symbol }} is depegged"
+          description: "{{ $labels.symbol }} price is outside its peg band; it is excluded from settlement collection and spendable credit. Deduction falls through to FIL. Verify the depeg is real (check the price feed) before acting."
+
+      # Growing carried debt = users consuming service their balance cannot cover.
+      - alert: CarriedDebtHigh
+        expr: openmodel_settlement_debt_usd > 100
+        for: 30m
+        labels: {severity: warning}
+        annotations:
+          summary: "Carried under-funded debt exceeds $100"
+          description: "Outstanding debt is {{ $value }} USD. Review the balance gate / min-balance buffer; consider tightening credit limits."
+
+  - name: openmodel-availability
+    rules:
+      # All workers mining/offline for a sustained period = the network is serving
+      # nothing. Brief windows are normal (WinningPoSt); a long one is not.
+      - alert: NoServableWorkers
+        expr: (sum(openmodel_workers_total{state="idle"}) + sum(openmodel_workers_total{state="busy"})) == 0
+        for: 5m
+        labels: {severity: critical}
+        annotations:
+          summary: "No idle/busy workers available"
+          description: "Every worker is mining, loading, or offline for >5m. Inference requests are queuing or failing."
+
+      - alert: WorkerOffline
+        expr: openmodel_workers_total{state="offline"} > 0
+        for: 10m
+        labels: {severity: warning}
+        annotations:
+          summary: "{{ $value }} worker(s) offline for >10m"
+          description: "A worker has missed its health polls. Check the worker host and scheduler."
+
+      - alert: GatewayQueueSaturated
+        expr: openmodel_gateway_queued_requests > 50
+        for: 5m
+        labels: {severity: warning}
+        annotations:
+          summary: "Gateway request queue saturated ({{ $value }} waiting)"
+          description: "Many requests are waiting for an available worker. Capacity may be insufficient or the fleet is mining-heavy."
+
+      - alert: GatewayErrorRateHigh
+        expr: |
+          sum(rate(openmodel_gateway_requests_total{status=~"5.."}[5m]))
+            / clamp_min(sum(rate(openmodel_gateway_requests_total[5m])), 1) > 0.05
+        for: 10m
+        labels: {severity: warning}
+        annotations:
+          summary: "Gateway 5xx error rate above 5%"
+          description: "More than 5% of proxied requests are failing with 5xx over the last 5m."
+
+      - alert: AbuseRejectionsSpike
+        expr: increase(openmodel_gateway_ratelimit_rejected_total[5m]) > 100
+        for: 5m
+        labels: {severity: info}
+        annotations:
+          summary: "Spike in rate-limit/abuse rejections"
+          description: "{{ $value }} requests rejected by per-key limits in 5m. Could be a misbehaving client or an attack."
+
+  - name: openmodel-reconciliation
+    rules:
+      # Billed-vs-settled drift is the end-to-end billing-correctness check.
+      - alert: ReconcileDriftHigh
+        expr: openmodel_reconcile_drift_usd > 1
+        for: 1m
+        labels: {severity: critical}
+        annotations:
+          summary: "Billing reconciliation drift exceeds $1"
+          description: "Billed (request log) vs settled (on-chain) totals diverge by {{ $value }} USD. Investigate for lost or double settlement."
+
+      # If reconciliation stops running, drift can build unnoticed.
+      - alert: ReconcileStale
+        expr: time() - openmodel_reconcile_last_timestamp_seconds > 7200
+        for: 5m
+        labels: {severity: warning}
+        annotations:
+          summary: "Reconciliation has not run in >2h"
+          description: "The three-way reconciliation job appears stuck. Check the gateway reconcile goroutine / admin endpoint."

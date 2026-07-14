@@ -1,0 +1,121 @@
+# ============================================================================
+# PRODUCTION / MAINNET config template for sp-gateway.
+#
+# Every SECRET is read from an environment variable (interpolated at load), so no
+# secret is ever written into this file. Fill the <PLACEHOLDER> values (chain- and
+# deployment-specific) before starting. Key-custody + deploy procedure:
+# see your key-custody runbook.
+#
+# mode: prod makes the gateway REFUSE to start if admin.token or client auth is empty
+# (fail-closed, G1). Never run mainnet with auth disabled.
+# ============================================================================
+mode: prod
+
+gateway:
+  port: 3000
+  # Client API keys. The `key` values are SECRETS — inject via env, never inline.
+  # Each key binds to a funding wallet used for billing. Self-registration (/v1/register)
+  # can also add keys at runtime.
+  api_keys:
+    - key: ${CLIENT_KEY_1}
+      name: client1
+      wallet: "<CLIENT_1_EVM_WALLET>"
+  request_timeout_sec: 300        # covers 8-GPU model switch (~150s)
+  queue_timeout_sec: 60
+  max_queue_size: 100
+  model_switch_load_factor: 2.0
+  request_log_path: /data/requests.jsonl
+  request_log_max_mb: 50
+  request_log_backups: 10          # retention (max_mb × backups) must exceed one settlement cycle of traffic
+  # Abuse controls — set to your tier limits.
+  rate_per_sec_per_key: 20
+  rate_burst_per_key: 40
+  max_concurrent_per_key: 16
+  max_request_bytes: 10485760      # 10 MiB
+
+workers:
+  poll_interval_sec: 5
+  offline_fail_threshold: 5        # WAN: tolerate transient blips before marking offline (#3)
+  poll_timeout_sec: 10             # WAN: higher RTT/jitter than LAN (#3); keep < poll_interval_sec
+
+admin:
+  port: 9091
+  token: ${AGENT_ADMIN_TOKEN}      # SECRET via env. :9091 MUST stay bound to internal/loopback only.
+
+# Public read-only SP earnings query (optional). If exposed to untrusted networks, front
+# with a TLS reverse proxy (it is plain HTTP itself).
+public_query:
+  enabled: true
+  port: 3001
+  rate_per_sec: 20
+  rate_burst: 40
+
+# SP fraud-detection sampling. Off by default; if enabled on mainnet, use
+# sample_rate 0.01~0.05 and point sample_log_path at a persistent volume.
+# Retained samples contain user content — assess privacy and retention before
+# enabling (rotation max_mb×backups bounds how long they live).
+verification:
+  sample_rate: ${VERIFY_SAMPLE_RATE:-0}
+  sample_log_path: ${VERIFY_SAMPLE_PATH:-}
+  sample_max_mb: 50
+  sample_backups: 5
+
+logging:
+  level: info
+  format: json
+
+metrics:
+  enabled: true
+
+settlement:
+  enabled: true
+  # ---- chain ----
+  # ankr measured markedly more reliable than glif for read calls on mainnet
+  # (glif intermittently returns empty eth_call bodies, which read as zero
+  # balances); a 30s health monitor rotates to the next endpoint on failure.
+  rpc_url: ${FEVM_RPC_URL:-https://rpc.ankr.com/filecoin}     # primary FEVM RPC (tried first)
+  rpc_urls:                                                   # failover endpoints
+    - https://api.node.glif.io/rpc/v1
+  chain_id: 314                                               # 314 = mainnet
+  contract_address: "<MAINNET_SETTLEMENT_CONTRACT>"           # deploy OpenModelSettlement to mainnet first, then fill
+  operator_private_key: ${OPERATOR_PRIVATE_KEY}               # HOT operator key via env/KMS — NEVER inline
+  confirmation_depth: 5                                       # mainnet finality / reorg safety
+  # ---- cadence + timing ----
+  interval_minutes: 60
+  max_batch_size: 100
+  # Contract-side (not here): deploy the contract with refundDelaySec >= interval
+  # (60min = 3600s) + margin, e.g. 7200 (2h), so a user cannot refund a balance BEFORE
+  # settlement has collected it. This is a constructor arg to OpenModelSettlement.
+  # ---- pricing ----
+  fil_price_source: auto           # coingecko→binance; isImplausiblePrice guards bad/flash values.
+                                   # For a small trial, `manual` + a documented update cadence is also fine.
+  fil_price_usd: "3.0"             # seed/fallback value; auto overrides when it succeeds
+  model_prices_usd:
+    default: "0.60"                # USD per 1M tokens (output/base) — set your real prices
+  model_catalog:
+    default: {input: "0.20", cache_read: "0.05", context_window: 32768, max_output: 4096}
+  # ---- tokens ----
+  supported_tokens:
+    - {symbol: USDC, address: "<MAINNET_USDC_ADDRESS>", decimals: 6}   # real mainnet USDC; confirm decimals/behaviour first
+    - {symbol: FIL, address: "0x0000000000000000000000000000000000000000", decimals: 18}
+  deduction_priority: [USDC, FIL]
+  # ---- stablecoin depeg protection ----
+  stablecoin_symbol: USDC              # the USD-pegged token to monitor
+  stablecoin_price_sources: [coingecko, binance]  # empty = pin at $1 (no monitoring)
+  stablecoin_depeg_bps: 200            # >2% off $1 → depegged: excluded from settlement AND
+                                       # spendable credit (symmetric), cost falls through to FIL.
+                                       # Within band the real (off-peg) price is used so the SP
+                                       # is never under-paid. Alert: StablecoinDepegged.
+  stablecoin_price_refresh_sec: 300
+  balance_refresh_sec: 15
+  default_max_tokens: 512
+  # ---- credit limits (bound per-wallet exposure) ----
+  operator_min_balance_fil: "1.0"          # gas floor; OperatorBalanceLow alerts below this
+  max_pending_spend_fil: "<PER_WALLET_CAP>" # cap a wallet's unsettled spend to your tier economics
+  debt_suspend_usd: "1.0"                   # suspend a wallet once outstanding debt exceeds this USD
+  # ---- reconciliation ----
+  reconcile_interval_minutes: 30
+  reconcile_tolerance_usd: "0.01"
+  # ---- miner → EVM payout map ----
+  sp_address_map:
+    "<MINER_ADDRESS>": "<SP_EVM_PAYOUT_ADDRESS>"

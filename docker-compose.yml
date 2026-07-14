@@ -1,0 +1,43 @@
+services:
+  sp-gateway:
+    image: openmodel-sp-gateway:latest
+    container_name: openmodel-sp-gateway
+    ports:
+      - "3000:3000"   # OpenAI-compatible API gateway
+      - "9091:9091"   # Admin API + Prometheus metrics
+      - "3001:3001"   # Public read-only queries (receipt-proof / SP earnings)
+    environment:
+      - CONFIG_PATH=/etc/openmodel/sp-state-agent.yaml
+      - CLIENT_TOKEN=${CLIENT_TOKEN}
+      - AGENT_ADMIN_TOKEN=${AGENT_ADMIN_TOKEN}
+      - DATA_DIR=/data
+      - OPERATOR_PRIVATE_KEY=${OPERATOR_PRIVATE_KEY:-}
+    volumes:
+      - ./config:/etc/openmodel:ro
+      - ./data/state-agent:/data
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          cpus: "1.0"
+          # 2g (was 512m): the 24h full-perturbation soak OOM-killed the gateway 10× at
+          # 512m — peak request-handling working set ~469MB (150-burst + long streams +
+          # 10MB bodies) plus full-request-log scans (reconcile every 30min, receipt-proof
+          # per audit call) over ~500MB of retained logs spike past 512MB. Self-healing
+          # (auto-restart) but each is a brief outage + makes receipt-proof audits flaky.
+          memory: 2g
+        reservations:
+          cpus: "0.1"
+          memory: 128m
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:9091/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "50m"
+        max-file: "3"
