@@ -12,7 +12,10 @@ For the inference API (`/v1/chat/completions`, streaming, model routing) see **i
 
 A user self-registers an API key bound to their own EVM wallet — usage on that key is then billed and settled to that wallet. Wallet ownership is proven by an **Ethereum signature**, so nobody can register with someone else's address (which would bill that person).
 
-**`POST /v1/register`** (port 3000, no existing key required — this is the self-service entry point)
+**`POST /v1/register`** — no existing key required; this is the self-service entry
+point. It is served on every listener the gateway exposes (the plain API port and,
+when configured, the TLS port that also serves the web UI), so use whichever
+address the operator published.
 
 Request body:
 ```json

@@ -32,27 +32,39 @@ A trial instance is live for hands-on experience:
 
 | Endpoint | Purpose |
 |---|---|
-| `http://36.189.235.195:18019` | OpenAI-compatible API + self-service registration (`/v1/register`) |
-| `http://36.189.235.195:18020` | Public read-only queries: billing proofs (`/api/v1/receipt-proof/…`), SP earnings |
+| `https://36.189.235.195:18020` | **Everything, encrypted** — OpenAI-compatible API, self-service registration, the web chat UI, and public billing queries, all on one origin |
+| `http://36.189.235.195:18019` | The same API in plaintext, for clients that cannot be pointed at a private CA |
+
+> **Why `-k`.** The trial serves TLS from a private CA, so clients that verify the
+> chain need `-k` (curl), `verify=False` (requests), or the CA file. Prefer passing
+> the CA over disabling verification wherever your client allows it —
+> `verify-receipt.py` (contracts repo) takes `--ca <ca.crt>`. The plaintext port
+> stays open for clients that cannot do either; a public-CA domain removes the
+> choice entirely in a later phase.
 
 ```bash
 # 1. Register: prove wallet ownership with an EIP-191 signature, get an API key
-#    (message format and a signing example: docs/settlement-api.md §1)
-curl -X POST http://36.189.235.195:18019/v1/register \
+#    (exact message bytes + an ethers signing example: docs/settlement-api.md,
+#     section "Registration: getting an API key")
+curl -k -X POST https://36.189.235.195:18020/v1/register \
   -H "Content-Type: application/json" \
   -d '{"wallet":"0x…","issued_at":<unix seconds>,"signature":"0x…"}'
 
-# 2. Deposit a SMALL amount of FIL from that wallet to the settlement contract
-#    on Filecoin MAINNET: 0x1BB694BD2759eC88Bc04595D9677cb1065fa7D1f
-#    (depositFIL(); this is real FIL — without a deposit, billable calls return 402)
+# 2. Deposit a SMALL amount from that wallet to the settlement contract on
+#    Filecoin MAINNET: 0x465d979675d401295C529e15dC9187c9b92ed4d1
+#      FIL   — depositFIL(), payable
+#      USDFC — approve() on 0x80B98d3aa09ffff255c3ba4A241111Ff1262F045, then depositToken()
+#    This is real money. Without a deposit, billable calls return 402. A USDFC
+#    balance is spent before FIL, so a stablecoin deposit keeps your credit's
+#    purchasing power fixed while FIL's floats with the exchange rate.
 
-# 3. Call the API with your key
-curl http://36.189.235.195:18019/v1/chat/completions \
+# 3. Call the API with your key  (<model> = a model id from GET /v1/models; the "default" alias is not accepted)
+curl -k https://36.189.235.195:18020/v1/chat/completions \
   -H "Authorization: Bearer sk-om-…" -H "Content-Type: application/json" \
-  -d '{"model":"default","messages":[{"role":"user","content":"hi"}],"max_tokens":32}'
+  -d '{"model":"<model>","messages":[{"role":"user","content":"hi"}],"max_tokens":32}'
 
 # 4. Audit any charge: take request_id from the X-Om-Receipt response header, then
-curl http://36.189.235.195:18020/api/v1/receipt-proof/<request_id>
+curl -k https://36.189.235.195:18020/api/v1/receipt-proof/<request_id>
 ```
 
 > ⚠️ **Trial limitations.** This is an early, incomplete version of the
@@ -111,7 +123,7 @@ curl -X POST http://localhost:9091/api/v1/workers/register \
 # 5. Use it
 curl http://localhost:3000/v1/chat/completions \
   -H "Authorization: Bearer $CLIENT_TOKEN" -H "Content-Type: application/json" \
-  -d '{"model":"default","messages":[{"role":"user","content":"hi"}],"max_tokens":32}'
+  -d '{"model":"<model>","messages":[{"role":"user","content":"hi"}],"max_tokens":32}'
 ```
 
 Settlement is **off by default**. To enable it, set `settlement.enabled: true`
@@ -169,7 +181,7 @@ in the config, and provide `OPERATOR_PRIVATE_KEY`. Details and every endpoint:
 |---|---|
 | Contract repo | [openmodel-contracts](https://github.com/6block/openmodel-contracts) v1.0.0 |
 | Filecoin Calibration | `0x83c264c95e7Ad4b30Caa5Bc60e75E317bf109E4F` |
-| Filecoin Mainnet | `0x1BB694BD2759eC88Bc04595D9677cb1065fa7D1f` (trial: fee 0%) |
+| Filecoin Mainnet | `0x465d979675d401295C529e15dC9187c9b92ed4d1` (trial: fee 0%) |
 
 The contract is non-upgradeable; the gateway pins its interface internally. A
 contract change means a new address and a new gateway release.
