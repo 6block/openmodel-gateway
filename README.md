@@ -51,7 +51,7 @@ curl -k -X POST https://36.189.235.195:18020/v1/register \
   -d '{"wallet":"0x…","issued_at":<unix seconds>,"signature":"0x…"}'
 
 # 2. Deposit a SMALL amount from that wallet to the settlement contract on
-#    Filecoin MAINNET: 0x465d979675d401295C529e15dC9187c9b92ed4d1
+#    Filecoin MAINNET: 0x60D41baEaBe1ABE061AE82c44425debc35bA524A
 #      FIL   — depositFIL(), payable
 #      USDFC — approve() on 0x80B98d3aa09ffff255c3ba4A241111Ff1262F045, then depositToken()
 #    This is real money. Without a deposit, billable calls return 402. A USDFC
@@ -179,12 +179,18 @@ in the config, and provide `OPERATOR_PRIVATE_KEY`. Details and every endpoint:
 
 | | |
 |---|---|
-| Contract repo | [openmodel-contracts](https://github.com/6block/openmodel-contracts) v1.0.0 |
-| Filecoin Calibration | `0x83c264c95e7Ad4b30Caa5Bc60e75E317bf109E4F` |
-| Filecoin Mainnet | `0x465d979675d401295C529e15dC9187c9b92ed4d1` (trial: fee 0%) |
+| Contract repo | [openmodel-contracts](https://github.com/6block/openmodel-contracts) v1.3.0 |
+| Filecoin Calibration | `0x97a3d202CfF60dD369cdf8F7D514dAe36b469852` |
+| Filecoin Mainnet | `0x60D41baEaBe1ABE061AE82c44425debc35bA524A` (trial: fee 0%) |
 
 The contract is non-upgradeable; the gateway pins its interface internally. A
-contract change means a new address and a new gateway release.
+contract change means a new address and a new gateway release. The addresses
+above are the ones the hosted trial settles against — they run contract v1.3,
+whose `submitSettlement` carries per-batch request/token counts. **This release
+targets the previous contract interface**; point a self-hosted gateway from this
+tag at a v1.2-era deployment, and use the upcoming release for v1.3. Deposits,
+balances and billing are unaffected either way — only the settlement call
+differs.
 
 ## API documentation
 
