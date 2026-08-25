@@ -6,6 +6,10 @@ package metrics
 
 import "github.com/prometheus/client_golang/prometheus"
 
+// Version labels the openmodel_agent_info metric. Overridden at build time:
+//   go build -ldflags "-X openmodel/sp-state-agent/internal/metrics.Version=v2.1.0"
+var Version = "dev"
+
 var (
 	WorkersGauge = prometheus.NewGaugeVec(prometheus.GaugeOpts{
 		Name: "openmodel_workers_total",
@@ -306,5 +310,5 @@ func init() {
 		VerificationSamplesRetained,
 		VerificationSampleWriteErrors,
 	)
-	AgentInfo.WithLabelValues("v0.2.0").Set(1)
+	AgentInfo.WithLabelValues(Version).Set(1)
 }

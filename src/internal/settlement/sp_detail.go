@@ -24,17 +24,17 @@ import (
 
 // SPRequestEarning is one inference request attributed to an SP.
 type SPRequestEarning struct {
-	RequestID     string    `json:"request_id"`
-	Timestamp     time.Time `json:"timestamp"`
-	Model         string    `json:"model"`
-	TotalTokens   int       `json:"total_tokens"`
-	PromptTokens  int       `json:"prompt_tokens"`
-	CachedTokens  int       `json:"cached_tokens"`
-	EarningUSD    string    `json:"earning_usd"`
-	Settled       bool      `json:"settled"`
-	TxHash        string    `json:"tx_hash,omitempty"`
-	DetailsHash   string    `json:"details_hash,omitempty"`
-	BlockNumber   uint64    `json:"block_number,omitempty"`
+	RequestID    string    `json:"request_id"`
+	Timestamp    time.Time `json:"timestamp"`
+	Model        string    `json:"model"`
+	TotalTokens  int       `json:"total_tokens"`
+	PromptTokens int       `json:"prompt_tokens"`
+	CachedTokens int       `json:"cached_tokens"`
+	EarningUSD   string    `json:"earning_usd"`
+	Settled      bool      `json:"settled"`
+	TxHash       string    `json:"tx_hash,omitempty"`
+	DetailsHash  string    `json:"details_hash,omitempty"`
+	BlockNumber  uint64    `json:"block_number,omitempty"`
 }
 
 // SPEarningsDetailResult is the full response for one SP's per-request earnings.
@@ -44,15 +44,15 @@ type SPRequestEarning struct {
 // full request log + the whole items ledger (>90s at soak scale). All-time settled
 // totals come from GET /api/v1/revenue/<sp> (dedicated cumulative store, instant).
 type SPEarningsDetailResult struct {
-	SP              string             `json:"sp"`
-	PlatformFeeBps  int64              `json:"platform_fee_bps"`
-	Scope           string             `json:"scope"` // always "returned_items" (self-documenting)
-	TotalEarningUSD string             `json:"total_earning_usd"`
-	SettledEarningUSD string           `json:"settled_earning_usd"`
-	PendingEarningUSD string           `json:"pending_earning_usd"`
-	SettledCount    int                `json:"settled_count"`
-	PendingCount    int                `json:"pending_count"`
-	Items           []SPRequestEarning `json:"items"`
+	SP                string             `json:"sp"`
+	PlatformFeeBps    int64              `json:"platform_fee_bps"`
+	Scope             string             `json:"scope"` // always "returned_items" (self-documenting)
+	TotalEarningUSD   string             `json:"total_earning_usd"`
+	SettledEarningUSD string             `json:"settled_earning_usd"`
+	PendingEarningUSD string             `json:"pending_earning_usd"`
+	SettledCount      int                `json:"settled_count"`
+	PendingCount      int                `json:"pending_count"`
+	Items             []SPRequestEarning `json:"items"`
 }
 
 // SPEarningsDetail returns the per-request earnings for one SP (by EVM address).
@@ -79,6 +79,7 @@ func (s *Settler) SPEarningsDetail(spEVM string, sinceUnix int64, limit int, fee
 	// Refresh worker→SP from the live registry so attribution matches settlement.
 	if s.resolver != nil {
 		s.aggregator.UpdateWorkerSPMap(s.resolver.GetWorkerSPMap())
+		s.refreshMinerPayoutMap()
 	}
 
 	res := SPEarningsDetailResult{SP: spEVM, PlatformFeeBps: feeBps, Scope: "returned_items"}

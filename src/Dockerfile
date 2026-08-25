@@ -8,6 +8,7 @@ RUN go mod download
 COPY . .
 RUN CGO_ENABLED=0 go build -o /sp-state-agent cmd/agent/main.go
 RUN CGO_ENABLED=0 go build -o /merkle-migrate cmd/merkle-migrate/main.go
+RUN CGO_ENABLED=0 go build -o /settlement-cli cmd/settlement-cli/main.go
 
 FROM alpine:3.19
 
@@ -16,6 +17,7 @@ RUN apk add --no-cache ca-certificates
 WORKDIR /app
 COPY --from=builder /sp-state-agent /app/sp-state-agent
 COPY --from=builder /merkle-migrate /app/merkle-migrate
+COPY --from=builder /settlement-cli /app/settlement-cli
 
 RUN mkdir -p /data
 

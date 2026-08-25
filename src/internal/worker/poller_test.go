@@ -26,7 +26,7 @@ func TestPollerFetchGPUState(t *testing.T) {
 	registry := NewRegistry(logger, "")
 	poller := NewPoller(registry, time.Second, 3, logger)
 
-	state, _, err := poller.fetchGPUState(context.Background(), server.URL, "")
+	state, _, err := poller.fetchGPUState(context.Background(), "w-test", server.URL, "")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -49,7 +49,7 @@ func TestPollerFetchInferenceHealth(t *testing.T) {
 	registry := NewRegistry(logger, "")
 	poller := NewPoller(registry, time.Second, 3, logger)
 
-	engineState, activeReqs, model, _, _, _, err := poller.fetchInferenceHealth(context.Background(), server.URL, "")
+	engineState, activeReqs, model, _, _, _, err := poller.fetchInferenceHealth(context.Background(), "w-test", server.URL, "")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -170,7 +170,7 @@ func TestFetchGPUStateParsesUntilChange(t *testing.T) {
 		fmt.Fprintln(w, "ready, seconds_until_change=287, gpu_state=GPU_STATE_AVAILABLE")
 	}))
 	defer newFmt.Close()
-	state, until, err := newPoller(t).fetchGPUState(context.Background(), newFmt.URL, "")
+	state, until, err := newPoller(t).fetchGPUState(context.Background(), "w-test", newFmt.URL, "")
 	if err != nil || state != "GPU_STATE_AVAILABLE" || until != 287 {
 		t.Fatalf("new format: state=%q until=%d err=%v", state, until, err)
 	}
@@ -179,7 +179,7 @@ func TestFetchGPUStateParsesUntilChange(t *testing.T) {
 		fmt.Fprintln(w, "ready, gpu_state=GPU_STATE_WINNING_POST")
 	}))
 	defer oldFmt.Close()
-	state, until, err = newPoller(t).fetchGPUState(context.Background(), oldFmt.URL, "")
+	state, until, err = newPoller(t).fetchGPUState(context.Background(), "w-test", oldFmt.URL, "")
 	if err != nil || state != "GPU_STATE_WINNING_POST" || until != -1 {
 		t.Fatalf("old format: state=%q until=%d err=%v", state, until, err)
 	}

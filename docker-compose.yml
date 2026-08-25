@@ -3,18 +3,28 @@ services:
     image: openmodel-sp-gateway:latest
     container_name: openmodel-sp-gateway
     ports:
-      - "3000:3000"   # OpenAI-compatible API gateway
-      - "9091:9091"   # Admin API + Prometheus metrics
-      - "3001:3001"   # Public read-only queries (receipt-proof / SP earnings)
+      - "3000:3000"             # OpenAI-compatible API gateway
+      - "127.0.0.1:9091:9091"   # Admin API + Prometheus metrics — operator-only; NEVER expose publicly
+      - "3001:3001"             # Public read-only queries (receipt-proof / SP earnings / network-stats)
+      - "3002:3002"             # TLS listener (sp_registration.https_port): worker direction + web UI; used by the mainnet template
     environment:
+      # Default config. For the mainnet template, change to
+      # /etc/openmodel/sp-state-agent-mainnet.yaml — and fill its ${VARS} below.
       - CONFIG_PATH=/etc/openmodel/sp-state-agent.yaml
       - CLIENT_TOKEN=${CLIENT_TOKEN}
+      - CLIENT_KEY_1=${CLIENT_KEY_1:-}
       - AGENT_ADMIN_TOKEN=${AGENT_ADMIN_TOKEN}
       - DATA_DIR=/data
       - OPERATOR_PRIVATE_KEY=${OPERATOR_PRIVATE_KEY:-}
+      - VERIFY_SAMPLE_RATE=${VERIFY_SAMPLE_RATE:-0}
+      - VERIFY_SAMPLE_PATH=${VERIFY_SAMPLE_PATH:-}
     volumes:
       - ./config:/etc/openmodel:ro
       - ./data/state-agent:/data
+      # CA + gateway certs for SP self-registration / worker mTLS (mainnet
+      # template). Create ./mtls and place ca.crt/ca.key + the gateway pair
+      # there before enabling sp_registration.
+      - ./mtls:/etc/openmodel-mtls:ro
     extra_hosts:
       - "host.docker.internal:host-gateway"
     restart: unless-stopped

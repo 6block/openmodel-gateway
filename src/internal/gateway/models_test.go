@@ -42,8 +42,8 @@ func TestHandleModels(t *testing.T) {
 	if !ids["Qwen/Qwen2.5-3B-Instruct"] {
 		t.Error("expected the worker's loaded model listed in /v1/models")
 	}
-	if !ids["default"] {
-		t.Error("expected 'default' to be injected into /v1/models")
+	if ids["default"] {
+		t.Error("'default' must NOT be advertised — clients request exact model ids now")
 	}
 }
 

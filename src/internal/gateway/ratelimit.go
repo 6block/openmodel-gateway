@@ -55,7 +55,7 @@ func (b *tokenBucket) allowAt(now time.Time) bool {
 
 // keyLimiter holds the per-key rate bucket and concurrency counter.
 type keyLimiter struct {
-	bucket  *tokenBucket
+	bucket   *tokenBucket
 	inFlight int
 }
 

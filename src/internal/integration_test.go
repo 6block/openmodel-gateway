@@ -213,7 +213,7 @@ func TestIntegration_StreamRewrite(t *testing.T) {
 
 	// Send request with stream: true — gateway should rewrite to false
 	resp, err := http.Post(gwServer.URL+"/v1/chat/completions", "application/json",
-		bytes.NewBufferString(`{"model":"default","messages":[{"role":"user","content":"test"}],"stream":true}`))
+		bytes.NewBufferString(`{"model":"model","messages":[{"role":"user","content":"test"}],"stream":true}`))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -235,7 +235,7 @@ func TestIntegration_StreamRewrite(t *testing.T) {
 
 func postChat(t *testing.T, baseURL, content string) *http.Response {
 	t.Helper()
-	body := fmt.Sprintf(`{"model":"default","messages":[{"role":"user","content":"%s"}],"max_tokens":10}`, content)
+	body := fmt.Sprintf(`{"model":"Qwen/Qwen2.5-3B-Instruct","messages":[{"role":"user","content":"%s"}],"max_tokens":10}`, content)
 	resp, err := http.Post(baseURL+"/v1/chat/completions", "application/json",
 		bytes.NewBufferString(body))
 	if err != nil {

@@ -30,6 +30,20 @@ type candidate struct {
 // the overloaded worker. Set to 0 to disable.
 //
 // Returns ErrNoWorkerAvailable if no suitable Worker is found.
+// workerVerifiedFor reports whether model appears in w's verified list
+// (normalized matching, same rules as loaded-model matching).
+func workerVerifiedFor(w *worker.Worker, model string) bool {
+	if model == "" {
+		return false
+	}
+	for _, vm := range w.VerifiedModels {
+		if modelMatches(vm, model) || modelMatches(model, vm) {
+			return true
+		}
+	}
+	return false
+}
+
 func selectWorkerForModel(registry *worker.Registry, model string, exclude map[string]bool, overloadFactor ...float64) (*worker.Worker, error) {
 	workers := registry.List()
 
@@ -48,6 +62,25 @@ func selectWorkerForModel(registry *worker.Registry, model string, exclude map[s
 		// different worker — so a transient mid-flight yield stays transparent.
 		if w.State != worker.StateIdle && w.State != worker.StateBusy {
 			continue
+		}
+		// Banned workers stay polled (state visible) but get no inference tasks
+		// until the ban expires — the routing half of the misbehavior punishment.
+		if w.IsBanned() {
+			continue
+		}
+		// Probe admission gate: for self-registered workers, routing trusts only
+		// the EVIDENCE-BACKED verified_models list — supported_models is the
+		// claim, verified_models is the proof. A freshly-registered worker with
+		// nothing verified yet receives no traffic until its first admission
+		// probe passes (minutes). Operator-registered workers are exempt.
+		if registry.AdmissionGateEnabled() && w.SelfRegistered {
+			if isDefault {
+				if !workerVerifiedFor(&w, w.LoadedModel) {
+					continue
+				}
+			} else if !workerVerifiedFor(&w, model) {
+				continue
+			}
 		}
 		if exclude != nil && exclude[w.ID] {
 			continue
@@ -159,6 +192,22 @@ func modelMatches(loadedModel, requestedModel string) bool {
 	return false
 }
 
+// canonicalModelID collapses the two ways the same model reaches the gateway —
+// the worker's local weight path ("/models/Qwen--Qwen2.5-3B-Instruct") and the
+// HuggingFace id it also reports ("Qwen/Qwen2.5-3B-Instruct") — onto the
+// HuggingFace form. Routing already treats them as one (modelMatches); without
+// the same collapse in the listing, /v1/models returned both and the model
+// picker showed the same model twice.
+func canonicalModelID(m string) string {
+	base := filepath.Base(m)
+	if strings.Contains(base, "--") {
+		return strings.Replace(base, "--", "/", 1)
+	}
+	// Already an id like "Qwen/Qwen2.5-3B-Instruct": filepath.Base would drop the
+	// org prefix, so keep the string as it came.
+	return m
+}
+
 // workerSupportsModel checks if the requested model is in the worker's supported_models list.
 func workerSupportsModel(w *worker.Worker, model string) bool {
 	for _, m := range w.SupportedModels {
@@ -253,4 +302,28 @@ func computeWeight(w *worker.Worker) float64 {
 		weight *= yieldSoonPenalty
 	}
 	return weight
+}
+
+// routableModels is the set of models THIS worker can actually serve a request
+// for right now: loaded ∪ supported, filtered by the admission gate's verified
+// list for self-registered workers when the gate is on. This is the single
+// caliber the model listing and the catalog must share with the router — a
+// model shown to users but not routable (or vice versa) is a lie in one
+// direction or the other.
+func routableModels(w *worker.Worker, gateOn bool) []string {
+	cand := []string{}
+	if w.LoadedModel != "" {
+		cand = append(cand, w.LoadedModel)
+	}
+	cand = append(cand, w.SupportedModels...)
+	if !gateOn || !w.SelfRegistered {
+		return cand
+	}
+	out := cand[:0]
+	for _, m := range cand {
+		if workerVerifiedFor(w, m) {
+			out = append(out, m)
+		}
+	}
+	return out
 }

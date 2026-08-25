@@ -45,10 +45,10 @@ func TestPollSendsWorkerToken(t *testing.T) {
 	}))
 	defer hlt.Close()
 	p := newPoller(t)
-	if _, _, err := p.fetchGPUState(context.Background(), rdy.URL, "wtok"); err != nil {
+	if _, _, err := p.fetchGPUState(context.Background(), "w-test", rdy.URL, "wtok"); err != nil {
 		t.Fatal(err)
 	}
-	if _, _, _, _, _, _, err := p.fetchInferenceHealth(context.Background(), hlt.URL, "wtok"); err != nil {
+	if _, _, _, _, _, _, err := p.fetchInferenceHealth(context.Background(), "w-test", hlt.URL, "wtok"); err != nil {
 		t.Fatal(err)
 	}
 	if readyAuth != "Bearer wtok" {
@@ -62,7 +62,7 @@ func TestPollSendsWorkerToken(t *testing.T) {
 func TestFetchGPUState_Non200(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { w.WriteHeader(503) }))
 	defer srv.Close()
-	if _, _, err := newPoller(t).fetchGPUState(context.Background(), srv.URL, ""); err == nil {
+	if _, _, err := newPoller(t).fetchGPUState(context.Background(), "w-test", srv.URL, ""); err == nil {
 		t.Error("expected error on non-200 /ready")
 	}
 }
@@ -72,7 +72,7 @@ func TestFetchGPUState_Malformed(t *testing.T) {
 		fmt.Fprintln(w, "ready but no gpu state field")
 	}))
 	defer srv.Close()
-	if _, _, err := newPoller(t).fetchGPUState(context.Background(), srv.URL, ""); err == nil {
+	if _, _, err := newPoller(t).fetchGPUState(context.Background(), "w-test", srv.URL, ""); err == nil {
 		t.Error("expected error on /ready missing gpu_state=")
 	}
 }
@@ -80,7 +80,7 @@ func TestFetchGPUState_Malformed(t *testing.T) {
 func TestFetchInferenceHealth_Non200(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { w.WriteHeader(500) }))
 	defer srv.Close()
-	if _, _, _, _, _, _, err := newPoller(t).fetchInferenceHealth(context.Background(), srv.URL, ""); err == nil {
+	if _, _, _, _, _, _, err := newPoller(t).fetchInferenceHealth(context.Background(), "w-test", srv.URL, ""); err == nil {
 		t.Error("expected error on non-200 /health")
 	}
 }
@@ -90,7 +90,7 @@ func TestFetchInferenceHealth_DecodeError(t *testing.T) {
 		fmt.Fprintln(w, "{ not valid json")
 	}))
 	defer srv.Close()
-	if _, _, _, _, _, _, err := newPoller(t).fetchInferenceHealth(context.Background(), srv.URL, ""); err == nil {
+	if _, _, _, _, _, _, err := newPoller(t).fetchInferenceHealth(context.Background(), "w-test", srv.URL, ""); err == nil {
 		t.Error("expected JSON decode error")
 	}
 }
@@ -102,7 +102,7 @@ func TestFetchInferenceHealth_MultiGPU(t *testing.T) {
 		fmt.Fprintln(w, `{"status":"ok","engine_state":"running","active_requests":2,"loaded_model":"m","multi_gpu":{"engine_count":8}}`)
 	}))
 	defer srv.Close()
-	es, ar, lm, ec, _, _, err := newPoller(t).fetchInferenceHealth(context.Background(), srv.URL, "")
+	es, ar, lm, ec, _, _, err := newPoller(t).fetchInferenceHealth(context.Background(), "w-test", srv.URL, "")
 	if err != nil {
 		t.Fatal(err)
 	}

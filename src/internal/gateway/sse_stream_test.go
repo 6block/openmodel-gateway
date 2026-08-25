@@ -27,8 +27,8 @@ func feedSSE(chunks ...string) *sseCaptureWriter {
 // usage-bearing SSE event (OpenAI streams usage in the last data frame).
 func TestSSEUsageExtractedFromFinalChunk(t *testing.T) {
 	w := feedSSE(
-		`data: {"choices":[{"delta":{"content":"hi"}}]}` + "\n\n",
-		`data: {"choices":[{"delta":{}}],"usage":{"prompt_tokens":12,"completion_tokens":8,"total_tokens":20}}` + "\n\n",
+		`data: {"choices":[{"delta":{"content":"hi"}}]}`+"\n\n",
+		`data: {"choices":[{"delta":{}}],"usage":{"prompt_tokens":12,"completion_tokens":8,"total_tokens":20}}`+"\n\n",
 		"data: [DONE]\n\n",
 	)
 	if w.usage.TotalTokens != 20 || w.usage.PromptTokens != 12 || w.usage.CompletionTokens != 8 {
@@ -55,8 +55,8 @@ func TestSSECachedTokensParsed(t *testing.T) {
 // stream_interrupted and NOT bill it.
 func TestSSEErrorEventDetected(t *testing.T) {
 	w := feedSSE(
-		`data: {"choices":[{"delta":{"content":"partial"}}]}` + "\n\n",
-		`data: {"error":{"message":"Engine paused during generation","type":"server_error"}}` + "\n\n",
+		`data: {"choices":[{"delta":{"content":"partial"}}]}`+"\n\n",
+		`data: {"error":{"message":"Engine paused during generation","type":"server_error"}}`+"\n\n",
 	)
 	if w.streamError == "" {
 		t.Fatal("mid-stream error event should be detected")
@@ -88,7 +88,7 @@ func TestSSEMalformedJSONIgnored(t *testing.T) {
 		"data: {not json at all\n\n",
 		": this is a comment line\n\n",
 		"\n\n",
-		`data: {"usage":{"total_tokens":}}` + "\n\n", // broken JSON with usage marker
+		`data: {"usage":{"total_tokens":}}`+"\n\n", // broken JSON with usage marker
 	)
 	if w.usage.TotalTokens != 0 {
 		t.Errorf("malformed usage must not be counted, got %d", w.usage.TotalTokens)

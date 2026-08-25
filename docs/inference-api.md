@@ -6,6 +6,11 @@ The OpenModel Gateway provides an **OpenAI-compatible API** that routes inferenc
 
 **Base URL:** `http://<gateway-host>:3000`
 
+**Hosted mainnet deployment (alpha):** `https://openmodel.filfox.info` —
+publicly-trusted certificate, also serves the web UI and the public billing
+queries on the same origin. Get a key via self-registration (settlement-api.md,
+"Registration & API keys") and fund the wallet before calling.
+
 **Authentication:** All requests require a Bearer token in the `Authorization` header.
 
 ```
@@ -36,7 +41,7 @@ curl http://<host>:3000/v1/chat/completions \
   -H "Authorization: Bearer $CLIENT_TOKEN" \
   -H "Content-Type: application/json" \
   -d '{
-    "model": "default",
+    "model": "Qwen/Qwen3-4B-Instruct-2507",
     "messages": [
       {"role": "system", "content": "You are a helpful assistant."},
       {"role": "user", "content": "What is Filecoin?"}
@@ -52,7 +57,7 @@ curl http://<host>:3000/v1/chat/completions \
 {
   "id": "cmpl-abc123",
   "object": "chat.completion",
-  "model": "default",
+  "model": "Qwen/Qwen3-4B-Instruct-2507",
   "choices": [
     {
       "index": 0,
@@ -93,7 +98,7 @@ Returns the list of available models across all active Workers.
 
 | Parameter | Supported | Notes |
 |-----------|:---------:|-------|
-| `model` | Yes | Use `"default"` or the full model name (e.g. `"Qwen/Qwen2.5-1.5B-Instruct"`) |
+| `model` | Yes | A specific model id from `GET /v1/models` (e.g. `"Qwen/Qwen3-4B-Instruct-2507"`). The `"default"` alias is **not accepted** — it returns 400 |
 | `messages` | Yes | Standard chat message array |
 | `max_tokens` | Yes | |
 | `temperature` | Yes | 0.0 - 2.0 |
@@ -115,7 +120,7 @@ SSE streaming is fully supported. Set `"stream": true` to receive token-by-token
 curl -N http://<host>:3000/v1/chat/completions \
   -H "Authorization: Bearer $CLIENT_TOKEN" \
   -H "Content-Type: application/json" \
-  -d '{"model":"default","messages":[{"role":"user","content":"Hello"}],"max_tokens":100,"stream":true}'
+  -d '{"model":"Qwen/Qwen3-4B-Instruct-2507","messages":[{"role":"user","content":"Hello"}],"max_tokens":100,"stream":true}'
 ```
 
 Each chunk is an SSE event:
@@ -134,7 +139,7 @@ To display readable streaming output in terminal:
 curl -sN http://<host>:3000/v1/chat/completions \
   -H "Authorization: Bearer $CLIENT_TOKEN" \
   -H "Content-Type: application/json" \
-  -d '{"model":"default","messages":[{"role":"user","content":"Hello"}],"max_tokens":100,"stream":true}' \
+  -d '{"model":"Qwen/Qwen3-4B-Instruct-2507","messages":[{"role":"user","content":"Hello"}],"max_tokens":100,"stream":true}' \
   | python3 -c "
 import sys, json
 for line in sys.stdin:
@@ -146,6 +151,64 @@ print()
 "
 ```
 
+### Streaming receipts (opt-in)
+
+Non-streaming responses carry the worker-signed billing receipt in the
+`X-Om-Receipt` header (settlement-api.md §2.2). A streaming response cannot use a
+trailer, so the receipt arrives as a dedicated SSE event instead — but only when
+the client asks for it, by sending the header:
+
+```
+X-OM-Receipt-Req: 1
+```
+
+The gateway then forwards one extra event before `[DONE]`:
+
+```
+data: {"om_receipt": {"v":1, "request_id":"…", "model":"…", "request_sha256":"…", "response_sha256":"…", "prompt_tokens":…, "completion_tokens":…, "cached_tokens":…, "ts":…, "pubkey":"…", "sig":"…"}}
+```
+
+Without the header the event is stripped and the stream is byte-identical to
+plain OpenAI SSE — existing clients parse nothing new. Verification of the
+receipt (five offline checks against the on-chain batch) is described in
+settlement-api.md §2.2.
+
+### Thinking mode (opt-in)
+
+Reasoning-capable models (Qwen3-8B, Qwen3-32B-AWQ, Qwen3.8-27B-FP8,
+openai/gpt-oss-20b) can think before answering. Off by default — answers,
+latency and bills stay unchanged unless a request opts in:
+
+```json
+{"model": "Qwen/Qwen3.8-27B-FP8", "enable_thinking": true, "messages": [...]}
+```
+
+(`"chat_template_kwargs": {"enable_thinking": true}` is accepted as the
+OpenAI-ecosystem spelling of the same switch. Models without a thinking
+template silently ignore both.)
+
+With thinking on, the reasoning arrives separated from the answer, matching the
+convention used across OpenAI-compatible reasoning APIs:
+
+- **Non-streaming**: `choices[0].message.reasoning_content` carries the chain
+  of thought; `content` stays clean.
+- **Streaming**: deltas carry `reasoning_content` first, then `content`.
+
+Billing: reasoning tokens are generated tokens — they are billed as output at
+the model's normal rate, and a thinking answer can cost several times a direct
+one. The signed receipt hashes the raw generated text (reasoning included), so
+verifiability is unchanged.
+
+**One case surfaces `reasoning_content` even with thinking off.** `gpt-oss-20b`
+reasons on every request — its template has no off switch — so by default that
+reasoning is withheld and only the answer is returned. If `max_tokens` runs out
+*before* any answer text exists, withholding it too would return an entirely
+empty response for tokens you are billed for. Instead the reasoning is
+returned in `reasoning_content` with `content: ""` and `finish_reason:
+"length"` — read that pair as "raise `max_tokens`" (256 is a sane floor for
+reasoning models). Requests that do produce an answer are unaffected: the
+reasoning stays hidden unless you asked for it.
+
 ---
 
 ## Model Names
@@ -154,17 +217,18 @@ The following model names all route to the same backend:
 
 | Model Name | Example |
 |-----------|---------|
-| `default` | Always routes to whatever model is loaded; may be removed in a future version |
-| Full HuggingFace ID | `Qwen/Qwen2.5-1.5B-Instruct` |
-| Local path | `/models/Qwen--Qwen2.5-1.5B-Instruct` |
+| `default` | **Not accepted** — the gateway returns 400 (`a specific model id is required`); pick a name from `GET /v1/models` |
+| Full HuggingFace ID | `Qwen/Qwen3-4B-Instruct-2507` |
+| Local path | `/models/Qwen--Qwen3-4B-Instruct-2507` |
 
-Only `"default"` (or an omitted model) falls back to any available worker; **a named model that no worker has loaded or supports returns 404** (verified 2026-07-07 — the behavior since model-aware routing landed; this doc previously claimed unknown names were silently rewritten to `default`, which is stale):
+A missing or `"default"` model returns **400** (the request must name a model); a named model that no worker has loaded or supports returns **404**:
 
 ```json
 {"error":{"message":"no worker supports model \"gpt-nonexistent\"","type":"gateway_error"}}
 ```
 
-> Why no silent rewrite anymore: it would hide client-side model-name typos and make the model actually served/billed differ from the one requested. The authoritative list of available models is `GET /v1/catalog` (see settlement-api.md).
+The authoritative list of available models is `GET /v1/catalog` (see
+settlement-api.md).
 
 ---
 
@@ -182,7 +246,7 @@ client = OpenAI(
 
 # Non-streaming
 response = client.chat.completions.create(
-    model="default",
+    model="Qwen/Qwen3-4B-Instruct-2507",
     messages=[{"role": "user", "content": "Hello!"}],
     max_tokens=100,
 )
@@ -190,7 +254,7 @@ print(response.choices[0].message.content)
 
 # Streaming
 for chunk in client.chat.completions.create(
-    model="default",
+    model="Qwen/Qwen3-4B-Instruct-2507",
     messages=[{"role": "user", "content": "Hello!"}],
     max_tokens=100,
     stream=True,
@@ -206,7 +270,7 @@ from langchain_openai import ChatOpenAI
 llm = ChatOpenAI(
     base_url="http://<host>:3000/v1",
     api_key="<CLIENT_TOKEN>",
-    model="default",
+    model="Qwen/Qwen3-4B-Instruct-2507",
     max_tokens=200,
 )
 
@@ -220,7 +284,7 @@ print(response.content)
 curl http://<host>:3000/v1/chat/completions \
   -H "Authorization: Bearer $CLIENT_TOKEN" \
   -H "Content-Type: application/json" \
-  -d '{"model":"default","messages":[{"role":"user","content":"Hi"}],"max_tokens":50}'
+  -d '{"model":"Qwen/Qwen3-4B-Instruct-2507","messages":[{"role":"user","content":"Hi"}],"max_tokens":50}'
 ```
 
 ### JavaScript (fetch)
@@ -233,7 +297,7 @@ const response = await fetch("http://<host>:3000/v1/chat/completions", {
     "Content-Type": "application/json"
   },
   body: JSON.stringify({
-    model: "default",
+    model: "Qwen/Qwen3-4B-Instruct-2507",
     messages: [{ role: "user", content: "Hello" }],
     max_tokens: 100
   })
@@ -258,7 +322,7 @@ When Workers are registered with `supported_models`, the gateway routes requests
 
 1. **Priority 1**: Route to a Worker that already has the model loaded (no switch, lowest latency)
 2. **Priority 2**: Route to an idle Worker that lists the model in `supported_models` (triggers model switch)
-3. **Priority 3**: For `model: "default"`, route to any available Worker
+3. **Priority 3** (internal only): requests without a usable model preference — e.g. gateway-initiated stream-resume continuations — route to any available Worker. Client requests can never reach this branch: a missing or `"default"` model is rejected with 400 at the door
 
 When all Workers that have the requested model loaded are overloaded (active requests exceed `gpu_count * model_switch_load_factor`), the gateway automatically routes to an idle Worker that supports the model, triggering a model switch to distribute load. This is configurable; set `model_switch_load_factor: 0` to disable.
 
@@ -295,9 +359,9 @@ If no Worker supports the requested model:
 **HTTP Status:** 404
 
 The gateway automatically normalizes model name formats. All of these match the same model:
-- `Qwen/Qwen2.5-3B-Instruct` (HuggingFace ID)
-- `/models/Qwen--Qwen2.5-3B-Instruct` (local path)
-- `Qwen--Qwen2.5-3B-Instruct` (basename)
+- `Qwen/Qwen3-4B-Instruct-2507` (HuggingFace ID)
+- `/models/Qwen--Qwen3-4B-Instruct-2507` (local path)
+- `Qwen--Qwen3-4B-Instruct-2507` (basename)
 
 ---
 
@@ -358,6 +422,22 @@ With `stream_resume` off (the default) it is always the legacy behavior. Separat
 client **abandons** a stream, it is billed for the tokens delivered before the disconnect
 (see the billing rules in settlement-api.md).
 
+### Model required (400)
+
+A request without a `model`, or with the retired `"default"` alias, is rejected
+before routing:
+
+```json
+{"error":{"message":"a specific model id is required (the \"default\" alias is no longer accepted); call GET /v1/models for the live list","type":"gateway_error"}}
+```
+
+### Upstream failure (502)
+
+The serving worker failed mid-request. Non-streaming requests are retried on
+another worker automatically before you ever see a 502 — a surfaced one means
+retries were exhausted; retry later. For streams, see "Streaming interruption &
+transparent resume" above.
+
 ### Unsupported Endpoints
 
 ```json
@@ -379,6 +459,14 @@ The gateway provides a REST API on port **9091** for Worker management.
 
 **Authentication:** Bearer token (`AGENT_ADMIN_TOKEN`)
 
+> **Operator-internal.** This admin API is for the gateway operator's own
+> tooling; its token must never be handed out. A third-party Storage Provider
+> joins through **self-registration** instead — the worker's scheduler signs a
+> gateway challenge with the miner's own key and receives its credentials and
+> TLS certificate automatically. That flow needs nothing from this section; see
+> ONBOARDING-ALPHA.md in the [openmodel](https://github.com/6block/openmodel)
+> repository.
+
 ### Register a Worker
 
 ```bash
@@ -391,16 +479,16 @@ curl -X POST http://<host>:9091/api/v1/workers/register \
     "scheduler_url": "http://<worker-ip>:9090",
     "gpu_count": 1,
     "miner_address": "t0182063",
-    "supported_models": ["Qwen/Qwen2.5-3B-Instruct", "Qwen/Qwen2.5-1.5B-Instruct"],
+    "supported_models": ["Qwen/Qwen3-4B-Instruct-2507", "Qwen/Qwen3-8B"],
     "auth_token": "<secret the worker stack validates>"
   }'
 ```
 
-Worker ID rules: 1-64 characters, alphanumeric plus `-`, `_`, `.`
+Worker ID rules: 1-64 characters, starting alphanumeric, then alphanumeric plus `-`, `_`, `.`
 
 Notes:
 - `gpu_count` is an initial value. After the first poll, it is automatically updated from the Worker's actual `engine_count` to reflect true inference capacity.
-- `supported_models` is optional. If omitted, the Worker only accepts `model: "default"` requests. If provided, the gateway uses model-aware routing to match requests to Workers.
+- `supported_models` is optional but strongly recommended: the gateway routes model-aware, and a worker with no claimed (or loaded) models is never matched to client requests.
 - `miner_address` is the Worker's miner address (mapped to an EVM payout address via `sp_address_map` at settlement).
 - `auth_token` is optional, a **per-worker auth secret**: the gateway attaches it when forwarding inference requests, and the worker stack validates that requests really came from this gateway (preventing free-riding by connecting to the Worker directly, bypassing the gateway). It **must survive restarts** — if a poll gets a 401, the gateway marks that Worker offline.
 - `loaded_model` is auto-detected from the Worker's `/health` endpoint — no need to specify.

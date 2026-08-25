@@ -50,7 +50,7 @@ func newBillingGateway(t *testing.T, balanceUSDC *big.Int, endpoints ...string) 
 	for i, ep := range endpoints {
 		id := fmt.Sprintf("w%d", i)
 		registry.Register(worker.WorkerRegistration{ID: id, Endpoint: ep, SchedulerURL: ep, GPUCount: 1})
-		registry.UpdateState(id, "GPU_STATE_AVAILABLE", "running", 0, "default", 1)
+		registry.UpdateState(id, "GPU_STATE_AVAILABLE", "running", 0, "test-model", 1)
 	}
 
 	scfg := &settlement.Config{
@@ -111,7 +111,7 @@ func sseServer(chunks ...string) *httptest.Server {
 	}))
 }
 
-const chatBody = `{"model":"default","messages":[{"role":"user","content":"x"}],"max_tokens":10}`
+const chatBody = `{"model":"test-model","messages":[{"role":"user","content":"x"}],"max_tokens":10}`
 
 // TestBilling_NonStreamingSuccessBillsActual: reserve by max_tokens, then settle by
 // the actual usage returned (estimated $10 → actual $8).
@@ -192,7 +192,7 @@ func TestBilling_StreamingBilledByUsageChunk(t *testing.T) {
 	gw, bc, cleanup := newBillingGateway(t, usdcWei(1000), up.URL)
 	defer cleanup()
 
-	body := `{"model":"default","messages":[{"role":"user","content":"x"}],"max_tokens":10,"stream":true}`
+	body := `{"model":"test-model","messages":[{"role":"user","content":"x"}],"max_tokens":10,"stream":true}`
 	if st := doChat(t, gw.URL, body); st != 200 {
 		t.Fatalf("expected 200, got %d", st)
 	}
@@ -212,7 +212,7 @@ func TestBilling_StreamInterruptedNotBilled(t *testing.T) {
 	gw, bc, cleanup := newBillingGateway(t, usdcWei(1000), up.URL)
 	defer cleanup()
 
-	body := `{"model":"default","messages":[{"role":"user","content":"x"}],"max_tokens":10,"stream":true}`
+	body := `{"model":"test-model","messages":[{"role":"user","content":"x"}],"max_tokens":10,"stream":true}`
 	doChat(t, gw.URL, body)
 	if ps := bc.GetPendingSpend(billWallet); ps.Sign() != 0 {
 		t.Errorf("interrupted stream must NOT be billed, got pendingSpend %s", ps.Text('f', 4))
@@ -233,7 +233,7 @@ func TestBilling_StreamNoUsageBilledByMeteredDelivery(t *testing.T) {
 	gw, bc, cleanup := newBillingGateway(t, usdcWei(1000), up.URL)
 	defer cleanup()
 
-	body := `{"model":"default","messages":[{"role":"user","content":"x"}],"max_tokens":10,"stream":true}`
+	body := `{"model":"test-model","messages":[{"role":"user","content":"x"}],"max_tokens":10,"stream":true}`
 	if st := doChat(t, gw.URL, body); st != 200 {
 		t.Fatalf("expected 200, got %d", st)
 	}
@@ -249,7 +249,7 @@ func TestBilling_StreamNoContentNoUsageNotBilled(t *testing.T) {
 	gw, bc, cleanup := newBillingGateway(t, usdcWei(1000), up.URL)
 	defer cleanup()
 
-	body := `{"model":"default","messages":[{"role":"user","content":"x"}],"max_tokens":10,"stream":true}`
+	body := `{"model":"test-model","messages":[{"role":"user","content":"x"}],"max_tokens":10,"stream":true}`
 	if st := doChat(t, gw.URL, body); st != 200 {
 		t.Fatalf("expected 200, got %d", st)
 	}
@@ -301,7 +301,7 @@ func TestBilling_ConcurrentOverspendEndToEnd(t *testing.T) {
 	var ok200, got402 atomic.Int32
 	var wg sync.WaitGroup
 	wg.Add(n)
-	body := `{"model":"default","messages":[{"role":"user","content":"x"}],"max_tokens":1}`
+	body := `{"model":"test-model","messages":[{"role":"user","content":"x"}],"max_tokens":1}`
 	for i := 0; i < n; i++ {
 		go func() {
 			defer wg.Done()

@@ -11,10 +11,10 @@ func TestEstimatePromptTokens(t *testing.T) {
 	}{
 		{"empty object", `{}`, 0, 0},
 		{"unparseable", `not json`, 0, 0},
-		{"chat single message", `{"messages":[{"role":"user","content":"aaaaaaaa"}]}`, 2, 2}, // 8 chars / 4
+		{"chat single message", `{"messages":[{"role":"user","content":"aaaaaaaa"}]}`, 2, 2},                               // 8 chars / 4
 		{"chat multi message", `{"messages":[{"role":"system","content":"aaaa"},{"role":"user","content":"bbbb"}]}`, 2, 2}, // 8/4
-		{"completion prompt string", `{"prompt":"aaaaaaaaaaaaaaaa"}`, 4, 4}, // 16/4
-		{"completion prompt array", `{"prompt":["aaaa","bbbb"]}`, 2, 2},   // 8/4
+		{"completion prompt string", `{"prompt":"aaaaaaaaaaaaaaaa"}`, 4, 4},                                                // 16/4
+		{"completion prompt array", `{"prompt":["aaaa","bbbb"]}`, 2, 2},                                                    // 8/4
 		{"non-string content ignored", `{"messages":[{"role":"user","content":123}]}`, 0, 0},
 	}
 	for _, c := range cases {

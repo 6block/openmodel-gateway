@@ -11,15 +11,94 @@ import (
 )
 
 type Config struct {
-	Mode         string             `yaml:"mode"` // "dev" or "prod"
-	Gateway      GatewayConfig      `yaml:"gateway"`
-	Workers      WorkerConfig       `yaml:"workers"`
-	Admin        AdminConfig        `yaml:"admin"`
-	PublicQuery  PublicQueryConfig  `yaml:"public_query"`
-	Verification VerificationConfig `yaml:"verification"`
-	Logging      LoggingConfig      `yaml:"logging"`
-	Metrics      MetricsConfig      `yaml:"metrics"`
-	Settlement   settlement.Config  `yaml:"settlement"`
+	Mode           string               `yaml:"mode"` // "dev" or "prod"
+	Gateway        GatewayConfig        `yaml:"gateway"`
+	Workers        WorkerConfig         `yaml:"workers"`
+	Admin          AdminConfig          `yaml:"admin"`
+	PublicQuery    PublicQueryConfig    `yaml:"public_query"`
+	Verification   VerificationConfig   `yaml:"verification"`
+	SPRegistration SPRegistrationConfig `yaml:"sp_registration"`
+	Ban            BanConfig            `yaml:"ban"`
+	Probe          ProbeConfig          `yaml:"probe"`
+	WorkerMTLS     WorkerMTLSConfig     `yaml:"worker_mtls"`
+	Logging        LoggingConfig        `yaml:"logging"`
+	Metrics        MetricsConfig        `yaml:"metrics"`
+	Settlement     settlement.Config    `yaml:"settlement"`
+}
+
+// SPRegistrationConfig controls SP (worker) self-registration on the public port:
+// a miner proves control of its owner/worker key over a server challenge, passes
+// the admission thresholds, and receives a per-worker auth token — no operator
+// action involved.
+type SPRegistrationConfig struct {
+	Enabled bool `yaml:"enabled"` // default false (admin-API registration only)
+	// GatewayID is the identity string SPs bind their signature to (goes verbatim
+	// into the signed message), so a signature for this gateway cannot be replayed
+	// against another. Required when enabled. Use a stable public name, e.g.
+	// "openmodel-gateway-test".
+	GatewayID string `yaml:"gateway_id"`
+	// FilecoinRPCURLs are native Lotus JSON-RPC endpoints (NOT the FEVM eth
+	// endpoint) used to read miner state. Multiple endpoints are cross-checked
+	// against fake-empty responses; list at least two independent providers.
+	FilecoinRPCURLs []string `yaml:"filecoin_rpc_urls"`
+	// MinRawPowerBytes is the admission floor on the miner's raw byte power
+	// (storage scale). "0"/empty disables the check. Decimal string, e.g.
+	// "34359738368" = 32 GiB.
+	MinRawPowerBytes string `yaml:"min_raw_power_bytes"`
+	// MinMinerBalanceFIL is the admission floor on the miner actor's balance
+	// (pledge + vesting rewards + available — evidence of real mining stake), in
+	// FIL. "0"/empty disables the check. Decimal string, e.g. "10.5".
+	MinMinerBalanceFIL string `yaml:"min_miner_balance_fil"`
+	ChallengeTTLSec    int    `yaml:"challenge_ttl_sec"`     // default 600
+	RegisterRatePerMin int    `yaml:"register_rate_per_min"` // per-IP limit on challenge+register; default 6
+	MaxRegisteredSPs   int    `yaml:"max_registered_sps"`    // total worker cap; default 1000
+	// Certificate-at-registration: when both paths are set, a CSR submitted with
+	// a successful registration is signed on the spot and renewals are served on
+	// /v1/sp/renew-cert (refused for banned workers — short-lived certs make
+	// renewal the revocation mechanism). Empty = no issuing; manual/plaintext
+	// workers unaffected. The CA key gets the same hot-key treatment as the
+	// settlement operator key; production shape is a cold root + short-lived
+	// intermediate here.
+	IssuerCACert string `yaml:"issuer_ca_cert"`
+	// HTTPSPort, when >0 and the issuer CA is configured, serves the SAME routes
+	// over TLS with a gateway server certificate signed by that CA. This is the
+	// worker→gateway direction's encryption (registration, token issuance, the
+	// admission self-view): workers verify ServerName == gateway_id against the
+	// CA they already trust, so no public PKI or domain is needed.
+	HTTPSPort       int    `yaml:"https_port"`
+	IssuerCAKey     string `yaml:"issuer_ca_key"`
+	CertValiditySec int    `yaml:"cert_validity_sec"` // default 604800 (7 days)
+}
+
+// BanConfig controls the routing-ban punishment lever.
+type BanConfig struct {
+	DefaultDurationSec int `yaml:"default_duration_sec"` // used when an admin ban request omits duration; default 604800 (7 days)
+}
+
+// ProbeConfig controls the automated capability spot-check auditor. It periodically
+// probes a servable self-registered worker with fresh deterministically-scored
+// questions and auto-bans one scoring far below its claimed model's capability (the
+// routing-ban lever; on-chain confiscation stays a manual arbiter decision).
+type ProbeConfig struct {
+	Enabled      bool    `yaml:"enabled"`
+	IntervalSec  int     `yaml:"interval_sec"`  // seconds between probing one worker; 0 disables
+	NumQuestions int     `yaml:"num_questions"` // questions per probe; 0 = default 16
+	MinScore     float64 `yaml:"min_score"`     // suspect if score below this floor; 0 = default 0.5
+	BanSeconds   int     `yaml:"ban_seconds"`   // ban duration on a suspect verdict; 0 = default 3600
+	// AdmissionGate makes every claimed model prove itself before routing trusts
+	// it: a freshly self-registered worker gets no traffic until its first
+	// admission probe passes. Requires Enabled (a gate with no prober would
+	// starve every worker forever — startup rejects that combination).
+	AdmissionGate bool               `yaml:"admission_gate"`
+	VerifyTTLSec  int                `yaml:"verify_ttl_sec"` // re-verify interval; 0 = default 604800 (7 days)
+	ModelFloors   map[string]float64 `yaml:"model_floors"`   // claimed model → score floor; unlisted → min_score
+	// SpotMinIntervalSec is the per-worker cooldown between routine spot checks
+	// (0 = default 259200, i.e. 3 days). It exists because the spot-check tick
+	// picks from the SELF-REGISTERED pool only: with few external workers, a
+	// bare interval_sec cadence concentrates every probe on the same machines.
+	// Admission probes and TTL re-verification ignore this cooldown — a new
+	// worker must still be verified immediately.
+	SpotMinIntervalSec int `yaml:"spot_min_interval_sec"`
 }
 
 // VerificationConfig controls sampling + retention of request/response pairs for SP
@@ -33,6 +112,19 @@ type VerificationConfig struct {
 	SampleLogPath string  `yaml:"sample_log_path"` // JSONL path; empty = off even if rate > 0
 	SampleMaxMB   int     `yaml:"sample_max_mb"`   // rotation size per file (MB); 0 = default 50
 	SampleBackups int     `yaml:"sample_backups"`  // numbered backups kept; 0 = default 5
+}
+
+// WorkerMTLSConfig arms the gateway→worker direction (polling, forwarding,
+// probing) with mutual TLS. All three paths set = enabled; all empty =
+// plaintext (current behavior). The TLS material only engages for workers whose
+// endpoints are https:// — plaintext workers keep working, so a fleet migrates
+// worker by worker and rollback is flipping an endpoint back to http.
+// Identity is pinned to the WORKER ID (certificate SAN), never to the address:
+// tunnels and port maps stay transparent.
+type WorkerMTLSConfig struct {
+	CAFile   string `yaml:"ca_file"`   // private CA bundle that signed the worker certs
+	CertFile string `yaml:"cert_file"` // this gateway's client certificate
+	KeyFile  string `yaml:"key_file"`  // its private key
 }
 
 type GatewayConfig struct {
@@ -60,9 +152,32 @@ type GatewayConfig struct {
 	RateBurstPerKey     int     `yaml:"rate_burst_per_key"`     // Token-bucket burst size; 0 = ceil(rate) or 1
 	MaxConcurrentPerKey int     `yaml:"max_concurrent_per_key"` // Max in-flight requests per API key; 0 = unlimited
 	MaxRequestBytes     int64   `yaml:"max_request_bytes"`      // Max request body size in bytes; 0 = default 10 MiB
+
+	// WebUI serves the embedded chat + wallet-registration single-page app on the
+	// gateway port (same origin as the API, so no CORS surface). Off by default.
+	WebUI WebUIConfig `yaml:"web_ui"`
+
+	// Key-store v2 (self-service key management).
+	MaxKeysPerWallet   int `yaml:"max_keys_per_wallet"`   // cap per wallet; 0 = default 10
+	RegisterRatePerMin int `yaml:"register_rate_per_min"` // per-IP limit on /v1/register + /v1/keys; 0 = default 10
+	// TrustedProxies lists reverse proxies (IPs or CIDRs) whose
+	// X-Forwarded-For / X-Real-IP headers are believed for per-IP rate
+	// limiting. Empty = headers ignored (direct peers only). Set this when the
+	// gateway sits behind a domain front, or every user arriving through it
+	// shares the proxy's single rate-limit bucket.
+	TrustedProxies []string `yaml:"trusted_proxies"`
 }
 
-// APIKey represents a client API key with metadata for billing (M3 prep).
+// WebUIConfig controls the embedded browser app (M4.1 user terminal).
+type WebUIConfig struct {
+	Enabled bool `yaml:"enabled"`
+	// PublicQueryURL is the EXTERNAL base URL of the public read-only query port
+	// (receipt-proof), as reachable by end users — e.g. "https://openmodel.filfox.info".
+	// Display-only: the UI links receipts there. Empty hides verify links.
+	PublicQueryURL string `yaml:"public_query_url"`
+}
+
+// APIKey represents a client API key with metadata for billing.
 type APIKey struct {
 	Key    string `yaml:"key"`
 	Name   string `yaml:"name"`             // Human-readable label
@@ -147,8 +262,26 @@ func validate(cfg *Config) error {
 		if cfg.Admin.Token == "" {
 			return fmt.Errorf("admin.token is required in prod mode (refusing to start with admin auth disabled)")
 		}
-		if cfg.Gateway.ClientToken == "" && len(cfg.Gateway.APIKeys) == 0 {
-			return fmt.Errorf("gateway.client_token or gateway.api_keys is required in prod mode (refusing to start with client auth disabled)")
+		// Count keys that actually carry a value: an api_keys entry whose `key`
+		// is an unset ${ENV} placeholder expands to "" and is skipped when the
+		// lookup table is built, which switches client auth OFF entirely. A
+		// non-empty LIST is therefore not proof that auth is on.
+		configured := 0
+		for _, k := range cfg.Gateway.APIKeys {
+			if k.Key != "" {
+				configured++
+			}
+		}
+		if cfg.Gateway.ClientToken == "" && configured == 0 {
+			return fmt.Errorf("gateway.client_token or at least one api_keys entry with a non-empty key is required in prod mode (refusing to start with client auth disabled; %d api_keys entries present but none carry a value — check the ${ENV} vars they reference)", len(cfg.Gateway.APIKeys))
+		}
+	}
+	if cfg.SPRegistration.Enabled {
+		if cfg.SPRegistration.GatewayID == "" {
+			return fmt.Errorf("sp_registration.gateway_id is required when sp_registration.enabled (signatures are domain-bound to it)")
+		}
+		if len(cfg.SPRegistration.FilecoinRPCURLs) == 0 {
+			return fmt.Errorf("sp_registration.filecoin_rpc_urls is required when sp_registration.enabled (miner admission reads chain state)")
 		}
 	}
 	return nil
@@ -218,5 +351,17 @@ func applyDefaults(cfg *Config) {
 	}
 	if cfg.Logging.Format == "" {
 		cfg.Logging.Format = "json"
+	}
+	if cfg.SPRegistration.ChallengeTTLSec == 0 {
+		cfg.SPRegistration.ChallengeTTLSec = 600
+	}
+	if cfg.SPRegistration.RegisterRatePerMin == 0 {
+		cfg.SPRegistration.RegisterRatePerMin = 6
+	}
+	if cfg.SPRegistration.MaxRegisteredSPs == 0 {
+		cfg.SPRegistration.MaxRegisteredSPs = 1000
+	}
+	if cfg.Ban.DefaultDurationSec == 0 {
+		cfg.Ban.DefaultDurationSec = 604800 // 7 days
 	}
 }

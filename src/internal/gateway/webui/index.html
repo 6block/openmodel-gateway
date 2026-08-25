@@ -1,0 +1,166 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>OpenModel — AI on Filecoin</title>
+<link rel="stylesheet" href="/style.css">
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+</head>
+<body>
+<div id="app">
+  <aside id="sidebar">
+    <div class="brand">
+      <div class="brand-name">OpenModel</div>
+      <div class="brand-sub">AI on Filecoin <span id="chain-badge" class="badge" hidden></span></div>
+    </div>
+
+    <section class="card" id="wallet-card">
+      <h3>Wallet</h3>
+      <div id="wallet-disconnected">
+        <button id="btn-connect" class="primary">Connect wallet</button>
+        <div id="wallet-picker" hidden></div>
+        <p class="hint" id="no-wallet-hint" hidden>No browser wallet detected. You can still chat by pasting an existing API key below.</p>
+      </div>
+      <div id="wallet-connected" hidden>
+        <div class="kv"><span>Address</span><code id="wallet-addr" class="mono"></code></div>
+        <div class="kv"><span class="hint" id="wallet-via"></span><button id="btn-switchwallet" class="small" hidden>Switch wallet</button></div>
+        <details id="fund-help">
+          <summary class="hint">How do I get FIL into this wallet?</summary>
+          <p class="hint">Send FIL to this wallet's Filecoin-native form (exchanges and Lotus wallets accept it):</p>
+          <code id="f4-addr" class="mono wrap">…</code>
+          <div class="row">
+            <button id="btn-copyf4" class="small">Copy f4 address</button>
+            <a id="faucet-link" target="_blank" rel="noopener" hidden><button class="small">Testnet faucet</button></a>
+          </div>
+        </details>
+        <div class="kv"><span>In contract</span><b id="contract-balance">—</b></div>
+        <div id="contract-balances"></div>
+        <div class="row amount-row">
+          <select id="deposit-token" title="deposit currency"></select>
+          <input id="deposit-amount" type="number" min="0" step="0.1" placeholder="amount">
+          <button id="btn-deposit">Deposit</button>
+        </div>
+        <p class="hint" id="deposit-estimate"></p>
+        <div id="deposit-status" class="hint"></div>
+      </div>
+    </section>
+
+    <section class="card" id="account-card">
+      <h3>Account <button id="btn-refresh-me" class="small" style="float:right">Refresh</button></h3>
+      <div id="me-guide" hidden>
+        <p class="hint">Balance and usage live on the gateway and need an <b>API key</b>
+        (bound to your wallet by a free signature — the deposit above is on-chain and
+        visible without one).</p>
+        <div class="row">
+          <button id="btn-goto-register" class="primary small">Create a key</button>
+          <button id="btn-goto-paste" class="small">I have a key</button>
+        </div>
+      </div>
+      <div class="kv"><span>Usable now</span><b id="me-available">—</b></div>
+      <div class="kv"><span>Unsettled spend</span><span id="me-pending" class="hint">—</span></div>
+      <details>
+        <summary class="hint">Recent requests</summary>
+        <div id="me-usage" class="hint mono"></div>
+      </details>
+    </section>
+
+    <section class="card" id="withdraw-card" hidden>
+      <h3>Withdraw</h3>
+      <div class="row amount-row">
+        <select id="refund-token" title="withdraw currency"></select>
+        <input id="refund-amount" type="number" min="0" step="0.1" placeholder="amount">
+        <button id="btn-refund">Request</button>
+      </div>
+      <p class="hint">Withdrawals unlock after the contract's timelock, then need one more click to claim.</p>
+      <div id="refund-list"></div>
+    </section>
+
+    <section class="card" id="key-card">
+      <h3>API key</h3>
+      <div id="key-none">
+        <button id="btn-register" class="primary" disabled>Sign &amp; get API key</button>
+        <p class="hint">Sign a one-line message with your wallet to receive an API key bound to it. No transaction, no gas.</p>
+        <details>
+          <summary class="hint">…or paste an existing key</summary>
+          <div class="row">
+            <input id="manual-key" type="password" placeholder="sk-om-…">
+            <button id="btn-usekey">Use</button>
+          </div>
+        </details>
+      </div>
+      <div id="key-have" hidden>
+        <div class="kv"><span>Active key</span><code id="key-masked" class="mono"></code></div>
+        <div class="row">
+          <button id="btn-copykey">Copy</button>
+          <button id="btn-forgetkey" class="danger">Forget</button>
+        </div>
+        <p class="hint">Stored only in this browser. A key's full value is shown once at creation and can never be viewed again — lost keys are deleted and replaced.</p>
+        <details>
+          <summary class="hint">Use via API</summary>
+          <pre id="api-snippet" class="mono wrap" style="font-size:11.5px"></pre>
+          <button id="btn-copysnippet" class="small">Copy</button>
+        </details>
+      </div>
+      <div id="key-manage" hidden>
+        <div class="kv"><span>All keys</span><button id="btn-loadkeys" class="small">Load (sign)</button></div>
+        <div id="key-list"></div>
+        <div class="row">
+          <input id="new-key-name" placeholder="name (optional)">
+          <button id="btn-createkey">New key</button>
+        </div>
+        <div id="new-key-reveal" hidden>
+          <p class="hint warn">New key created — <b>copy it now, it will never be shown again:</b></p>
+          <code id="new-key-full" class="mono wrap"></code>
+          <div class="row">
+            <button id="btn-copynewkey">Copy</button>
+            <button id="btn-usenewkey" class="primary">Use in this browser</button>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <section class="card">
+      <h3>Chat settings</h3>
+      <div class="kv"><span>Model</span>
+        <select id="model-select"></select>
+      </div>
+      <div id="model-price" class="hint"></div>
+      <div class="kv"><span>Thinking</span>
+        <label class="hint" style="display:flex;align-items:center;gap:6px">
+          <input type="checkbox" id="thinking-toggle"> show reasoning (slower, billed as output)
+        </label>
+      </div>
+      <details id="pricing-details">
+        <summary class="hint">All model pricing</summary>
+        <div id="pricing-table"></div>
+        <p class="hint" style="margin-top:6px">USD per 1M tokens. <b>Input</b> = prompt (cache miss); <b>Cached</b> = prompt served from prefix cache (cache hit, discounted); <b>Output</b> = generated tokens.</p>
+      </details>
+      <button id="btn-newchat">New conversation</button>
+    </section>
+
+    <div class="foot hint">
+      Every answer is billed with a worker-signed receipt anchored on Filecoin.
+      <span id="verify-hint" hidden> Open the <b>signed receipt</b> under any reply to verify that request independently.</span>
+    </div>
+  </aside>
+
+  <main id="chat">
+    <div id="model-price-bar" hidden></div>
+    <div id="messages">
+      <div class="msg system" id="welcome">
+        <p><b>Welcome.</b> This chat runs on idle GPUs of Filecoin storage providers; billing settles on-chain and every response carries a verifiable signed receipt.</p>
+        <p>To start: <b>connect your wallet</b> → <b>deposit a little FIL</b> → <b>sign to get an API key</b> → chat.</p>
+      </div>
+    </div>
+    <div id="composer">
+      <textarea id="input" rows="2" placeholder="Message… (Enter to send, Shift+Enter for newline)"></textarea>
+      <button id="btn-stop" class="danger" hidden>Stop</button>
+      <button id="btn-send" class="primary" disabled>Send</button>
+    </div>
+    <div id="statusline" class="hint"></div>
+  </main>
+</div>
+<script src="/app.js"></script>
+</body>
+</html>

@@ -74,7 +74,7 @@ func TestRegisterHappyPath(t *testing.T) {
 	}
 	// the issued key authenticates and resolves to the wallet (for billing)
 	g.keysMu.RLock()
-	e, ok := g.apiKeys[resp.APIKey]
+	e, ok := g.apiKeys[hashKey(resp.APIKey)]
 	g.keysMu.RUnlock()
 	if !ok || e.Wallet != wallet {
 		t.Fatalf("key not registered/bound: ok=%v entry=%+v", ok, e)
@@ -129,7 +129,7 @@ func TestRegisterCannotHijackStaticConfigWallet(t *testing.T) {
 	g := newRegTestGateway(t)
 	priv, wallet := genWallet(t)
 	// wallet is already bound to an operator-configured key
-	g.apiKeys["sk-static"] = apiKeyEntry{Name: "client", Wallet: wallet}
+	g.apiKeys[hashKey("sk-static")] = apiKeyEntry{Name: "client", Wallet: wallet, Static: true}
 	issued := time.Now().Unix()
 	rr := postRegister(g, map[string]any{"wallet": wallet, "issued_at": issued, "signature": signFor(t, priv, wallet, issued)})
 	if rr.Code != http.StatusConflict {

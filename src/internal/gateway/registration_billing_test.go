@@ -58,7 +58,7 @@ func TestRegister_MakesWalletSpendable(t *testing.T) {
 
 	registry := worker.NewRegistry(logger, "")
 	registry.Register(worker.WorkerRegistration{ID: "w0", Endpoint: up.URL, SchedulerURL: up.URL, GPUCount: 1})
-	registry.UpdateState("w0", "GPU_STATE_AVAILABLE", "running", 0, "default", 1)
+	registry.UpdateState("w0", "GPU_STATE_AVAILABLE", "running", 0, "test-model", 1)
 
 	scfg := &settlement.Config{
 		ModelPricesUSD:    map[string]string{"default": "1000000"}, // $1/token
@@ -107,7 +107,7 @@ func TestRegister_MakesWalletSpendable(t *testing.T) {
 	// --- Control: inject a key bound to a funded wallet WITHOUT AddWallet (old bug path) ---
 	_, walletInj := genWallet(t)
 	gw.keysMu.Lock()
-	gw.apiKeys["sk-injected"] = apiKeyEntry{Name: "inj", Wallet: walletInj}
+	gw.apiKeys[hashKey("sk-injected")] = apiKeyEntry{Name: "inj", Wallet: walletInj}
 	gw.keysMu.Unlock()
 	bc.ForceRefresh(context.Background()) // even a full refresh cycle can't reach it
 	if code := doChatKey(t, srv.URL, "sk-injected"); code != http.StatusPaymentRequired {

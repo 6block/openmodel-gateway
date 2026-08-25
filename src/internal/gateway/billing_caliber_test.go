@@ -31,7 +31,7 @@ func TestBilling_CatalogAdjustUsesSplitCost(t *testing.T) {
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
 	registry := worker.NewRegistry(logger, "")
 	registry.Register(worker.WorkerRegistration{ID: "w0", Endpoint: up.URL, SchedulerURL: up.URL, GPUCount: 1})
-	registry.UpdateState("w0", "GPU_STATE_AVAILABLE", "running", 0, "default", 1)
+	registry.UpdateState("w0", "GPU_STATE_AVAILABLE", "running", 0, "test-model", 1)
 
 	scfg := &settlement.Config{
 		ModelPricesUSD: map[string]string{"default": "1000000"}, // $1/token output

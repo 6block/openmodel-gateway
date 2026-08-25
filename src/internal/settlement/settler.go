@@ -3,12 +3,12 @@ package settlement
 import (
 	"bufio"
 	"bytes"
-	"io"
 	"context"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"log/slog"
 	"math/big"
 	"os"
@@ -58,6 +58,7 @@ type Settler struct {
 
 	requestLogPath    string
 	settlementLogPath string
+	lastSettleUnix    int64 // unix time the last settle pass finished; 0 until then
 	deadLetterPath    string
 	pendingPath       string
 	debtPath          string
@@ -107,10 +108,17 @@ func NewSettler(
 	if resolver != nil {
 		workerSPMap = resolver.GetWorkerSPMap()
 	}
+	// Miner-signed payout overlay (self-registered SPs); optional interface so
+	// existing resolver fakes keep working.
+	var minerPayoutMap map[string]string
+	if pr, ok := resolver.(minerPayoutResolver); ok {
+		minerPayoutMap = pr.GetMinerPayoutMap()
+	}
 
 	scanner := NewScanner(requestLogPath, dataDir+"/settlement-cursor.json", logger)
 	aggregator := NewAggregator(cfg, workerSPMap, logger)
 	aggregator.SetPricer(pricer) // C3: stablecoin depeg-aware deduction
+	aggregator.UpdateMinerPayoutMap(minerPayoutMap)
 
 	return &Settler{
 		cfg:               cfg,
@@ -196,6 +204,16 @@ func (s *Settler) PublishFundMetrics() {
 	}
 }
 
+// refreshMinerPayoutMap pulls the miner-signed payout overlay from the resolver
+// (self-registered SPs) when it supports one. Called alongside every
+// UpdateWorkerSPMap refresh so a runtime-registered SP settles to its signed
+// payout address without a gateway restart.
+func (s *Settler) refreshMinerPayoutMap() {
+	if pr, ok := s.resolver.(minerPayoutResolver); ok {
+		s.aggregator.UpdateMinerPayoutMap(pr.GetMinerPayoutMap())
+	}
+}
+
 func (s *Settler) settleWithRecover(ctx context.Context) {
 	defer func() {
 		if r := recover(); r != nil {
@@ -213,6 +231,9 @@ func (s *Settler) settleWithRecover(ctx context.Context) {
 func (s *Settler) Settle(ctx context.Context) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	// Stamp on exit regardless of outcome: the ETA answers "when does the next
+	// PASS run", and a failed pass still means the next attempt is one interval away.
+	defer s.noteSettleRan()
 
 	// Always finish an interrupted settlement first.
 	if err := s.resumePending(ctx); err != nil {
@@ -224,6 +245,7 @@ func (s *Settler) Settle(ctx context.Context) error {
 	// 1. Refresh worker→SP map from the live registry (fixes stale/empty map).
 	if s.resolver != nil {
 		s.aggregator.UpdateWorkerSPMap(s.resolver.GetWorkerSPMap())
+		s.refreshMinerPayoutMap()
 	}
 
 	// 2. Peek new billable records WITHOUT advancing the cursor.
@@ -605,18 +627,38 @@ func (s *Settler) buildPending(items []SettlementItem, cursor Cursor, settledUSD
 			}
 			pb.Leaves = append(pb.Leaves, leaf)
 		}
+		// Per-item stats for the schema-3 submit. Mirrors batchLeaves exactly: a rid
+		// is attributed to the FIRST item that carries it (a token-split rid must not
+		// count twice), tokens come from the request record (prompt + completion —
+		// recomputable by anyone holding the published leaf set), and a debt rid
+		// without a record counts as 1 request with 0 tokens.
+		seenRid := make(map[string]bool)
 		for _, it := range batch {
 			amountUSD := ""
 			if it.AmountUSD != nil {
 				amountUSD = it.AmountUSD.Text('f', 18)
 			}
+			reqCount := 0
+			var tokCount int64
+			for _, rid := range it.RequestIDs {
+				if seenRid[rid] {
+					continue
+				}
+				seenRid[rid] = true
+				reqCount++
+				if rec, ok := recordsByID[rid]; ok {
+					tokCount += int64(rec.PromptTokens) + int64(rec.CompletionTokens)
+				}
+			}
 			pb.Items = append(pb.Items, pendingItem{
-				User:       it.UserEVM.Hex(),
-				SP:         it.SPEVM.Hex(),
-				Amount:     it.Amount.String(),
-				Token:      it.TokenAddr.Hex(),
-				AmountUSD:  amountUSD,
-				RequestIDs: it.RequestIDs,
+				User:         it.UserEVM.Hex(),
+				SP:           it.SPEVM.Hex(),
+				Amount:       it.Amount.String(),
+				Token:        it.TokenAddr.Hex(),
+				AmountUSD:    amountUSD,
+				RequestIDs:   it.RequestIDs,
+				RequestCount: reqCount,
+				TokenCount:   tokCount,
 			})
 		}
 		p.Batches = append(p.Batches, pb)
@@ -1003,15 +1045,27 @@ type pendingItem struct {
 	// settlement ledger (settlement-items.jsonl) for SP per-request earnings queries.
 	// Optional/omitempty: an older WAL (pre-feature) lacks it and degrades gracefully.
 	RequestIDs []string `json:"request_ids,omitempty"`
+	// Batch stats submitted on-chain with schema 3 (v1.3 contracts): how many
+	// requests this item settles and their prompt+completion token sum. A rid split
+	// across two items (token spillover) is counted in the FIRST item that carries
+	// it, matching the batch's Merkle leaf set; a debt rid without a record counts 1
+	// request / 0 tokens. Persisted in the WAL so a crash-replay re-submits the
+	// EXACT same stats (the on-chain dedup keys off detailsHash, which does not
+	// cover them). Optional/omitempty: an older WAL lacks them → zeros go on-chain,
+	// money math unaffected.
+	RequestCount int   `json:"request_count,omitempty"`
+	TokenCount   int64 `json:"token_count,omitempty"`
 }
 
 func (pb pendingBatch) toBatch(hash [32]byte) (SettlementBatch, error) {
 	b := SettlementBatch{
-		Users:       make([]common.Address, len(pb.Items)),
-		SPs:         make([]common.Address, len(pb.Items)),
-		Amounts:     make([]*big.Int, len(pb.Items)),
-		Tokens:      make([]common.Address, len(pb.Items)),
-		DetailsHash: hash,
+		Users:         make([]common.Address, len(pb.Items)),
+		SPs:           make([]common.Address, len(pb.Items)),
+		Amounts:       make([]*big.Int, len(pb.Items)),
+		Tokens:        make([]common.Address, len(pb.Items)),
+		RequestCounts: make([]*big.Int, len(pb.Items)),
+		TokenCounts:   make([]*big.Int, len(pb.Items)),
+		DetailsHash:   hash,
 	}
 	for i, it := range pb.Items {
 		amt, ok := new(big.Int).SetString(it.Amount, 10)
@@ -1022,6 +1076,9 @@ func (pb pendingBatch) toBatch(hash [32]byte) (SettlementBatch, error) {
 		b.SPs[i] = common.HexToAddress(it.SP)
 		b.Amounts[i] = amt
 		b.Tokens[i] = common.HexToAddress(it.Token)
+		// Older WAL entries carry no stats — they submit as 0, never nil.
+		b.RequestCounts[i] = big.NewInt(int64(it.RequestCount))
+		b.TokenCounts[i] = big.NewInt(it.TokenCount)
 	}
 	return b, nil
 }

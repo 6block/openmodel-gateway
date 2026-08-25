@@ -41,7 +41,7 @@ type ReconcileReport struct {
 	SettledUSD      string    `json:"settled_usd"`   // Σ on-chain settled (from audit log)
 	PendingUSD      string    `json:"pending_usd"`   // current reserved-but-unsettled spend
 	DebtUSD         string    `json:"debt_usd"`      // carried under-funded debt
-	DriftUSD        string    `json:"drift_usd"`     // billed - (settled + pending + debt); ~0 is healthy
+	DriftUSD        string    `json:"drift_usd"`     // billed - (settled + pending); pending already carries debt; ~0 is healthy
 	DriftAbsUSD     string    `json:"drift_abs_usd"` // |drift|, the alert quantity
 	WithinTolerance bool      `json:"within_tolerance"`
 	ToleranceUSD    string    `json:"tolerance_usd"`
@@ -97,8 +97,8 @@ func (rc *Reconciler) SetReadySignal(ch <-chan struct{}) { rc.ready = ch }
 // reconcileState is the persisted rotation-immune state (atomic tmp+rename).
 type reconcileState struct {
 	Initialized     bool   `json:"initialized"`
-	BilledCumUSD    string `json:"billed_cum_usd"`      // Σ cost of every billable record ever seen
-	BillableCount   int    `json:"billable_count"`      // cumulative billable records
+	BilledCumUSD    string `json:"billed_cum_usd"`       // Σ cost of every billable record ever seen
+	BillableCount   int    `json:"billable_count"`       // cumulative billable records
 	SettledBaseline string `json:"settled_baseline_usd"` // settled/pending/debt at first run
 	PendingBaseline string `json:"pending_baseline_usd"`
 	DebtBaseline    string `json:"debt_baseline_usd"`
@@ -212,14 +212,23 @@ func (rc *Reconciler) Run(_ context.Context) (ReconcileReport, error) {
 	_ = rc.scanner.CommitCursor(newCur)
 	rc.saveState()
 
-	// 3. Invariant over DELTAS since baseline: every dollar billed since we started is
-	//    either settled-since, still-pending-vs-baseline, or debt-since.
-	//        billedCum == (settled-base) + (pending-base) + (debt-base)
+	// 3. Invariant over DELTAS since baseline: every dollar billed since we started
+	//    is either settled-since or still pending-vs-baseline:
+	//        billedCum == (settled-base) + (pending-base)
+	//
+	// Debt is NOT a third term: pendingSpend deliberately KEEPS a wallet's unpaid
+	// balance (see restorePendingSpend — the balance gate must count it to keep an
+	// indebted wallet from spending further), so carried debt is already inside
+	// `pending`. Adding a separate debt term double-counts every bad debt and
+	// reports drift == -debt exactly. That is how it shipped: with zero debt the
+	// two formulas agree, all five M3 soak campaigns ran debt-free, and the first
+	// real unpaid wallet made reconciliation cry wolf. Debt still appears in the
+	// report — as information, not as an extra term.
 	settledDelta := new(big.Float).Sub(settled, parseBigOrZero(rc.st.SettledBaseline))
 	pendingDelta := new(big.Float).Sub(pending, parseBigOrZero(rc.st.PendingBaseline))
 	debtDelta := new(big.Float).Sub(debt, parseBigOrZero(rc.st.DebtBaseline))
+	_ = debtDelta // reported below; intentionally not part of the invariant
 	accounted := new(big.Float).Add(settledDelta, pendingDelta)
-	accounted.Add(accounted, debtDelta)
 	drift := new(big.Float).Sub(billedCum, accounted)
 	driftAbs := new(big.Float).Abs(drift)
 	within := driftAbs.Cmp(rc.toleranceUSD) <= 0

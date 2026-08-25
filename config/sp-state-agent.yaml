@@ -20,6 +20,19 @@ gateway:
   # rate_burst_per_key: 40        # max instantaneous burst; default = ceil(rate)
   # max_concurrent_per_key: 16    # max simultaneous in-flight requests per API key
   # max_request_bytes: 10485760   # max request body size in bytes (default 10 MiB)
+  # stream_resume: true    # streamed requests carry signed receipts and can resume on another worker
+
+# REQUIRED when any worker registers with an https:// endpoint (self-registered
+# SPs always do): the gateway-side client credentials for the mTLS handshake.
+# ca_file is the same CA that signs worker certificates (sp_registration's
+# issuer); cert_file/key_file is a clientAuth certificate issued by that CA to
+# this gateway. Without this section the gateway polls https workers with
+# system-default TLS and the handshake fails on both sides (the worker logs
+# `remote error: tls: bad certificate`; the worker stays offline).
+# worker_mtls:
+#   ca_file: /etc/openmodel-mtls/ca.crt
+#   cert_file: /etc/openmodel-mtls/gateway-client.crt
+#   key_file: /etc/openmodel-mtls/gateway-client.key
 
 workers:
   poll_interval_sec: 5
@@ -30,10 +43,11 @@ admin:
   port: 9091
   token: ${AGENT_ADMIN_TOKEN}
 
-# Public, read-only SP earnings query port. Separate from the admin API (:9091) so
-# exposing it never exposes the admin token's powers (register/settle/pause). Serves
-# ONLY GET /api/v1/sp-earnings-detail/:sp — read-only, no auth, and carries NO client
-# identity (no wallet/api-key). Rate-limited (each call scans the request log).
+# Public, read-only query port. Separate from the admin API (:9091) so exposing it
+# never exposes the admin token's powers (register/settle/pause). Serves exactly
+# three read-only routes: /api/v1/sp-earnings-detail/:sp, /api/v1/receipt-proof/:rid
+# and /api/v1/network-stats — no auth, and none of them carries client identity
+# (no wallet/api-key). Rate-limited.
 # Plain HTTP is acceptable for an invite-only small-amount trial; front with a TLS reverse proxy
 # before exposing to untrusted networks at scale. Requires settlement.enabled.
 # Port 3001 sits next to the client gateway (3000) as the other public-facing port; the
@@ -50,11 +64,63 @@ public_query:
 # sample_rate=0 disables it entirely (zero overhead).
 # Note: retained samples contain user content — assess privacy and retention
 # before enabling in production.
+# On-chain settlement (M3+). Off by default: without it the gateway is a pure
+# router. With it, usage is billed per request against prepaid balances in the
+# settlement contract and batched on-chain every interval_minutes.
+# settlement:
+#   enabled: true
+#   rpc_urls:                                  # first is primary; extras cross-check reads
+#     - https://rpc.ankr.com/filecoin
+#   chain_id: 314
+#   contract_address: "0x…your deployment…"    # see the openmodel-contracts repo
+#   contract_schema: 3                         # v1.3 contract (per-batch stats); 2 = v1.2
+#   operator_private_key: ${OPERATOR_PRIVATE_KEY}   # hot key, submitSettlement only — via env, never inline
+#   confirmation_depth: 5
+#   interval_minutes: 20
+#   fil_price_source: auto                     # CoinGecko → Binance fallback; or `manual` + fil_price_usd
+#   model_prices_usd:                          # USD per 1M output tokens
+#     default: "0.60"
+#   model_catalog:                             # per-model client-facing pricing/limits
+#     default: {input: "0.20", cache_read: "0.05", context_window: 32768, max_output: 4096}
+#     "/models/Qwen--Qwen3.8-27B-FP8": {input: "0.60", cache_read: "0.15", context_window: 8192, max_output: 4096}
+#   supported_tokens:
+#     - {symbol: FIL, address: "0x0000000000000000000000000000000000000000", decimals: 18}
+#   sp_address_map:                            # minerID → payout EVM address (self-registered
+#     "t01234": "0x…"                          # workers override this with their signed payout)
+
+# SP self-registration (M4). Lets a miner join with one signed challenge instead
+# of operator-side registration; issues the worker its token and 7-day TLS cert.
+# sp_registration:
+#   enabled: true
+#   gateway_id: "your-gateway-name"            # TLS identity + signature domain, NOT an address
+#   filecoin_rpc_urls:                         # native Lotus API (not the FEVM eth endpoint);
+#     - https://api.node.glif.io/rpc/v1        # two+ endpoints cross-check miner power reads
+#     - https://rpc.ankr.com/filecoin
+#   min_raw_power_bytes: "322122547200"        # admission floor: 300 GiB raw power
+#   min_miner_balance_fil: "1"
+#   issuer_ca_cert: /etc/openmodel-mtls/ca.crt # CA that signs worker certificates
+#   issuer_ca_key: /etc/openmodel-mtls/ca.key
+#   cert_validity_sec: 604800                  # 7d worker certs, renewed at half-life
+#   https_port: 3002                           # worker-direction + web UI TLS listener
+
 verification:
   sample_rate: 0          # fraction 0~1; 0 = off. Suggested 0.01~0.05 in production
   sample_log_path: ""     # JSONL path; empty = off. e.g. /data/verify-samples.jsonl
   sample_max_mb: 50       # per-file rotation threshold (MB); 0 = default 50
   sample_backups: 5       # rotated files kept; 0 = default 5
+
+# Capability auditor: periodically quizzes SELF-REGISTERED workers with
+# deterministically-scored questions; admission_gate additionally withholds
+# routing from a freshly registered worker until its claimed models pass a
+# first probe. Operator-configured workers are never probed or gated.
+# probe:
+#   enabled: true
+#   interval_sec: 300             # auditor tick; one action per tick
+#   num_questions: 16
+#   min_score: 0.5
+#   admission_gate: true
+#   verify_ttl_sec: 604800        # re-confirm evidence every 7 days
+#   spot_min_interval_sec: 259200 # one routine spot check per worker per 3 days
 
 logging:
   level: info

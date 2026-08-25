@@ -33,11 +33,11 @@ func TestModelMatches(t *testing.T) {
 	}{
 		{"", "x", false},
 		{"x", "", false},
-		{"Qwen/Qwen2.5-3B", "Qwen/Qwen2.5-3B", true},                              // exact
-		{"/models/Qwen--Qwen2.5-3B-Instruct", "Qwen/Qwen2.5-3B-Instruct", true},   // local path ↔ HF id
-		{"Qwen--Qwen2.5-3B-Instruct", "Qwen/Qwen2.5-3B-Instruct", true},           // -- ↔ /
-		{"/models/Qwen2.5-3B", "Qwen2.5-3B", true},                                // suffix
-		{"Qwen/Qwen2.5-3B-Instruct", "meta-llama/Llama-3-70B", false},             // unrelated
+		{"Qwen/Qwen2.5-3B", "Qwen/Qwen2.5-3B", true},                            // exact
+		{"/models/Qwen--Qwen2.5-3B-Instruct", "Qwen/Qwen2.5-3B-Instruct", true}, // local path ↔ HF id
+		{"Qwen--Qwen2.5-3B-Instruct", "Qwen/Qwen2.5-3B-Instruct", true},         // -- ↔ /
+		{"/models/Qwen2.5-3B", "Qwen2.5-3B", true},                              // suffix
+		{"Qwen/Qwen2.5-3B-Instruct", "meta-llama/Llama-3-70B", false},           // unrelated
 	}
 	for _, c := range cases {
 		if got := modelMatches(c.loaded, c.requested); got != c.want {
@@ -139,12 +139,47 @@ func TestSelectWorkerForModel_ExcludeSet(t *testing.T) {
 	reg := routerReg(t)
 	for _, id := range []string{"a", "b"} {
 		reg.Register(worker.WorkerRegistration{ID: id, Endpoint: "http://x:8000", SchedulerURL: "http://x:9090", GPUCount: 1})
-		reg.UpdateState(id, "GPU_STATE_AVAILABLE", "running", 0, "default", 1)
+		reg.UpdateState(id, "GPU_STATE_AVAILABLE", "running", 0, "test-model", 1)
 	}
 	for i := 0; i < 20; i++ {
 		w, err := selectWorkerForModel(reg, "default", map[string]bool{"a": true})
 		if err != nil || w.ID != "b" {
 			t.Fatalf("excluded 'a' must always pick 'b', got %v err %v", w, err)
 		}
+	}
+}
+
+// A worker reports the same model twice — once as the local weight path it
+// loaded, once as the HuggingFace id it advertises as supported. Routing has
+// always treated those as one model; the listing did not, so the web UI's model
+// picker showed two identical "Qwen2.5-3B-Instruct" entries.
+func TestCanonicalModelIDCollapsesPathAndHubID(t *testing.T) {
+	cases := []struct {
+		in, want string
+	}{
+		{"/models/Qwen--Qwen2.5-3B-Instruct", "Qwen/Qwen2.5-3B-Instruct"},
+		{"Qwen/Qwen2.5-3B-Instruct", "Qwen/Qwen2.5-3B-Instruct"},
+		{"/models/Qwen--Qwen3-32B-AWQ", "Qwen/Qwen3-32B-AWQ"},
+		{"openai/gpt-oss-20b", "openai/gpt-oss-20b"},
+		// No "--" and no org prefix: keep it verbatim rather than inventing one.
+		{"/models/local-experiment", "/models/local-experiment"},
+	}
+	for _, c := range cases {
+		if got := canonicalModelID(c.in); got != c.want {
+			t.Errorf("canonicalModelID(%q) = %q, want %q", c.in, got, c.want)
+		}
+	}
+
+	// The two spellings must land on the same dedupe key.
+	pathForm := normalizeModelKey(canonicalModelID("/models/Qwen--Qwen2.5-3B-Instruct"))
+	hubForm := normalizeModelKey(canonicalModelID("Qwen/Qwen2.5-3B-Instruct"))
+	if pathForm != hubForm {
+		t.Errorf("dedupe keys differ: path=%q hub=%q — /v1/models would list the model twice", pathForm, hubForm)
+	}
+
+	// A genuinely different model must NOT collapse into the same key.
+	other := normalizeModelKey(canonicalModelID("/models/Qwen--Qwen2.5-1.5B-Instruct"))
+	if other == hubForm {
+		t.Error("1.5B collapsed onto the 3B key — distinct models would vanish from the listing")
 	}
 }

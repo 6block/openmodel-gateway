@@ -1,6 +1,7 @@
 package worker
 
 import (
+	"crypto/subtle"
 	"encoding/json"
 	"fmt"
 	"log/slog"
@@ -8,6 +9,7 @@ import (
 	"os"
 	"regexp"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -29,6 +31,7 @@ type Registry struct {
 	savePath string // JSON file for persistence
 
 	loadingTimeout time.Duration // stuck-loading → offline threshold
+	admissionGate  atomic.Bool   // probe admission gate (routing trusts verified_models)
 }
 
 // NewRegistry creates a new worker registry.
@@ -121,6 +124,18 @@ func (r *Registry) Register(reg WorkerRegistration) (*RegisterResult, error) {
 		if len(reg.SupportedModels) > 0 {
 			w.SupportedModels = reg.SupportedModels
 		}
+		// Payout is only ever set through the miner-signed self-registration path;
+		// an admin re-register without it must not wipe the signed value (settlement
+		// attribution would silently fall back to static config).
+		if reg.PayoutAddress != "" {
+			w.PayoutAddress = reg.PayoutAddress
+		}
+		if reg.SelfRegistered {
+			w.SelfRegistered = true
+		}
+		// VerifiedModels/VerifiedAt are deliberately NOT touched here: a routine
+		// restart re-registers, and forgetting the proven list would take the
+		// worker out of rotation for a full re-verification pass.
 
 		if result.EndpointChanged {
 			r.logger.Info("worker endpoint changed",
@@ -142,6 +157,8 @@ func (r *Registry) Register(reg WorkerRegistration) (*RegisterResult, error) {
 			MinerAddress:    reg.MinerAddress,
 			AuthToken:       reg.AuthToken,
 			SupportedModels: reg.SupportedModels,
+			PayoutAddress:   reg.PayoutAddress,
+			SelfRegistered:  reg.SelfRegistered,
 			RegisteredAt:    time.Now(),
 		}
 		r.workers[reg.ID] = w
@@ -208,6 +225,108 @@ func (r *Registry) ListWorkerSPMap() map[string]string {
 	}
 	return m
 }
+
+// ListMinerPayoutMap returns miner address → miner-signed EVM payout address for
+// every worker that self-registered one. Settlement overlays this on top of the
+// static sp_address_map (the signed value wins for its miner).
+func (r *Registry) ListMinerPayoutMap() map[string]string {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+
+	m := make(map[string]string)
+	for _, w := range r.workers {
+		if w.MinerAddress != "" && w.PayoutAddress != "" {
+			m[w.MinerAddress] = w.PayoutAddress
+		}
+	}
+	return m
+}
+
+// FindByToken returns the worker whose per-worker auth token equals token.
+// Used by certificate renewal, where the Bearer token IS the worker identity.
+// Constant-time compare per candidate: the token is a credential.
+func (r *Registry) FindByToken(token string) (*Worker, bool) {
+	if token == "" {
+		return nil, false
+	}
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	for _, w := range r.workers {
+		if w.AuthToken != "" && subtle.ConstantTimeCompare([]byte(w.AuthToken), []byte(token)) == 1 {
+			cp := *w
+			return &cp, true
+		}
+	}
+	return nil, false
+}
+
+// FindByMiner returns the worker bound to the given miner address, if any.
+func (r *Registry) FindByMiner(miner string) (*Worker, bool) {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	for _, w := range r.workers {
+		if w.MinerAddress == miner {
+			copy := *w
+			copy.InFlight = r.inflight[w.ID]
+			return &copy, true
+		}
+	}
+	return nil, false
+}
+
+// Count returns the number of registered workers.
+func (r *Registry) Count() int {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	return len(r.workers)
+}
+
+// SetBan sets (or, with a zero time, clears) a worker's routing ban. Banned
+// workers keep being polled — their state stays observable — but the router
+// dispatches no inference tasks to them until the ban expires. Persisted so a
+// gateway restart cannot cut a punishment short.
+func (r *Registry) SetBan(id string, until time.Time, reason string) bool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	w, ok := r.workers[id]
+	if !ok {
+		return false
+	}
+	w.BannedUntil = until
+	w.BanReason = reason
+	if until.IsZero() {
+		r.logger.Info("worker ban cleared", "id", id)
+	} else {
+		r.logger.Warn("worker banned from routing", "id", id, "until", until, "reason", reason)
+	}
+	r.saveToDiskLocked()
+	return true
+}
+
+// SetVerified replaces a worker's evidence-backed model list wholesale and
+// stamps VerifiedAt. Persisted: a gateway restart must not forget which claims
+// were already proven (re-verification would take the worker out of rotation
+// for the whole probe pass).
+func (r *Registry) SetVerified(id string, models []string) bool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	w, ok := r.workers[id]
+	if !ok {
+		return false
+	}
+	w.VerifiedModels = append([]string(nil), models...)
+	w.VerifiedAt = time.Now()
+	r.logger.Info("worker verified models updated", "id", id, "models", models)
+	r.saveToDiskLocked()
+	return true
+}
+
+// AdmissionGate switches routing (for self-registered workers) to trust ONLY
+// verified_models. Set once at start-up from probe config.
+func (r *Registry) SetAdmissionGate(on bool) { r.admissionGate.Store(on) }
+
+// AdmissionGateEnabled reports whether the probe admission gate is active.
+func (r *Registry) AdmissionGateEnabled() bool { return r.admissionGate.Load() }
 
 // SetFeatures records the capability flags a worker's /health advertises (e.g.
 // "continuation" for B2 stream resume). Called by the poller each cycle; transient
@@ -447,7 +566,16 @@ type persistedWorker struct {
 	MinerAddress    string    `json:"miner_address"`
 	SupportedModels []string  `json:"supported_models,omitempty"`
 	AuthToken       string    `json:"auth_token,omitempty"` // per-worker secret; must survive restarts or polls 401 → offline
+	PayoutAddress   string    `json:"payout_address,omitempty"`
+	SelfRegistered  bool      `json:"self_registered,omitempty"`
+	BannedUntil     time.Time `json:"banned_until,omitempty"` // a restart must not cut a punishment short
+	BanReason       string    `json:"ban_reason,omitempty"`
 	RegisteredAt    time.Time `json:"registered_at"`
+	// The evidence-backed model list MUST persist: without it, every gateway
+	// restart drops the whole fleet out of the admission-gated routing pool
+	// until each worker is re-probed model-by-model (minutes of dead air).
+	VerifiedModels []string  `json:"verified_models,omitempty"`
+	VerifiedAt     time.Time `json:"verified_at,omitempty"`
 }
 
 func (r *Registry) saveToDiskLocked() {
@@ -465,7 +593,13 @@ func (r *Registry) saveToDiskLocked() {
 			MinerAddress:    w.MinerAddress,
 			SupportedModels: w.SupportedModels,
 			AuthToken:       w.AuthToken,
+			PayoutAddress:   w.PayoutAddress,
+			SelfRegistered:  w.SelfRegistered,
+			BannedUntil:     w.BannedUntil,
+			BanReason:       w.BanReason,
 			RegisteredAt:    w.RegisteredAt,
+			VerifiedModels:  w.VerifiedModels,
+			VerifiedAt:      w.VerifiedAt,
 		})
 	}
 
@@ -516,7 +650,13 @@ func (r *Registry) loadFromDisk() {
 			GPUCount:        pw.GPUCount,
 			MinerAddress:    pw.MinerAddress,
 			SupportedModels: pw.SupportedModels,
+			VerifiedModels:  pw.VerifiedModels,
+			VerifiedAt:      pw.VerifiedAt,
 			AuthToken:       pw.AuthToken,
+			PayoutAddress:   pw.PayoutAddress,
+			SelfRegistered:  pw.SelfRegistered,
+			BannedUntil:     pw.BannedUntil,
+			BanReason:       pw.BanReason,
 			RegisteredAt:    registeredAt,
 		}
 	}

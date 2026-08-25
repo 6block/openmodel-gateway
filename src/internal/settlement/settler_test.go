@@ -23,11 +23,11 @@ type mockContract struct {
 	opBalance   *big.Int
 
 	// Failure injection (all default to "no failure"):
-	submitErr   error // SubmitSettlement returns this without marking the batch processed
-	receiptErr  error // WaitForReceipt returns this (transaction "stuck"/timeout)
-	receiptFail bool  // WaitForReceipt returns a reverted (status=failed) receipt
-	finalityErr error // WaitForFinality returns this (e.g. ErrReorged)
-	finalityCalls int // how many times WaitForFinality was invoked
+	submitErr     error // SubmitSettlement returns this without marking the batch processed
+	receiptErr    error // WaitForReceipt returns this (transaction "stuck"/timeout)
+	receiptFail   bool  // WaitForReceipt returns a reverted (status=failed) receipt
+	finalityErr   error // WaitForFinality returns this (e.g. ErrReorged)
+	finalityCalls int   // how many times WaitForFinality was invoked
 	// submitMarksProcessed models whether a submit's on-chain EFFECT durably lands: true
 	// (default) = normal; false = simulate a real reorg that drops the tx AND its effect
 	// (processedBatches stays false), distinct from a Filecoin false-positive where the

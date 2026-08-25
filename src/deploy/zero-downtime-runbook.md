@@ -34,7 +34,7 @@ time:
 # 1. Drain + restart instance 1; the LB sends new traffic to instance 2.
 systemctl restart openmodel-gateway@1
 #    ... wait for it to report healthy ...
-curl -fsS localhost:3001/health        # instance 1 admin health
+curl -fsS localhost:9091/health        # instance 1 admin health
 # 2. Then instance 2.
 systemctl restart openmodel-gateway@2
 ```
@@ -57,13 +57,14 @@ clients to retry on 503 (the OpenAI SDKs do by default).
 
 ## Rollback
 
-Images are tagged and a backup chain is kept (see CLAUDE.md):
-`openmodel-sp-gateway:latest` plus `:pre-*` backups.
+Before every deploy, tag the running image as a dated backup so a rollback
+target always exists (`docker tag openmodel-sp-gateway:latest
+openmodel-sp-gateway:pre-<date>`).
 
 ```
 # Roll back to the previous known-good image:
-docker tag openmodel-sp-gateway:pre-rotfix openmodel-sp-gateway:latest
-docker compose -f docker-compose.m2.yml up -d sp-gateway
+docker tag openmodel-sp-gateway:pre-<date> openmodel-sp-gateway:latest
+docker compose up -d sp-gateway
 ```
 
 Settlement-safety during rollback:

@@ -67,6 +67,16 @@ func decideNonceGas(pendingNonce uint64, suggested *big.Int, lastNonce *uint64, 
 //go:embed abi.json
 var contractABIJSON string
 
+// abi_v3.json is the v1.3 contract ABI (schema 3): submitSettlement gains
+// requestCounts/tokenCounts arrays, SettlementRecord/SettlementExecuted gain the
+// two stats fields, and SCHEMA_VERSION()/cumulativeRequests()/cumulativeTokens()
+// exist. Which ABI a client speaks is fixed by config (settlement.contract_schema);
+// schema 3 is verified against the live contract at startup so a schema/address
+// mismatch dies loudly instead of failing at settle time.
+//
+//go:embed abi_v3.json
+var contractABIV3JSON string
+
 // buildEndpoints returns the failover-ordered, de-duplicated RPC endpoint list:
 // rpc_url first (backward compat, always tried first), then rpc_urls in order.
 // Blank entries are dropped; duplicates collapse so a URL listed in both places is
@@ -131,6 +141,10 @@ type ContractClient struct {
 	client       *ethclient.Client
 	contractAddr common.Address
 	abi          abi.ABI
+	// schema is the contract ABI generation this client speaks: 2 = v1.2 and
+	// earlier (5-arg submitSettlement), 3 = v1.3 (7-arg with batch stats). It picks
+	// which embedded ABI `abi` was parsed from and gates the stats fields end to end.
+	schema       int
 	operatorKey  *ecdsa.PrivateKey
 	operatorAddr common.Address
 	chainID      *big.Int
@@ -154,9 +168,20 @@ func NewContractClient(cfg *Config, logger *slog.Logger) (*ContractClient, error
 		return nil, fmt.Errorf("dial FEVM RPC (all %d endpoints): %w", len(endpoints), err)
 	}
 
-	parsed, err := abi.JSON(strings.NewReader(contractABIJSON))
+	schema := cfg.ContractSchema
+	if schema == 0 {
+		schema = 2 // default: the v1.2 ABI every existing deployment (incl. mainnet) runs
+	}
+	if schema != 2 && schema != 3 {
+		return nil, fmt.Errorf("settlement.contract_schema must be 2 or 3, got %d", schema)
+	}
+	abiSrc := contractABIJSON
+	if schema == 3 {
+		abiSrc = contractABIV3JSON
+	}
+	parsed, err := abi.JSON(strings.NewReader(abiSrc))
 	if err != nil {
-		return nil, fmt.Errorf("parse contract ABI: %w", err)
+		return nil, fmt.Errorf("parse contract ABI (schema %d): %w", schema, err)
 	}
 
 	key, err := crypto.HexToECDSA(strings.TrimPrefix(cfg.OperatorPrivateKey, "0x"))
@@ -169,21 +194,65 @@ func NewContractClient(cfg *Config, logger *slog.Logger) (*ContractClient, error
 		"contract", cfg.ContractAddress,
 		"operator", addr.Hex(),
 		"chain_id", cfg.ChainID,
+		"schema", schema,
 	)
 
 	logger.Info("FEVM RPC endpoints configured", "count", len(endpoints), "active", endpoints[idx])
-	return &ContractClient{
+	c := &ContractClient{
 		endpoints:    endpoints,
 		activeIdx:    idx,
 		rpcURL:       endpoints[idx],
 		client:       client,
 		contractAddr: common.HexToAddress(cfg.ContractAddress),
 		abi:          parsed,
+		schema:       schema,
 		operatorKey:  key,
 		operatorAddr: addr,
 		chainID:      big.NewInt(cfg.ChainID),
 		logger:       logger,
-	}, nil
+	}
+	if schema == 3 {
+		// Schema 3 against a v1.2 contract would fail at settle time with an opaque
+		// revert (7-arg selector unknown there). Verify SCHEMA_VERSION() up front so a
+		// schema/address mismatch is a loud startup error naming the fix. Retried a
+		// few times so one flaky RPC response cannot block an otherwise-valid start.
+		if err := c.verifySchemaV3(); err != nil {
+			return nil, err
+		}
+	}
+	return c, nil
+}
+
+// verifySchemaV3 confirms the configured contract really speaks schema 3.
+func (c *ContractClient) verifySchemaV3() error {
+	var lastErr error
+	for attempt := 0; attempt < 3; attempt++ {
+		if attempt > 0 {
+			time.Sleep(2 * time.Second)
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+		data, err := c.abi.Pack("SCHEMA_VERSION")
+		if err != nil {
+			cancel()
+			return fmt.Errorf("pack SCHEMA_VERSION: %w", err)
+		}
+		result, err := c.callContract(ctx, data)
+		cancel()
+		if err != nil {
+			lastErr = err
+			continue
+		}
+		out := new(big.Int)
+		if err := c.unpackInto(&out, "SCHEMA_VERSION", result); err != nil {
+			lastErr = err
+			continue
+		}
+		if out.Int64() != 3 {
+			return fmt.Errorf("contract %s reports SCHEMA_VERSION=%d, config says contract_schema: 3 — wrong contract address or wrong schema", c.contractAddr.Hex(), out.Int64())
+		}
+		return nil
+	}
+	return fmt.Errorf("contract %s does not answer SCHEMA_VERSION() (last error: %w) — if this is a v1.2 or older contract, set settlement.contract_schema: 2 (or remove the field); if it is v1.3, check the RPC endpoints", c.contractAddr.Hex(), lastErr)
 }
 
 // --- View Functions ---
@@ -205,16 +274,41 @@ func (c *ContractClient) GetUserBalance(ctx context.Context, user, token common.
 }
 
 func (c *ContractClient) GetSPEarnings(ctx context.Context, sp, token common.Address) (*big.Int, error) {
-	data, err := c.abi.Pack("getSPEarnings", sp, token)
+	return c.getBigIntView(ctx, "getSPEarnings", sp, token)
+}
+
+// v1.1 earnings-freeze views. On a v1.0 contract these methods don't exist and
+// the call errors — callers treat that as "no freeze support" and fall back to
+// GetSPEarnings (which is the total there).
+
+// GetTotalEarnings returns withdrawable + frozen earnings.
+func (c *ContractClient) GetTotalEarnings(ctx context.Context, sp, token common.Address) (*big.Int, error) {
+	return c.getBigIntView(ctx, "getTotalEarnings", sp, token)
+}
+
+// GetFrozenEarnings returns earnings still inside the freeze window (the
+// confiscable dispute stake).
+func (c *ContractClient) GetFrozenEarnings(ctx context.Context, sp, token common.Address) (*big.Int, error) {
+	return c.getBigIntView(ctx, "getFrozenEarnings", sp, token)
+}
+
+// GetWithdrawableEarnings returns what withdrawEarnings would pay right now.
+func (c *ContractClient) GetWithdrawableEarnings(ctx context.Context, sp, token common.Address) (*big.Int, error) {
+	return c.getBigIntView(ctx, "getWithdrawableEarnings", sp, token)
+}
+
+// getBigIntView calls a view(address,address)→uint256 contract method.
+func (c *ContractClient) getBigIntView(ctx context.Context, method string, sp, token common.Address) (*big.Int, error) {
+	data, err := c.abi.Pack(method, sp, token)
 	if err != nil {
-		return nil, fmt.Errorf("pack getSPEarnings: %w", err)
+		return nil, fmt.Errorf("pack %s: %w", method, err)
 	}
 	result, err := c.callContract(ctx, data)
 	if err != nil {
 		return nil, err
 	}
 	out := new(big.Int)
-	if err := c.unpackInto(&out, "getSPEarnings", result); err != nil {
+	if err := c.unpackInto(&out, method, result); err != nil {
 		return nil, err
 	}
 	return out, nil
@@ -268,6 +362,38 @@ func (c *ContractClient) SettlementNonce(ctx context.Context) (uint64, error) {
 	return out.Uint64(), nil
 }
 
+// CumulativeStats reads the contract's all-time inference counters (schema 3+).
+// These are the public volume metrics: one call each, no log indexing. Against a
+// schema-2 contract the getters do not exist and the call reverts — callers must
+// treat the error as "not available on this deployment", never as zero.
+func (c *ContractClient) CumulativeStats(ctx context.Context) (requests, tokens uint64, err error) {
+	read := func(name string) (uint64, error) {
+		data, err := c.abi.Pack(name)
+		if err != nil {
+			return 0, fmt.Errorf("pack %s: %w", name, err)
+		}
+		result, err := c.callContract(ctx, data)
+		if err != nil {
+			return 0, err
+		}
+		out := new(big.Int)
+		if err := c.unpackInto(&out, name, result); err != nil {
+			return 0, err
+		}
+		return out.Uint64(), nil
+	}
+	if c.schema < 3 {
+		return 0, 0, fmt.Errorf("cumulative counters need contract schema 3 (this client speaks %d)", c.schema)
+	}
+	if requests, err = read("cumulativeRequests"); err != nil {
+		return 0, 0, err
+	}
+	if tokens, err = read("cumulativeTokens"); err != nil {
+		return 0, 0, err
+	}
+	return requests, tokens, nil
+}
+
 // PlatformFeeBps reads the on-chain platform fee in basis points. Used by the SP
 // per-request earnings view to compute each request's SP earning with the SAME fee
 // the contract actually applies (no config drift).
@@ -288,7 +414,8 @@ func (c *ContractClient) PlatformFeeBps(ctx context.Context) (int64, error) {
 }
 
 // OnChainSettlement mirrors the contract's SettlementRecord struct, returned by
-// getSettlement(batchId). Field names map to the ABI tuple components.
+// getSettlement(batchId). Field names map to the ABI tuple components. The two
+// stats fields exist on schema-3 contracts only; against schema 2 they stay nil.
 type OnChainSettlement struct {
 	BatchId      *big.Int
 	Timestamp    *big.Int
@@ -296,6 +423,27 @@ type OnChainSettlement struct {
 	SettledCount *big.Int
 	FailedCount  *big.Int
 	DetailsHash  [32]byte
+	RequestCount *big.Int
+	TokenCount   *big.Int
+}
+
+// onChainSettlementV2 is the schema-2 tuple shape (no stats fields); ConvertType
+// needs the struct's field count to match the ABI tuple exactly.
+type onChainSettlementV2 struct {
+	BatchId      *big.Int
+	Timestamp    *big.Int
+	TotalAmount  *big.Int
+	SettledCount *big.Int
+	FailedCount  *big.Int
+	DetailsHash  [32]byte
+}
+
+func zeroBigInts(n int) []*big.Int {
+	out := make([]*big.Int, n)
+	for i := range out {
+		out[i] = big.NewInt(0)
+	}
+	return out
 }
 
 // GetSettlement reads an on-chain settlement record by batch ID.
@@ -309,13 +457,14 @@ func (c *ContractClient) GetSettlement(ctx context.Context, batchID uint64) (OnC
 	if err != nil {
 		return out, err
 	}
-	return unpackSettlement(c.abi, result)
+	return unpackSettlement(c.abi, c.schema, result)
 }
 
 // unpackSettlement decodes a getSettlement return (a single tuple) into
 // OnChainSettlement using the standard abigen pattern (Unpack + ConvertType), which
-// — unlike UnpackIntoInterface — correctly handles a sole tuple output.
-func unpackSettlement(parsed abi.ABI, result []byte) (OnChainSettlement, error) {
+// — unlike UnpackIntoInterface — correctly handles a sole tuple output. The tuple
+// shape follows the schema: 6 fields on schema 2, 8 on schema 3.
+func unpackSettlement(parsed abi.ABI, schema int, result []byte) (OnChainSettlement, error) {
 	var out OnChainSettlement
 	unpacked, err := parsed.Unpack("getSettlement", result)
 	if err != nil {
@@ -324,18 +473,35 @@ func unpackSettlement(parsed abi.ABI, result []byte) (OnChainSettlement, error) 
 	if len(unpacked) == 0 {
 		return out, fmt.Errorf("empty getSettlement result")
 	}
-	out = *abi.ConvertType(unpacked[0], new(OnChainSettlement)).(*OnChainSettlement)
+	if schema >= 3 {
+		out = *abi.ConvertType(unpacked[0], new(OnChainSettlement)).(*OnChainSettlement)
+		return out, nil
+	}
+	v2 := *abi.ConvertType(unpacked[0], new(onChainSettlementV2)).(*onChainSettlementV2)
+	out = OnChainSettlement{
+		BatchId:      v2.BatchId,
+		Timestamp:    v2.Timestamp,
+		TotalAmount:  v2.TotalAmount,
+		SettledCount: v2.SettledCount,
+		FailedCount:  v2.FailedCount,
+		DetailsHash:  v2.DetailsHash,
+	}
 	return out, nil
 }
 
 // --- Write Functions ---
 
 type SettlementBatch struct {
-	Users       []common.Address
-	SPs         []common.Address
-	Amounts     []*big.Int
-	Tokens      []common.Address
-	DetailsHash [32]byte
+	Users   []common.Address
+	SPs     []common.Address
+	Amounts []*big.Int
+	Tokens  []common.Address
+	// Per-item inference stats (schema 3): request count and prompt+completion token
+	// sum of the requests aggregated into each item. Ignored when the client speaks
+	// schema 2 — the arrays never reach the wire there.
+	RequestCounts []*big.Int
+	TokenCounts   []*big.Int
+	DetailsHash   [32]byte
 }
 
 func (c *ContractClient) SubmitSettlement(ctx context.Context, batch SettlementBatch) (*types.Transaction, error) {
@@ -344,10 +510,23 @@ func (c *ContractClient) SubmitSettlement(ctx context.Context, batch SettlementB
 		return nil, err
 	}
 
+	args := []interface{}{batch.Users, batch.SPs, batch.Amounts, batch.Tokens, batch.DetailsHash}
+	if c.schema >= 3 {
+		reqCounts, tokCounts := batch.RequestCounts, batch.TokenCounts
+		// A WAL written by an older build has no stats arrays; zero-fill rather than
+		// refuse — the money math is untouched and the stats honestly report 0.
+		if len(reqCounts) != len(batch.Users) {
+			reqCounts = zeroBigInts(len(batch.Users))
+		}
+		if len(tokCounts) != len(batch.Users) {
+			tokCounts = zeroBigInts(len(batch.Users))
+		}
+		args = []interface{}{batch.Users, batch.SPs, batch.Amounts, batch.Tokens, reqCounts, tokCounts, batch.DetailsHash}
+	}
+
 	cli := c.curClient()
 	bc := bind.NewBoundContract(c.contractAddr, c.abi, cli, cli, cli)
-	tx, err := bc.Transact(auth, "submitSettlement",
-		batch.Users, batch.SPs, batch.Amounts, batch.Tokens, batch.DetailsHash)
+	tx, err := bc.Transact(auth, "submitSettlement", args...)
 	if err != nil {
 		return nil, fmt.Errorf("send submitSettlement: %w", err)
 	}

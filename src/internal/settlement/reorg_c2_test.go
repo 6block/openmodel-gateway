@@ -19,8 +19,8 @@ func iptr(n int) *int { return &n }
 
 func TestReorgKeepsBatchUnconfirmedAndReplays(t *testing.T) {
 	mock := newMockContract()
-	mock.finalityErr = ErrReorged        // first finality wait sees the tx reorged away
-	mock.submitMarksProcessed = false    // a REAL reorg: the effect is gone on-chain too
+	mock.finalityErr = ErrReorged     // first finality wait sees the tx reorged away
+	mock.submitMarksProcessed = false // a REAL reorg: the effect is gone on-chain too
 	s, dir := newTestSettler(t, mock, discardLogger())
 	s.cfg.ConfirmationDepth = iptr(5)
 	reqLog := filepath.Join(dir, "requests.jsonl")
@@ -70,8 +70,8 @@ func TestReorgKeepsBatchUnconfirmedAndReplays(t *testing.T) {
 // and halved settlement throughput). So: one submit, no "reorged" metric, cursor advances.
 func TestFinalityFalsePositiveTreatedAsFinal(t *testing.T) {
 	mock := newMockContract()
-	mock.finalityErr = ErrReorged     // tx-hash receipt vanished before finality...
-	mock.submitMarksProcessed = true  // ...but the batch DID land on-chain (the effect persisted)
+	mock.finalityErr = ErrReorged    // tx-hash receipt vanished before finality...
+	mock.submitMarksProcessed = true // ...but the batch DID land on-chain (the effect persisted)
 	s, dir := newTestSettler(t, mock, discardLogger())
 	reqLog := filepath.Join(dir, "requests.jsonl")
 

@@ -29,6 +29,7 @@ import (
 	"openmodel/sp-state-agent/internal/metrics"
 	"openmodel/sp-state-agent/internal/settlement"
 	"openmodel/sp-state-agent/internal/worker"
+	"openmodel/sp-state-agent/internal/workermtls"
 )
 
 // maxRequestBody caps the request body we'll read to rewrite stream flag (10 MiB).
@@ -42,12 +43,14 @@ const (
 type apiKeyEntry struct {
 	Name   string
 	Wallet string
+	ID     string // key row id (k-…) for self-registered keys; "" for static/config keys
+	Static bool   // operator-configured key: listable but not deletable via /v1/keys
 }
 
 // Gateway is the OpenAI-compatible reverse proxy.
 type Gateway struct {
 	registry              *worker.Registry
-	apiKeys               map[string]apiKeyEntry // key string → metadata (empty map = auth disabled)
+	apiKeys               map[string]apiKeyEntry // sha256(key) hex → metadata (empty map = auth disabled)
 	keysMu                sync.RWMutex           // guards apiKeys (self-registration adds keys at runtime)
 	registrationsPath     string                 // JSON store of self-registered keys; empty = no persistence
 	seenSigs              map[string]time.Time   // recently-used registration signatures → expiry (replay guard)
@@ -66,6 +69,9 @@ type Gateway struct {
 	catalogCacheRead      map[string]*math_big.Float // per-token cache-read price (catalog split)
 	httpClient            *http.Client               // shared client for non-streaming forwards (connection pooling)
 	streamTransport       *http.Transport            // shared transport for streaming reverse proxy
+	nonStreamTransport    *http.Transport            // base for per-worker mTLS clones (pooling tuning)
+	workerMTLS            *workermtls.Factory        // nil/disabled → plaintext clients unchanged
+	certIssuer            *certIssuer                // nil → no certificate-at-registration
 	sessions              *sessionAffinity           // session→worker stickiness for prefix-cache reuse
 	rateLimiter           *RateLimiter               // per-key rate + concurrency abuse controls (B5); nil = disabled
 	maxRequestBytes       int64                      // max request body size; 0 falls back to maxRequestBody
@@ -73,7 +79,15 @@ type Gateway struct {
 	inFlight              atomic.Int64               // proxied requests currently being served (for drain accounting, B7)
 	sampler               *verificationSampler       // retains a fraction of req/resp pairs for SP fraud detection (A7); nil = off
 	streamResume          bool                       // B2: transparently continue server-interrupted streams on another worker
-	streamMaxResumes      int                        // B2: per-request continuation budget
+	webUI                 config.WebUIConfig         // embedded chat app (M4.1); zero value = disabled
+	regIPLimiter          *ipLimiter                 // per-IP limit on register/key-management (no API key exists yet on these calls)
+	maxKeysPerWallet      int                        // key-store v2 cap; 0 = default 10
+	usage                 *usageRing                 // recent-usage ring for /v1/me (in-memory, dashboard only)
+	auditor               *auditor                   // probe auditor; nil until StartAuditor (worker self-view reads it)
+	muxOnce               sync.Once
+	muxCached             *http.ServeMux
+	streamMaxResumes      int          // B2: per-request continuation budget
+	spReg                 *spRegistrar // SP self-registration (miner-signed admission); nil = disabled, routes 404
 	logger                *slog.Logger
 }
 
@@ -143,42 +157,54 @@ func New(registry *worker.Registry, cfg config.GatewayConfig, logger *slog.Logge
 		queueTimeout = 60 * time.Second
 	}
 
-	// Build API key lookup table
+	// Build the API key lookup table, keyed by sha256(key): the auth path hashes
+	// the presented bearer and never compares plaintext. Static/config keys are
+	// hashed here at load; self-registered keys arrive pre-hashed from the store.
 	keys := make(map[string]apiKeyEntry)
 	if len(cfg.APIKeys) > 0 {
 		for _, k := range cfg.APIKeys {
 			if k.Key != "" {
-				keys[k.Key] = apiKeyEntry{Name: k.Name, Wallet: k.Wallet}
+				keys[hashKey(k.Key)] = apiKeyEntry{Name: k.Name, Wallet: k.Wallet, Static: true}
 			}
 		}
 	} else if cfg.ClientToken != "" {
 		// Backward compat: single token → key named "default"
-		keys[cfg.ClientToken] = apiKeyEntry{Name: "default"}
+		keys[hashKey(cfg.ClientToken)] = apiKeyEntry{Name: "default", Static: true}
 	}
 
-	// Self-registered keys (POST /v1/register) persist to a JSON file next to the
-	// request log; load them at startup so they survive restarts and auth (and the
-	// authEnabled gate below) recognizes them alongside the static config keys.
+	// Self-registered keys (POST /v1/register, /v1/keys) persist to a JSON file
+	// next to the request log; load them at startup so they survive restarts and
+	// auth (and the authEnabled gate below) recognizes them alongside the static
+	// config keys. Loading also migrates any legacy plaintext rows to hashes.
 	registrationsPath := registrationsPathFor(cfg.RequestLogPath)
 	if registrationsPath != "" {
 		for _, rec := range loadRegistrationsFile(registrationsPath, logger) {
-			if rec.Key != "" {
-				keys[rec.Key] = apiKeyEntry{Name: rec.Name, Wallet: rec.Wallet}
+			if rec.KeyHash != "" {
+				keys[rec.KeyHash] = apiKeyEntry{Name: rec.Name, Wallet: rec.Wallet, ID: rec.ID}
 			}
 		}
 	}
 
 	// Shared transports so connections are pooled and reused across requests instead
 	// of building a fresh transport (and TCP/TLS handshake) per request (audit fix).
+	//
+	// idleConnTimeout must stay BELOW the worker's HTTP keep-alive, or the pool hands
+	// out connections the worker has already closed. Writing a POST into such a socket
+	// succeeds locally and then blocks until ResponseHeaderTimeout — a 5-minute hang
+	// ending in 502, for a worker that is perfectly healthy and never saw the request.
+	// uvicorn's default keep-alive is 5s, so this value protects workers running an
+	// image from before that default was raised; it costs only an extra handshake on
+	// sparse traffic, which is exactly the traffic shape that hits the bug.
+	const idleConnTimeout = 3 * time.Second
 	nonStreamTransport := &http.Transport{
 		MaxIdleConns:        100,
 		MaxIdleConnsPerHost: 16,
-		IdleConnTimeout:     90 * time.Second,
+		IdleConnTimeout:     idleConnTimeout,
 	}
 	streamTransport := &http.Transport{
 		MaxIdleConns:          100,
 		MaxIdleConnsPerHost:   16,
-		IdleConnTimeout:       90 * time.Second,
+		IdleConnTimeout:       idleConnTimeout,
 		ResponseHeaderTimeout: timeout, // bound time-to-first-byte; the stream body itself is unbounded
 	}
 
@@ -211,6 +237,7 @@ func New(registry *worker.Registry, cfg config.GatewayConfig, logger *slog.Logge
 		modelSwitchLoadFactor: cfg.ModelSwitchLoadFactor,
 		requestLogger:         reqLog,
 		httpClient:            &http.Client{Timeout: timeout, Transport: nonStreamTransport},
+		nonStreamTransport:    nonStreamTransport,
 		streamTransport:       streamTransport,
 		sessions:              newSessionAffinity(0),
 		rateLimiter: NewRateLimiter(RateLimitConfig{
@@ -220,6 +247,10 @@ func New(registry *worker.Registry, cfg config.GatewayConfig, logger *slog.Logge
 		}),
 		maxRequestBytes:  cfg.MaxRequestBytes,
 		streamResume:     cfg.StreamResume,
+		webUI:            cfg.WebUI,
+		regIPLimiter:     newIPLimiter(float64(orDefault(cfg.RegisterRatePerMin, 10))),
+		maxKeysPerWallet: cfg.MaxKeysPerWallet,
+		usage:            newUsageRing(512),
 		streamMaxResumes: maxResumes,
 		logger:           logger,
 	}
@@ -268,15 +299,41 @@ func (g *Gateway) InFlight() int64 { return g.inFlight.Load() }
 
 // Handler returns an http.Handler for the gateway.
 // Mount this on the gateway HTTP server (port 3000).
+// Handler returns the gateway's route mux. Built once and cached: every
+// listener (plain :port and the worker-direction TLS port) serves the SAME mux,
+// so late route mounts — like the settlement public-query routes, registered
+// after the servers are constructed — appear on all of them. ServeMux.Handle is
+// internally locked, so post-listen registration is safe.
 func (g *Gateway) Handler() http.Handler {
+	g.muxOnce.Do(func() { g.muxCached = g.buildMux() })
+	return g.muxCached
+}
+
+func (g *Gateway) buildMux() *http.ServeMux {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/v1/chat/completions", g.handleProxy)
 	mux.HandleFunc("/v1/completions", g.handleProxy)
 	mux.HandleFunc("/v1/models", g.handleModels)
 	mux.HandleFunc("/v1/catalog", g.handleCatalog)
 	mux.HandleFunc("/v1/register", g.handleRegister)
+	// SP self-view + retry lever (worker-token authenticated; see workerself.go).
+	mux.HandleFunc("/v1/worker/self", g.handleWorkerSelf)
+	mux.HandleFunc("/v1/worker/reverify", g.handleWorkerReverify)
+	mux.HandleFunc("/v1/keys", g.handleKeys)
+	mux.HandleFunc("/v1/keys/message", g.handleKeysMessage)
+	// Unconditional like its /v1/keys/message sibling: the canonical registration
+	// text must be fetchable even on deployments that turn the web UI off.
+	mux.HandleFunc("/v1/register/message", g.handleRegisterMessage)
+	mux.HandleFunc("/v1/me", g.handleMe)
+	mux.HandleFunc("/v1/f4addr", g.handleF4Addr)
+	mux.HandleFunc("/v1/sp/challenge", g.handleSPChallenge)
+	mux.HandleFunc("/v1/sp/register", g.handleSPRegister)
+	mux.HandleFunc("/v1/sp/renew-cert", g.handleSPRenewCert)
 	// Catch-all for unsupported /v1/* endpoints
 	mux.HandleFunc("/v1/", g.handleUnsupported)
+	if g.webUI.Enabled {
+		g.registerWebUI(mux)
+	}
 	return mux
 }
 
@@ -290,6 +347,7 @@ func (g *Gateway) selectWithAffinity(sessKey, requestModel string) (*worker.Work
 		if wid, ok := g.sessions.get(sessKey); ok {
 			if w, found := g.registry.Get(wid); found &&
 				(w.State == worker.StateIdle || w.State == worker.StateBusy) &&
+				!w.IsBanned() && // stickiness must not tunnel around a routing ban
 				(requestModel == "" || requestModel == "default" || modelMatches(w.LoadedModel, requestModel)) {
 				return w, nil
 			}
@@ -386,6 +444,17 @@ func (g *Gateway) handleProxy(w http.ResponseWriter, r *http.Request) {
 	}
 
 	requestModel := extractModel(body)
+	// A specific model id is required: the "default" alias (and an empty/missing
+	// model) is no longer accepted for external requests, so a client always knows
+	// — and is billed for — the exact model it asked for. The internal "default"
+	// routing (stream resume picking any capable worker) is untouched; this gate is
+	// only on the external entry point. extractModel returns "unknown" for a
+	// missing/non-string model field.
+	if requestModel == "" || requestModel == "default" || requestModel == "unknown" {
+		metrics.GatewayRequestsTotal.WithLabelValues("400", "none").Inc()
+		jsonError(w, "a specific model id is required (the \"default\" alias is no longer accepted); call GET /v1/models to list available models", http.StatusBadRequest)
+		return
+	}
 	isStreaming := extractBool(body, "stream")
 
 	// om_continuation is a GATEWAY-INTERNAL field (B2 stream resume). A client setting
@@ -430,6 +499,9 @@ func (g *Gateway) handleProxy(w http.ResponseWriter, r *http.Request) {
 		maxTokens := extractInt(body, "max_tokens")
 		if maxTokens <= 0 && g.settlementCfg != nil {
 			maxTokens = g.settlementCfg.DefaultMaxTokens
+			// Send it upstream too, not just into the reservation: the worker
+			// otherwise applies its own (much smaller) default and truncates.
+			body = withDefaultMaxTokens(body, maxTokens)
 		}
 		// Include a conservative estimate of the prompt (input) tokens. Without it the
 		// reservation only covers max_tokens (output), so a large prompt with a tiny
@@ -462,7 +534,17 @@ func (g *Gateway) handleProxy(w http.ResponseWriter, r *http.Request) {
 			jsonError(w, fmt.Sprintf("no worker supports model %q", requestModel), http.StatusNotFound)
 			return
 		}
-		target, err = g.blockForWorker(r.Context(), requestModel, time.Now().Add(g.requestTimeout))
+		// Wait bounded by queueTimeout — NOT requestTimeout. Passing requestTimeout
+		// here silently turned the 60s queue setting into a 300s hang: blockForWorker
+		// re-queues window after window until the deadline, so a client saw neither a
+		// response nor a 503 for 5 minutes (24h-soak finding #1: a 19-minute
+		// WindowPoSt made every 1.5B request hang until the client gave up at 90s;
+		// one that straddled the yield end succeeded at 84.3s, proving the re-queue
+		// loop). queueTimeout keeps the intended behavior for brief WinningPoSt
+		// yields (~35s < 60s window, request rides through transparently) while a
+		// long yield now fails fast with an honest Retry-After instead of hanging.
+		// requestTimeout remains the budget for requests that HAVE a worker.
+		target, err = g.blockForWorker(r.Context(), requestModel, time.Now().Add(g.queueTimeout))
 		if err != nil {
 			msg := "no available worker — all workers are mining or offline"
 			reason := "queue_timeout"
@@ -640,11 +722,18 @@ func (g *Gateway) handleNonStreaming(w http.ResponseWriter, r *http.Request, bod
 			continue
 		}
 		// Nothing servable at this instant. Rather than fail, wait in the queue for
-		// a worker to come back (mining is brief; offline windows are short), then
-		// retry with a fresh slate — bounded by the overall deadline.
-		w2, werr := g.blockForWorker(r.Context(), requestModel, deadline)
+		// a worker to come back (a WinningPoSt yield is brief), then retry with a
+		// fresh slate. Bounded by ONE queueTimeout window (and never past the overall
+		// deadline): the client has already been waiting through the failed attempts,
+		// so a long yield must surface as a fast 503 + Retry-After here too, not as
+		// another 5-minute hang (same soak finding as the initial-queue path above).
+		queueDeadline := time.Now().Add(g.queueTimeout)
+		if queueDeadline.After(deadline) {
+			queueDeadline = deadline
+		}
+		w2, werr := g.blockForWorker(r.Context(), requestModel, queueDeadline)
 		if werr != nil {
-			break // deadline reached, queue full, or client disconnected
+			break // queue window or deadline reached, queue full, or client disconnected
 		}
 		tried = make(map[string]bool) // a recovered worker is a fresh candidate
 		target = w2
@@ -674,6 +763,29 @@ func (g *Gateway) handleNonStreaming(w http.ResponseWriter, r *http.Request, bod
 	return "", tokenUsage{}
 }
 
+// SetWorkerMTLS arms all gateway→worker calls (forwarding, streaming, probing)
+// with the gateway's client certificate. Engages only for https worker
+// endpoints; plaintext workers are untouched (per-worker migration).
+func (g *Gateway) SetWorkerMTLS(f *workermtls.Factory) { g.workerMTLS = f }
+
+// workerHTTPClient returns the non-streaming client for one worker: identity-
+// pinned mTLS (ServerName = worker ID) when material is loaded, the shared
+// pooled plaintext client otherwise.
+func (g *Gateway) workerHTTPClient(workerID string) *http.Client {
+	if g.workerMTLS.Enabled() {
+		return g.workerMTLS.ClientFor(workerID, g.requestTimeout, g.nonStreamTransport)
+	}
+	return g.httpClient
+}
+
+// workerStreamTransport is the streaming twin of workerHTTPClient.
+func (g *Gateway) workerStreamTransport(workerID string) http.RoundTripper {
+	if g.workerMTLS.Enabled() {
+		return g.workerMTLS.TransportFor(workerID, g.streamTransport)
+	}
+	return g.streamTransport
+}
+
 // forwardRequest sends the request body to a worker and returns the full response.
 // Does NOT write to the client — caller decides what to do with the response.
 // The request is bound to ctx so a client disconnect (or handler timeout) cancels the
@@ -700,7 +812,7 @@ func (g *Gateway) forwardRequest(ctx context.Context, path string, body []byte, 
 		req.Header.Set("Authorization", "Bearer "+target.AuthToken)
 	}
 
-	resp, err := g.httpClient.Do(req)
+	resp, err := g.workerHTTPClient(target.ID).Do(req)
 	if err != nil {
 		return nil, 0, nil, workerID, err
 	}
@@ -799,7 +911,7 @@ func (g *Gateway) handleStreaming(w http.ResponseWriter, r *http.Request, body [
 					req.Header.Set("X-OM-Receipt-Req", "1")
 				}
 			},
-			Transport: g.streamTransport, // shared, pooled transport (audit fix)
+			Transport: g.workerStreamTransport(target.ID), // pooled; identity-pinned when mTLS is on
 			ModifyResponse: func(resp *http.Response) error {
 				if resp.StatusCode == http.StatusServiceUnavailable {
 					return errWorkerMining // retry on another worker (nothing sent yet)
@@ -844,7 +956,7 @@ func (g *Gateway) handleStreaming(w http.ResponseWriter, r *http.Request, body [
 
 		// The worker's own [DONE] is the authoritative end-of-stream signal. A read
 		// error AFTER it (e.g. a tunnel/socat hop turning the final FIN into RST, seen
-		// on the real fs3 path) is connection-teardown noise, not an interruption —
+		// on a real tunneled worker path) is connection-teardown noise, not an interruption —
 		// treating it as one mis-billed a COMPLETE stream as stream_interrupted ($0).
 		if proxyErr != nil && sseCap.heldDone {
 			proxyErr = nil
@@ -1204,6 +1316,13 @@ func (g *Gateway) waitForWorkerForModel(ctx context.Context, model string) (*wor
 // offline for 75s while the other is briefly mining) instead of failing. Returns
 // ErrNoWorkerAvailable once the deadline passes, or ErrQueueFull / ctx error.
 func (g *Gateway) blockForWorker(ctx context.Context, model string, deadline time.Time) (*worker.Worker, error) {
+	// Honesty short-circuit: when every mining candidate's B1 estimate says it
+	// will NOT be back within our wait budget, fail now with that estimate in
+	// Retry-After instead of making the client burn the whole queue window first.
+	// No estimate (older scheduler) → no short-circuit, wait normally.
+	if est := g.minMiningRecovery(model); est > 0 && time.Now().Add(est).After(deadline) {
+		return nil, ErrNoWorkerAvailable
+	}
 	for time.Now().Before(deadline) {
 		wkr, err := g.waitForWorkerForModel(ctx, model)
 		if err == nil {
@@ -1215,6 +1334,31 @@ func (g *Gateway) blockForWorker(ctx context.Context, model string, deadline tim
 		return nil, err // queue full or client disconnected
 	}
 	return nil, ErrNoWorkerAvailable
+}
+
+// minMiningRecovery returns the smallest decayed B1 recovery estimate among
+// mining workers that could serve the model (loaded, supported, or any for "").
+// 0 means "no usable estimate" — callers must then wait rather than assume.
+func (g *Gateway) minMiningRecovery(model string) time.Duration {
+	best := time.Duration(0)
+	now := time.Now()
+	for _, w := range g.registry.List() {
+		if w.State != worker.StateMining || w.SecondsUntilChange < 0 || w.UntilChangeAt.IsZero() {
+			continue
+		}
+		if model != "" && model != "default" &&
+			!modelMatches(w.LoadedModel, model) && !workerSupportsModel(&w, model) {
+			continue
+		}
+		rem := time.Duration(w.SecondsUntilChange)*time.Second - now.Sub(w.UntilChangeAt)
+		if rem < 0 {
+			rem = 0
+		}
+		if best == 0 || rem < best {
+			best = rem
+		}
+	}
+	return best
 }
 
 // waitForWorker blocks until any available worker appears (for backward compat).
@@ -1276,26 +1420,43 @@ func (g *Gateway) handleModels(w http.ResponseWriter, r *http.Request) {
 	seen := make(map[string]bool)
 	var models []map[string]interface{}
 
+	// The listing must be exactly the set a request can actually reach — the same
+	// verdict selectWorkerForModel gives. Listing only LOADED models got it wrong
+	// in both directions once switching existed: a verified switch target was
+	// invisible (the user could not select the model that would have worked), and
+	// a freshly loaded but not-yet-verified model was shown (selecting it could
+	// only fail against the admission gate).
 	for _, w := range g.registry.List() {
 		if w.State != worker.StateIdle && w.State != worker.StateBusy {
 			continue
 		}
-		if w.LoadedModel != "" && !seen[w.LoadedModel] {
-			seen[w.LoadedModel] = true
+		for _, m := range routableModels(&w, g.registry.AdmissionGateEnabled()) {
+			if m == "" {
+				continue
+			}
+			// Dedupe on the canonical id: a worker reports the same model both as
+			// its loaded weight path and as a supported HuggingFace id, and keying
+			// on the raw string listed it twice (the picker showed two identical
+			// entries). normalizeModelKey folds away the remaining punctuation and
+			// case differences between the two spellings.
+			id := canonicalModelID(m)
+			key := normalizeModelKey(id)
+			if seen[key] {
+				continue
+			}
+			seen[key] = true
 			models = append(models, map[string]interface{}{
-				"id":       w.LoadedModel,
+				"id":       id,
 				"object":   "model",
 				"owned_by": "openmodel",
 			})
 		}
 	}
 
-	if !seen["default"] {
-		models = append([]map[string]interface{}{{
-			"id":       "default",
-			"object":   "model",
-			"owned_by": "openmodel",
-		}}, models...)
+	// No synthetic "default" entry: clients must request an exact model id, so the
+	// listing advertises only models a request can route to (empty when none).
+	if models == nil {
+		models = []map[string]interface{}{}
 	}
 
 	w.Header().Set("Content-Type", "application/json")
@@ -1305,21 +1466,44 @@ func (g *Gateway) handleModels(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-// handleCatalog returns a rich model catalog: per-model pricing (input / output /
-// cache-read, USD per 1M tokens) and limits (context window, max output) — the
-// data backing a model-listing UI. Prices come from the settlement config
-// (model_prices_usd = output/base, model_catalog = input/cache-read + limits);
-// availability comes from the live worker registry.
-func (g *Gateway) handleCatalog(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodGet {
-		jsonError(w, "GET only", http.StatusMethodNotAllowed)
-		return
-	}
-	if _, ok := g.authenticate(r); !ok {
-		jsonError(w, "invalid or missing Authorization header", http.StatusUnauthorized)
-		return
-	}
+// resolvedModel is one model's fully-resolved pricing + limits + availability.
+// Prices are strings (USD per 1M tokens) exactly as configured. Input is the
+// cache-MISS prompt rate; CacheRead is the cache-HIT (prefix-cache) prompt rate.
+type resolvedModel struct {
+	ID            string
+	Input         string
+	Output        string
+	CacheRead     string
+	ContextWindow int
+	MaxOutput     int
+	Available     bool
+}
 
+// resolveModels merges the configured price/catalog keys with the models actually
+// loaded/supported by live workers, applying the "default" fallback the biller
+// uses, and marks which are routable right now. Shared by the authed catalog
+// endpoint and the public webconfig so the UI and the billing agree by construction.
+// AvailableModelCount is how many models a client can actually be served RIGHT
+// NOW: a model counts only when some live worker can be routed to for it — the
+// worker is idle or busy (not offline or loading) and, for self-registered
+// workers under the admission gate, has passed the probe for that model.
+//
+// Deliberately NOT the size of the configured catalog. The catalog lists what the
+// network intends to offer, including entries no provider currently serves;
+// publishing that as the metric would report capacity nobody can reach. This uses
+// the same resolution the router and /v1/models use, so the published number and
+// what a request can actually reach cannot drift apart.
+func (g *Gateway) AvailableModelCount() int {
+	n := 0
+	for _, m := range g.resolveModels() {
+		if m.Available {
+			n++
+		}
+	}
+	return n
+}
+
+func (g *Gateway) resolveModels() []resolvedModel {
 	ids := map[string]bool{}
 	var prices map[string]string
 	var catalog map[string]settlement.ModelInfo
@@ -1333,24 +1517,27 @@ func (g *Gateway) handleCatalog(w http.ResponseWriter, r *http.Request) {
 			ids[m] = true
 		}
 	}
-	// Availability: models loaded/supported by a currently routable worker.
 	avail := map[string]bool{}
-	for _, wk := range g.registry.List() {
-		routable := wk.State == worker.StateIdle || wk.State == worker.StateBusy
-		if wk.LoadedModel != "" {
-			ids[wk.LoadedModel] = true
-			if routable {
-				avail[wk.LoadedModel] = true
+	if g.registry != nil {
+		gateOn := g.registry.AdmissionGateEnabled()
+		for _, wk := range g.registry.List() {
+			routable := wk.State == worker.StateIdle || wk.State == worker.StateBusy
+			// ids: everything claimed (so pricing shows even for pending models);
+			// avail: only what a request can actually route to — same caliber as
+			// the router and /v1/models (verified-gated for self-registered).
+			if wk.LoadedModel != "" {
+				ids[wk.LoadedModel] = true
 			}
-		}
-		for _, sm := range wk.SupportedModels {
-			ids[sm] = true
+			for _, sm := range wk.SupportedModels {
+				ids[sm] = true
+			}
 			if routable {
-				avail[sm] = true
+				for _, m := range routableModels(&wk, gateOn) {
+					avail[m] = true
+				}
 			}
 		}
 	}
-
 	priceOf := func(m map[string]string, id string) string {
 		if m == nil {
 			return ""
@@ -1369,8 +1556,7 @@ func (g *Gateway) handleCatalog(w http.ResponseWriter, r *http.Request) {
 		}
 		return catalog["default"]
 	}
-
-	out := []map[string]interface{}{}
+	out := []resolvedModel{}
 	for id := range ids {
 		if id == "default" { // pricing fallback key, not a real model
 			continue
@@ -1380,14 +1566,39 @@ func (g *Gateway) handleCatalog(w http.ResponseWriter, r *http.Request) {
 		if input == "" {
 			input = priceOf(prices, id) // no explicit input price → fall back to output/base
 		}
+		out = append(out, resolvedModel{
+			ID: id, Input: input, Output: priceOf(prices, id), CacheRead: info.CacheReadUSD,
+			ContextWindow: info.ContextWindow, MaxOutput: info.MaxOutput, Available: avail[id],
+		})
+	}
+	return out
+}
+
+// handleCatalog returns a rich model catalog: per-model pricing (input / output /
+// cache-read, USD per 1M tokens) and limits (context window, max output) — the
+// data backing a model-listing UI. Prices come from the settlement config
+// (model_prices_usd = output/base, model_catalog = input/cache-read + limits);
+// availability comes from the live worker registry.
+func (g *Gateway) handleCatalog(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		jsonError(w, "GET only", http.StatusMethodNotAllowed)
+		return
+	}
+	if _, ok := g.authenticate(r); !ok {
+		jsonError(w, "invalid or missing Authorization header", http.StatusUnauthorized)
+		return
+	}
+
+	out := []map[string]interface{}{}
+	for _, m := range g.resolveModels() {
 		out = append(out, map[string]interface{}{
-			"id":                          id,
-			"input_price_usd_per_1m":      input,
-			"output_price_usd_per_1m":     priceOf(prices, id),
-			"cache_read_price_usd_per_1m": info.CacheReadUSD,
-			"context_window":              info.ContextWindow,
-			"max_output":                  info.MaxOutput,
-			"available":                   avail[id],
+			"id":                          m.ID,
+			"input_price_usd_per_1m":      m.Input,
+			"output_price_usd_per_1m":     m.Output,
+			"cache_read_price_usd_per_1m": m.CacheRead,
+			"context_window":              m.ContextWindow,
+			"max_output":                  m.MaxOutput,
+			"available":                   m.Available,
 		})
 	}
 	resp := map[string]interface{}{"object": "list", "data": out}
@@ -1417,14 +1628,16 @@ func (g *Gateway) authenticate(r *http.Request) (apiKeyEntry, bool) {
 	}
 	token := strings.TrimSpace(strings.TrimPrefix(auth, "Bearer "))
 	g.keysMu.RLock()
-	entry, ok := g.apiKeys[token]
+	entry, ok := g.apiKeys[hashKey(token)]
 	g.keysMu.RUnlock()
 	return entry, ok
 }
 
-// logRequest writes to the persistent request log (if enabled).
+// logRequest writes to the persistent request log (if enabled) and feeds the
+// in-memory recent-usage ring behind /v1/me.
 func (g *Gateway) logRequest(rec RequestRecord) {
 	g.requestLogger.Log(rec)
+	g.recordUsage(rec)
 }
 
 // retainSample records a served request/response pair for offline SP fraud detection
@@ -1505,6 +1718,30 @@ func hasTopLevelKey(body []byte, key string) bool {
 	}
 	_, ok := m[key]
 	return ok
+}
+
+// withDefaultMaxTokens writes the gateway's default max_tokens into the upstream
+// body when the client did not specify one.
+//
+// Without this the number was only ever used to size the balance reservation and
+// never reached the worker, so py-inference fell back to its own 256 default:
+// the gateway reserved for 512, the catalog advertised 4096, and the user's
+// answer was cut off at 256 tokens mid-sentence. Three numbers, and the one the
+// user actually experienced was the one nobody configured.
+func withDefaultMaxTokens(body []byte, def int) []byte {
+	if def <= 0 || hasTopLevelKey(body, "max_tokens") {
+		return body // an explicit client value always wins
+	}
+	var m map[string]json.RawMessage
+	if json.Unmarshal(body, &m) != nil {
+		return body
+	}
+	m["max_tokens"] = json.RawMessage(strconv.Itoa(def))
+	out, err := json.Marshal(m)
+	if err != nil {
+		return body
+	}
+	return out
 }
 
 // withContinuation builds the upstream body for a mid-stream continuation (B2): the
@@ -2048,4 +2285,21 @@ func jsonError(w http.ResponseWriter, message string, status int) {
 			"type":    "gateway_error",
 		},
 	})
+}
+
+// MountPublicQuery mounts the settlement public read-only routes (receipt-proof,
+// sp-earnings-detail) onto this gateway's own mux via the provided registrar, so
+// the HTTPS web UI can fetch receipts same-origin (no mixed content, no CORS).
+func (g *Gateway) MountPublicQuery(register func(mux *http.ServeMux)) {
+	g.Handler() // ensure the cached mux exists
+	register(g.muxCached)
+}
+
+// orDefault returns v, or def when v is zero — an explicit operator setting
+// (even one lower than def) is respected, unlike a floor via max().
+func orDefault(v, def int) int {
+	if v == 0 {
+		return def
+	}
+	return v
 }

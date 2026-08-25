@@ -38,9 +38,11 @@ func (m *mockReader) GetSettlement(ctx context.Context, id uint64) (settlement.O
 func (m *mockReader) IsProcessedBatch(ctx context.Context, h [32]byte) (bool, error) {
 	return m.processed, nil
 }
-func (m *mockReader) OperatorBalance(ctx context.Context) (*big.Int, error) { return big.NewInt(0), nil }
-func (m *mockReader) OperatorAddress() common.Address                       { return common.Address{} }
-func (m *mockReader) PlatformFeeBps(ctx context.Context) (int64, error)     { return 300, nil }
+func (m *mockReader) OperatorBalance(ctx context.Context) (*big.Int, error) {
+	return big.NewInt(0), nil
+}
+func (m *mockReader) OperatorAddress() common.Address                   { return common.Address{} }
+func (m *mockReader) PlatformFeeBps(ctx context.Context) (int64, error) { return 300, nil }
 
 func setupDetailAPI(t *testing.T, mock *mockReader, withLocalAudit bool) *httptest.Server {
 	t.Helper()

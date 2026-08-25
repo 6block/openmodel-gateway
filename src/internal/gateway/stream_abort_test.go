@@ -52,7 +52,7 @@ func TestBilling_StreamHardClientAbortBillsDelivered(t *testing.T) {
 	gw, bc, cleanup := newBillingGateway(t, usdcWei(100000), up.URL) // ModelPricesUSD = $1/token
 	defer cleanup()
 
-	body := `{"model":"default","messages":[{"role":"user","content":"x"}],"max_tokens":30,"stream":true}`
+	body := `{"model":"test-model","messages":[{"role":"user","content":"x"}],"max_tokens":30,"stream":true}`
 	ctx, cancel := context.WithCancel(context.Background())
 	req, err := http.NewRequestWithContext(ctx, "POST", gw.URL+"/v1/chat/completions", strings.NewReader(body))
 	if err != nil {

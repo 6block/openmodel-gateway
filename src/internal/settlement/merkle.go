@@ -244,7 +244,7 @@ func (s *Settler) BuildReceiptProof(rid string) (*ReceiptProof, error) {
 		DetailsHash: batch.DetailsHash,
 		TxHash:      batch.TxHash,
 		BlockNumber: batch.BlockNumber,
-		Verify: "1) leaf == sha256 of the canonical leaf JSON (see docs/design-improvements.md A1); " +
+		Verify: "1) leaf == sha256 of the canonical leaf JSON (byte-level formats: the contracts repo, docs/verification.md); " +
 			"2) fold leaf up the proof (sha256 pairs, index parity picks side) == merkle_root; " +
 			"3) sha256(legacy_hash || merkle_root) == details_hash; " +
 			"4) details_hash matches getSettlement(batchId).detailsHash on-chain (tx_hash/block above); " +

@@ -1,6 +1,7 @@
 package worker
 
 import (
+	"encoding/json"
 	"strings"
 	"time"
 )
@@ -34,10 +35,31 @@ type Worker struct {
 	ActiveRequests  int         `json:"active_requests"`
 	LoadedModel     string      `json:"loaded_model"`
 	SupportedModels []string    `json:"supported_models,omitempty"` // Models this worker can load
-	GPUCount        int         `json:"gpu_count"`
-	MinerAddress    string      `json:"miner_address"`
-	LastPollTime    time.Time   `json:"last_poll_time"`
-	RegisteredAt    time.Time   `json:"registered_at"`
+	// VerifiedModels is the EVIDENCE-BACKED model list: every entry passed an
+	// admission probe on THIS worker (per-model score floor). With the probe
+	// admission gate on, routing for self-registered workers trusts only this
+	// list — supported_models is merely the claim, this is the proof. Persisted;
+	// survives re-registration so a routine restart never re-pays verification.
+	VerifiedModels []string  `json:"verified_models,omitempty"`
+	VerifiedAt     time.Time `json:"verified_at,omitempty"` // when the list was last fully confirmed
+	GPUCount       int       `json:"gpu_count"`
+	MinerAddress   string    `json:"miner_address"`
+	LastPollTime   time.Time `json:"last_poll_time"`
+	RegisteredAt   time.Time `json:"registered_at"`
+
+	// PayoutAddress is the EVM address settlement pays this worker's earnings to.
+	// Set (miner-signed) by SP self-registration; overrides the static
+	// sp_address_map for this worker's miner. Empty = resolve via static config.
+	PayoutAddress string `json:"payout_address,omitempty"`
+	// SelfRegistered marks workers that arrived via POST /v1/sp/register (miner
+	// signature + admission checks) rather than the operator admin API.
+	SelfRegistered bool `json:"self_registered,omitempty"`
+
+	// BannedUntil, when in the future, excludes this worker from routing (no
+	// inference tasks are dispatched) while polling continues — the punishment
+	// lever paired with on-chain frozen-earnings confiscation. Zero = not banned.
+	BannedUntil time.Time `json:"banned_until,omitempty"`
+	BanReason   string    `json:"ban_reason,omitempty"`
 
 	// InFlight is the gateway's own real-time count of requests dispatched to this
 	// worker that haven't completed yet. It is a transient runtime value filled in
@@ -115,6 +137,49 @@ type WorkerRegistration struct {
 	MinerAddress    string   `json:"miner_address"`
 	SupportedModels []string `json:"supported_models,omitempty"` // Models this worker can load
 	AuthToken       string   `json:"auth_token,omitempty"`       // per-worker shared secret (see Worker.AuthToken)
+	PayoutAddress   string   `json:"payout_address,omitempty"`   // miner-signed EVM payout (self-registration); empty preserves any existing value
+	SelfRegistered  bool     `json:"self_registered,omitempty"`
+}
+
+// IsBanned reports whether the worker is currently excluded from routing.
+func (w *Worker) IsBanned() bool {
+	return !w.BannedUntil.IsZero() && time.Now().Before(w.BannedUntil)
+}
+
+// MarshalJSON omits zero-valued timestamps instead of emitting
+// "0001-01-01T00:00:00Z". encoding/json's `omitempty` has no effect on struct
+// types — and time.Time is a struct — so the tags alone left a meaningless zero
+// date in every response. `banned_until: "0001-01-01T00:00:00Z"` on a perfectly
+// healthy worker reads as "banned until year 1", which is exactly the kind of
+// thing a dashboard renders verbatim.
+//
+// Only the API view changes: disk persistence uses persistedWorker, so ban
+// survival across restarts is untouched.
+func (w Worker) MarshalJSON() ([]byte, error) {
+	type alias Worker // shed the method set, otherwise this recurses
+	opt := func(t time.Time) *time.Time {
+		if t.IsZero() {
+			return nil
+		}
+		return &t
+	}
+	// Shallower fields win over the embedded alias's, so these pointer versions
+	// are what actually get encoded for these four keys.
+	return json.Marshal(struct {
+		BannedUntil    *time.Time `json:"banned_until,omitempty"`
+		LoadingSince   *time.Time `json:"loading_since,omitempty"`
+		SwitchingSince *time.Time `json:"switching_since,omitempty"`
+		UntilChangeAt  *time.Time `json:"until_change_at,omitempty"`
+		VerifiedAt     *time.Time `json:"verified_at,omitempty"`
+		alias
+	}{
+		BannedUntil:    opt(w.BannedUntil),
+		LoadingSince:   opt(w.LoadingSince),
+		SwitchingSince: opt(w.SwitchingSince),
+		UntilChangeAt:  opt(w.UntilChangeAt),
+		VerifiedAt:     opt(w.VerifiedAt),
+		alias:          alias(w),
+	})
 }
 
 // DeriveState maps raw M1 states to network-level WorkerState.
@@ -135,9 +200,12 @@ func DeriveState(gpuState, engineState string, activeRequests int) WorkerState {
 		// GPU is free for inference. Check engine actually ready.
 		if !isEngineReady(engineState) {
 			// Distinguish model loading (switch) from other unavailable states.
-			// Loading = model switch in progress, will be ready soon.
-			// Paused/unloading = typically post-mining recovery.
-			if engineState == "loading" || engineState == "starting" {
+			// Loading/starting = switch in progress. Unloading with the GPU still
+			// AVAILABLE is the FIRST HALF of that same switch (a mining yield flips
+			// gpu_state first) — labeling it "mining" made every model switch
+			// surface as "GPUs are busy mining" to clients. Paused stays mining:
+			// that is genuinely post-yield recovery.
+			if engineState == "loading" || engineState == "starting" || engineState == "unloading" {
 				return StateLoading
 			}
 			return StateMining

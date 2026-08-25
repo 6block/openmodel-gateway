@@ -38,7 +38,7 @@ const unsupportedModelBody = `{"model":"no-such-model-xyz"}`
 // billing). Uses httptest.NewRecorder so it needs no network socket.
 func TestHandleProxyBodyTooLarge(t *testing.T) {
 	gw := newLimitGateway(t, config.GatewayConfig{MaxRequestBytes: 64})
-	big := `{"model":"default","prompt":"` + strings.Repeat("x", 200) + `"}`
+	big := `{"model":"test-model","prompt":"` + strings.Repeat("x", 200) + `"}`
 
 	rec := httptest.NewRecorder()
 	gw.handleProxy(rec, proxyReq(big))

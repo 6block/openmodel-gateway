@@ -14,7 +14,10 @@ func TestDeriveState(t *testing.T) {
 		{"available + running + requests", "GPU_STATE_AVAILABLE", "running", 5, StateBusy},
 		{"available + loading → loading (model switch)", "GPU_STATE_AVAILABLE", "loading", 0, StateLoading},
 		{"available + starting → loading", "GPU_STATE_AVAILABLE", "starting", 0, StateLoading},
-		{"available + unloading → mining", "GPU_STATE_AVAILABLE", "unloading", 0, StateMining},
+		// Unloading with the GPU still AVAILABLE is the first half of a model
+		// switch (a mining yield flips gpu_state first) — it must read as
+		// loading, or every switch surfaces as "busy mining" to clients.
+		{"available + unloading → loading", "GPU_STATE_AVAILABLE", "unloading", 0, StateLoading},
 		{"available + paused → mining", "GPU_STATE_AVAILABLE", "paused", 0, StateMining},
 		{"available + empty engine_state (backward compat) → idle", "GPU_STATE_AVAILABLE", "", 0, StateIdle},
 		{"yielding", "GPU_STATE_YIELDING", "running", 0, StateMining},

@@ -78,7 +78,7 @@ func TestGetSettlementUnpack(t *testing.T) {
 	}
 
 	// Exercise the SAME helper ContractClient.GetSettlement uses in production.
-	out, err := unpackSettlement(parsed, packed)
+	out, err := unpackSettlement(parsed, 2, packed)
 	if err != nil {
 		t.Fatalf("unpack: %v", err)
 	}
@@ -86,5 +86,9 @@ func TestGetSettlementUnpack(t *testing.T) {
 		out.TotalAmount.Int64() != 5000 || out.SettledCount.Int64() != 3 ||
 		out.FailedCount.Int64() != 1 || out.DetailsHash != dh {
 		t.Errorf("field mapping wrong: %+v", out)
+	}
+	// Schema 2 has no stats fields — they must stay nil (the admin API keys off that).
+	if out.RequestCount != nil || out.TokenCount != nil {
+		t.Errorf("schema-2 stats fields must be nil, got %+v", out)
 	}
 }

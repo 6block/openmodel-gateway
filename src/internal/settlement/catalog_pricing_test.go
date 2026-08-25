@@ -55,8 +55,8 @@ func TestRecordCostFlatWithoutCatalog(t *testing.T) {
 // tokens fall back to the input rate (no free cache, no crash).
 func TestRecordCostNoCacheReadRate(t *testing.T) {
 	cfg := &Config{
-		ModelPricesUSD: map[string]string{"default": "0.60"},
-		ModelCatalog:   map[string]ModelInfo{"default": {InputUSD: "0.20"}},
+		ModelPricesUSD:  map[string]string{"default": "0.60"},
+		ModelCatalog:    map[string]ModelInfo{"default": {InputUSD: "0.20"}},
 		SupportedTokens: []TokenConfig{{Symbol: "FIL", Address: "0x0000000000000000000000000000000000000000", Decimals: 18}},
 	}
 	cfg.ApplyDefaults()

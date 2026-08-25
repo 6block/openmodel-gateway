@@ -13,13 +13,19 @@ import (
 	"time"
 
 	"openmodel/sp-state-agent/internal/metrics"
+	"openmodel/sp-state-agent/internal/workermtls"
 )
+
+// unreachableLogEvery paces the "still unreachable" WARN for a worker that
+// stays offline: at the default 5s poll interval, one line every ~10 minutes.
+const unreachableLogEvery = 120
 
 // Poller periodically polls each registered SP worker's M1 endpoints
 // to collect their state (GPU state from go-scheduler, engine state from py-inference).
 type Poller struct {
 	registry         *Registry
 	client           *http.Client
+	mtls             *workermtls.Factory // nil/disabled → p.client (plaintext) unchanged
 	logger           *slog.Logger
 	interval         time.Duration
 	failureThreshold int // Consecutive poll failures before marking offline
@@ -47,6 +53,19 @@ func NewPoller(registry *Registry, interval time.Duration, failureThreshold int,
 // SetOnChange registers a callback for state transitions.
 func (p *Poller) SetOnChange(fn func(workerID string, oldState, newState WorkerState)) {
 	p.onChange = fn
+}
+
+// SetWorkerMTLS arms polling with the gateway's client certificate. Only https
+// worker endpoints engage it; http endpoints keep using the shared plain client.
+func (p *Poller) SetWorkerMTLS(f *workermtls.Factory) { p.mtls = f }
+
+// clientFor returns the poll client for one worker: identity-pinned mTLS when
+// material is loaded, the shared plaintext client otherwise.
+func (p *Poller) clientFor(workerID string) *http.Client {
+	if p.mtls.Enabled() {
+		return p.mtls.ClientFor(workerID, p.client.Timeout, nil)
+	}
+	return p.client
 }
 
 // SetPollTimeout overrides the per-poll HTTP timeout (default 5s). Used to raise the
@@ -110,7 +129,7 @@ func (p *Poller) pollAll(ctx context.Context) {
 // On failure, increments consecutive failure counter; marks offline only after threshold.
 func (p *Poller) pollWorker(ctx context.Context, w Worker) {
 	t0 := time.Now()
-	gpuState, untilChange, err := p.fetchGPUState(ctx, w.SchedulerURL, w.AuthToken)
+	gpuState, untilChange, err := p.fetchGPUState(ctx, w.ID, w.SchedulerURL, w.AuthToken)
 	metrics.PollDuration.WithLabelValues("go-scheduler").Observe(time.Since(t0).Seconds())
 	if err != nil {
 		metrics.PollTotal.WithLabelValues("error").Inc()
@@ -119,7 +138,7 @@ func (p *Poller) pollWorker(ctx context.Context, w Worker) {
 	}
 
 	t1 := time.Now()
-	engineState, activeRequests, loadedModel, engineCount, features, receiptPubkey, err := p.fetchInferenceHealth(ctx, w.Endpoint, w.AuthToken)
+	engineState, activeRequests, loadedModel, engineCount, features, receiptPubkey, err := p.fetchInferenceHealth(ctx, w.ID, w.Endpoint, w.AuthToken)
 	metrics.PollDuration.WithLabelValues("py-inference").Observe(time.Since(t1).Seconds())
 	if err != nil {
 		metrics.PollTotal.WithLabelValues("error").Inc()
@@ -165,26 +184,38 @@ func (p *Poller) handlePollFailure(workerID, source string, err error) {
 		"error", err,
 	)
 
-	if !shouldOffline {
-		return
-	}
-
-	oldState, changed := p.registry.MarkOffline(workerID)
-	if changed {
-		p.logger.Warn("worker marked offline after consecutive failures",
-			"worker", workerID,
-			"failures", failures,
-			"last_error", err.Error(),
-		)
-		if p.onChange != nil {
-			p.onChange(workerID, oldState, StateOffline)
+	if shouldOffline {
+		oldState, changed := p.registry.MarkOffline(workerID)
+		if changed {
+			p.logger.Warn("worker marked offline after consecutive failures",
+				"worker", workerID,
+				"failures", failures,
+				"last_error", err.Error(),
+			)
+			if p.onChange != nil {
+				p.onChange(workerID, oldState, StateOffline)
+			}
+			return
 		}
+	}
+	// No state transition to announce — which is exactly the silent case: a
+	// worker that has never been reachable STARTS offline (RecordPollFailure
+	// then never recommends the transition), so its failures used to be
+	// visible only at Debug level. Surface the first threshold crossing and
+	// then roughly every ten minutes, with the actual error.
+	if failures == p.failureThreshold || (failures > p.failureThreshold && failures%unreachableLogEvery == 0) {
+		p.logger.Warn("worker still unreachable",
+			"worker", workerID,
+			"source", source,
+			"consecutive_failures", failures,
+			"error", err.Error(),
+		)
 	}
 }
 
 // fetchGPUState calls the go-scheduler /ready endpoint and parses the gpu_state.
 // Response format: "ready, gpu_state=GPU_STATE_AVAILABLE\n"
-func (p *Poller) fetchGPUState(ctx context.Context, schedulerURL, token string) (string, int64, error) {
+func (p *Poller) fetchGPUState(ctx context.Context, workerID, schedulerURL, token string) (string, int64, error) {
 	url := strings.TrimRight(schedulerURL, "/") + "/ready"
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
 	if err != nil {
@@ -194,7 +225,7 @@ func (p *Poller) fetchGPUState(ctx context.Context, schedulerURL, token string) 
 		req.Header.Set("Authorization", "Bearer "+token)
 	}
 
-	resp, err := p.client.Do(req)
+	resp, err := p.clientFor(workerID).Do(req)
 	if err != nil {
 		return "", -1, err
 	}
@@ -251,7 +282,7 @@ type multiGPUInfo struct {
 }
 
 // fetchInferenceHealth calls the py-inference /health endpoint.
-func (p *Poller) fetchInferenceHealth(ctx context.Context, endpoint, token string) (engineState string, activeRequests int, loadedModel string, engineCount int, features []string, receiptPubkey string, err error) {
+func (p *Poller) fetchInferenceHealth(ctx context.Context, workerID, endpoint, token string) (engineState string, activeRequests int, loadedModel string, engineCount int, features []string, receiptPubkey string, err error) {
 	url := strings.TrimRight(endpoint, "/") + "/health"
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
 	if err != nil {
@@ -261,7 +292,7 @@ func (p *Poller) fetchInferenceHealth(ctx context.Context, endpoint, token strin
 		req.Header.Set("Authorization", "Bearer "+token)
 	}
 
-	resp, err := p.client.Do(req)
+	resp, err := p.clientFor(workerID).Do(req)
 	if err != nil {
 		return "", 0, "", 0, nil, "", err
 	}

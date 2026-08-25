@@ -12,15 +12,15 @@ import (
 
 // StateCheckResult summarizes the integrity of the on-disk settlement state.
 type StateCheckResult struct {
-	OK            bool     `json:"ok"`
-	CursorOffset  int64    `json:"cursor_offset"`
-	SettledUSD    string   `json:"settled_usd"`
-	DebtEntries   int      `json:"debt_entries"`
-	DeadLetters   int      `json:"dead_letters"`
-	WALPresent    bool     `json:"wal_present"`
-	WALConfirmed  int      `json:"wal_confirmed_batches"`
-	WALTotal      int      `json:"wal_total_batches"`
-	Problems      []string `json:"problems"`
+	OK           bool     `json:"ok"`
+	CursorOffset int64    `json:"cursor_offset"`
+	SettledUSD   string   `json:"settled_usd"`
+	DebtEntries  int      `json:"debt_entries"`
+	DeadLetters  int      `json:"dead_letters"`
+	WALPresent   bool     `json:"wal_present"`
+	WALConfirmed int      `json:"wal_confirmed_batches"`
+	WALTotal     int      `json:"wal_total_batches"`
+	Problems     []string `json:"problems"`
 }
 
 // VerifyState reads and cross-checks the settler's persisted state files. It never

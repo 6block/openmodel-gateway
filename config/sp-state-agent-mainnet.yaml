@@ -1,59 +1,98 @@
 # ============================================================================
 # PRODUCTION / MAINNET config template for sp-gateway.
 #
-# Every SECRET is read from an environment variable (interpolated at load), so no
-# secret is ever written into this file. Fill the <PLACEHOLDER> values (chain- and
-# deployment-specific) before starting. Key-custody + deploy procedure:
-# see your key-custody runbook.
+# Every SECRET is read from an environment variable (interpolated at load) — no
+# secret is ever written into this file. Fill the <<< placeholders before
+# starting. Compose note: any ${VAR} you use here must ALSO be passed through
+# in docker-compose.yml `environment:` (CLIENT_KEY_1, AGENT_ADMIN_TOKEN,
+# OPERATOR_PRIVATE_KEY, VERIFY_SAMPLE_RATE, VERIFY_SAMPLE_PATH are pre-wired),
+# and CONFIG_PATH must point at this file instead of the default sample.
 #
-# mode: prod makes the gateway REFUSE to start if admin.token or client auth is empty
-# (fail-closed, G1). Never run mainnet with auth disabled.
+# mode: prod makes the gateway REFUSE to start if admin.token or client auth is
+# missing — including the case where every api_keys entry expands to an empty
+# value because its ${ENV} var is unset. Never run mainnet with auth disabled.
 # ============================================================================
 mode: prod
 
 gateway:
   port: 3000
-  # Client API keys. The `key` values are SECRETS — inject via env, never inline.
-  # Each key binds to a funding wallet used for billing. Self-registration (/v1/register)
-  # can also add keys at runtime.
+  web_ui:
+    enabled: true
+    # Same-origin base the web app uses for receipt links and read-only queries.
+    # Point it at the PUBLIC https address of the https_port listener below.
+    public_query_url: "https://<public-host>:<mapped-https-port>"   # <<<
+  # Client API keys. The `key` values are SECRETS — inject via env, never
+  # inline. Each key binds to a funding wallet used for billing.
+  # Self-registration (/v1/register) also adds keys at runtime.
   api_keys:
     - key: ${CLIENT_KEY_1}
       name: client1
-      wallet: "<CLIENT_1_EVM_WALLET>"
-  request_timeout_sec: 300        # covers 8-GPU model switch (~150s)
+      wallet: "<CLIENT_1_EVM_WALLET>"   # <<< the wallet this key bills to
+  # Reverse proxies (IPs/CIDRs) whose X-Forwarded-For is believed for per-IP
+  # rate limiting. REQUIRED when fronting the gateway with a domain proxy —
+  # without it every user arriving through the proxy shares one rate bucket.
+  # trusted_proxies: ["<your-proxy-ip>"]
+  request_timeout_sec: 300        # covers an 8-GPU model switch (~150s)
+  stream_resume: true             # streamed requests carry worker-signed receipts and can resume on another worker; without it the gateway never asks the worker to sign
   queue_timeout_sec: 60
   max_queue_size: 100
   model_switch_load_factor: 2.0
   request_log_path: /data/requests.jsonl
   request_log_max_mb: 50
-  request_log_backups: 10          # retention (max_mb × backups) must exceed one settlement cycle of traffic
+  request_log_backups: 10          # retention (max_mb x backups) must exceed one settlement cycle of traffic
   # Abuse controls — set to your tier limits.
   rate_per_sec_per_key: 20
   rate_burst_per_key: 40
   max_concurrent_per_key: 16
   max_request_bytes: 10485760      # 10 MiB
 
+# --- SP self-registration + certificate issuance ---
+sp_registration:
+  enabled: true
+  gateway_id: "<your-gateway-id>"         # <<< TLS identity + signature domain; NOT an address
+  filecoin_rpc_urls:                      # native Lotus API (NOT the FEVM eth endpoint)
+    - https://api.node.glif.io/rpc/v1
+    - https://rpc.ankr.com/filecoin       # cross-check endpoint (guards against fake-empty responses)
+  # Admission floors. Keep them low to exclude non-miners and empty shells, not
+  # to gate on size. Raising them later never evicts already-registered workers.
+  min_raw_power_bytes: "322122547200"     # 300 GiB raw power
+  min_miner_balance_fil: "1"
+  challenge_ttl_sec: 600
+  register_rate_per_min: 6
+  max_registered_sps: 50
+  issuer_ca_cert: /etc/openmodel-mtls/ca.crt
+  issuer_ca_key: /etc/openmodel-mtls/ca.key
+  cert_validity_sec: 604800               # 7d worker certs, renewed at half-life
+  https_port: 3002                        # worker-direction + web UI TLS listener (CA-signed)
+
+# Gateway-side client certificate for the worker direction (issued by the same
+# CA). Files live on the host and are mounted at /etc/openmodel-mtls.
+worker_mtls:
+  ca_file: /etc/openmodel-mtls/ca.crt
+  cert_file: /etc/openmodel-mtls/<your-gateway-id>-gw.crt   # <<<
+  key_file: /etc/openmodel-mtls/<your-gateway-id>-gw.key    # <<<
+
 workers:
   poll_interval_sec: 5
-  offline_fail_threshold: 5        # WAN: tolerate transient blips before marking offline (#3)
-  poll_timeout_sec: 10             # WAN: higher RTT/jitter than LAN (#3); keep < poll_interval_sec
+  offline_fail_threshold: 5        # WAN: tolerate transient blips before marking offline
+  poll_timeout_sec: 10             # WAN: higher RTT/jitter than LAN; keep < poll_interval_sec
 
 admin:
   port: 9091
-  token: ${AGENT_ADMIN_TOKEN}      # SECRET via env. :9091 MUST stay bound to internal/loopback only.
+  token: ${AGENT_ADMIN_TOKEN}      # SECRET via env. :9091 MUST stay bound to loopback/internal only.
 
-# Public read-only SP earnings query (optional). If exposed to untrusted networks, front
-# with a TLS reverse proxy (it is plain HTTP itself).
+# Public read-only queries (receipt proofs, SP earnings, network stats). Plain
+# HTTP itself — the https_port listener above serves the same routes under TLS.
 public_query:
   enabled: true
   port: 3001
   rate_per_sec: 20
   rate_burst: 40
 
-# SP fraud-detection sampling. Off by default; if enabled on mainnet, use
-# sample_rate 0.01~0.05 and point sample_log_path at a persistent volume.
-# Retained samples contain user content — assess privacy and retention before
-# enabling (rotation max_mb×backups bounds how long they live).
+# Sampled request retention for SP fraud detection. Off by default; if enabled
+# on mainnet, use sample_rate 0.01-0.05 and point sample_log_path at a
+# persistent volume. Samples contain user content — assess privacy and
+# retention (rotation is max_mb x backups) before enabling.
 verification:
   sample_rate: ${VERIFY_SAMPLE_RATE:-0}
   sample_log_path: ${VERIFY_SAMPLE_PATH:-}
@@ -70,52 +109,71 @@ metrics:
 settlement:
   enabled: true
   # ---- chain ----
-  # ankr measured markedly more reliable than glif for read calls on mainnet
-  # (glif intermittently returns empty eth_call bodies, which read as zero
-  # balances); a 30s health monitor rotates to the next endpoint on failure.
-  rpc_url: ${FEVM_RPC_URL:-https://rpc.ankr.com/filecoin}     # primary FEVM RPC (tried first)
-  rpc_urls:                                                   # failover endpoints
+  # Primary RPC: ankr (measured stable). glif intermittently returns EMPTY
+  # bodies on eth_call (~30% in our tests) which parse as zero balances — keep
+  # it as failover only, and always cross-check balance reads across endpoints.
+  rpc_url: https://rpc.ankr.com/filecoin
+  rpc_urls:                                                   # failover list
     - https://api.node.glif.io/rpc/v1
-  chain_id: 314                                               # 314 = mainnet
-  contract_address: "<MAINNET_SETTLEMENT_CONTRACT>"           # deploy OpenModelSettlement to mainnet first, then fill
+  chain_id: 314                                               # 314 = Filecoin mainnet
+  contract_address: "0x60D41baEaBe1ABE061AE82c44425debc35bA524A"  # OpenModelSettlement v1.3 (mainnet; batch stats, earnings freeze)
+  contract_schema: 3               # v1.3 ABI: submitSettlement carries per-item request/token stats. Use 2 only for v1.2-era contracts.
   operator_private_key: ${OPERATOR_PRIVATE_KEY}               # HOT operator key via env/KMS — NEVER inline
   confirmation_depth: 5                                       # mainnet finality / reorg safety
   # ---- cadence + timing ----
-  interval_minutes: 60
+  # Contract-side invariant: the contract's refundDelaySec must comfortably
+  # exceed this interval (refundDelaySec >= interval + margin), so a user can
+  # never claim a refund BEFORE settlement collects what they spent. With the
+  # deployed refundDelaySec = 3600s, an interval of 20 min leaves a 40-min
+  # margin; do NOT raise the interval to 60 min against that contract — the
+  # margin would be zero. Longer intervals need a contract deployed with a
+  # larger refundDelaySec (e.g. 7200s).
+  interval_minutes: 20
   max_batch_size: 100
-  # Contract-side (not here): deploy the contract with refundDelaySec >= interval
-  # (60min = 3600s) + margin, e.g. 7200 (2h), so a user cannot refund a balance BEFORE
-  # settlement has collected it. This is a constructor arg to OpenModelSettlement.
   # ---- pricing ----
-  fil_price_source: auto           # coingecko→binance; isImplausiblePrice guards bad/flash values.
-                                   # For a small trial, `manual` + a documented update cadence is also fine.
+  fil_price_source: auto           # coingecko -> binance; implausible-price guard drops bad/flash values.
+                                   # For a small deployment, `manual` + a documented update cadence also works.
   fil_price_usd: "3.0"             # seed/fallback value; auto overrides when it succeeds
   model_prices_usd:
     default: "0.60"                # USD per 1M tokens (output/base) — set your real prices
   model_catalog:
     default: {input: "0.20", cache_read: "0.05", context_window: 32768, max_output: 4096}
+    # Context windows here should match the DEPLOYED max_model_len, not the
+    # model card maximum.
+    "/models/Qwen--Qwen3-32B-AWQ": {input: "0.60", cache_read: "0.15", context_window: 8192, max_output: 4096}
+    "/models/Qwen--Qwen3.8-27B-FP8": {input: "0.60", cache_read: "0.15", context_window: 8192, max_output: 4096}
   # ---- tokens ----
   supported_tokens:
-    - {symbol: USDC, address: "<MAINNET_USDC_ADDRESS>", decimals: 6}   # real mainnet USDC; confirm decimals/behaviour first
     - {symbol: FIL, address: "0x0000000000000000000000000000000000000000", decimals: 18}
-  deduction_priority: [USDC, FIL]
-  # ---- stablecoin depeg protection ----
-  stablecoin_symbol: USDC              # the USD-pegged token to monitor
-  stablecoin_price_sources: [coingecko, binance]  # empty = pin at $1 (no monitoring)
-  stablecoin_depeg_bps: 200            # >2% off $1 → depegged: excluded from settlement AND
-                                       # spendable credit (symmetric), cost falls through to FIL.
-                                       # Within band the real (off-peg) price is used so the SP
-                                       # is never under-paid. Alert: StablecoinDepegged.
-  stablecoin_price_refresh_sec: 300
+    # USDFC has 18 decimals (NOT 6 like USDC) — a decimals mismatch here would
+    # misprice every stablecoin balance by a factor of 1e12. Whitelist the
+    # token on-chain (owner: addSupportedToken) before listing it here.
+    - {symbol: USDFC, address: "0x80B98d3aa09ffff255c3ba4A241111Ff1262F045", decimals: 18}
+  # Stablecoin first: users who deposit USDFC bought price stability on purpose.
+  deduction_priority: [USDFC, FIL]
+  stablecoin_symbol: USDFC
+  # Empty price sources = the stablecoin is valued at exactly $1 (depeg
+  # protection off). Add sources to enable depeg monitoring.
+  stablecoin_price_sources: []
   balance_refresh_sec: 15
-  default_max_tokens: 512
+  default_max_tokens: 2048   # must reach the worker; too small leaves answers cut off mid-sentence
   # ---- credit limits (bound per-wallet exposure) ----
   operator_min_balance_fil: "1.0"          # gas floor; OperatorBalanceLow alerts below this
-  max_pending_spend_fil: "<PER_WALLET_CAP>" # cap a wallet's unsettled spend to your tier economics
-  debt_suspend_usd: "1.0"                   # suspend a wallet once outstanding debt exceeds this USD
+  max_pending_spend_fil: "5"               # cap a wallet's unsettled spend (adjust to your economics)
+  debt_suspend_usd: "1.0"                  # suspend a wallet once outstanding debt exceeds this USD
   # ---- reconciliation ----
   reconcile_interval_minutes: 30
   reconcile_tolerance_usd: "0.01"
-  # ---- miner → EVM payout map ----
+  # ---- miner -> EVM payout map (operator-configured workers only; self-registered
+  # workers carry their payout address in the miner-signed registration) ----
   sp_address_map:
-    "<MINER_ADDRESS>": "<SP_EVM_PAYOUT_ADDRESS>"
+    "<t0-miner-id>": "<payout-evm-address>"   # <<< one line per operator-configured worker
+
+probe:
+  enabled: true
+  interval_sec: 300
+  num_questions: 16
+  min_score: 0.5
+  admission_gate: true    # gates SELF-REGISTERED workers only; operator-configured ones are unaffected
+  verify_ttl_sec: 604800
+  spot_min_interval_sec: 259200   # one routine spot check per worker per 3 days (admission/TTL re-verify exempt)

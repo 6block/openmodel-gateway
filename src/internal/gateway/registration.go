@@ -2,6 +2,7 @@ package gateway
 
 import (
 	cryptorand "crypto/rand"
+	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
@@ -33,12 +34,68 @@ import (
 // registrationWindow bounds how far the signed issued_at may be from server time.
 const registrationWindow = 5 * time.Minute
 
-// registrationRecord is one persisted self-registered key.
+// registrationRecord is one persisted self-registered key. Since the key-store v2
+// the SECRET is never persisted: KeyHash is sha256(key) and Display a masked stub
+// ("sk-om-3c3c…e3bc") for dashboards. The full key appears exactly once, in the
+// create response — industry-standard show-once semantics, so a stolen store file
+// yields no usable credentials.
+//
+// Key (plaintext) survives only as a LEGACY read field: v1 files carried it, and
+// loading migrates such rows in place (hash filled, plaintext dropped, file
+// rewritten). It is never written back — json:"-" on write is enforced by clearing
+// it during migration and omitempty.
 type registrationRecord struct {
-	Key       string    `json:"key"`
+	ID        string    `json:"id"`
 	Name      string    `json:"name"`
 	Wallet    string    `json:"wallet"`
+	KeyHash   string    `json:"key_hash"`
+	Display   string    `json:"display"`
 	CreatedAt time.Time `json:"created_at"`
+	Key       string    `json:"key,omitempty"` // legacy v1 plaintext; read-only, cleared on migration
+}
+
+// hashKey is the storage/lookup form of an API key. sha256 is sufficient: keys
+// carry 192 bits of CSPRNG entropy, so offline guessing is not a concern and a
+// fast hash keeps the per-request auth path free of KDF cost.
+func hashKey(key string) string {
+	sum := sha256.Sum256([]byte(key))
+	return hex.EncodeToString(sum[:])
+}
+
+// keyDisplay renders the masked, list-safe form of a key.
+func keyDisplay(key string) string {
+	if len(key) <= 14 {
+		return key
+	}
+	return key[:10] + "…" + key[len(key)-4:]
+}
+
+// generateKeyID returns a short public identifier for one key row. It is NOT the
+// credential — delete/list address keys by this id so a lost key can still be
+// revoked without knowing its secret.
+func generateKeyID() (string, error) {
+	b := make([]byte, 6)
+	if _, err := cryptorand.Read(b); err != nil {
+		return "", err
+	}
+	return "k-" + hex.EncodeToString(b), nil
+}
+
+// migrateRegistrationRecord fills v2 fields from a legacy plaintext row. Returns
+// true when the row changed (caller rewrites the store).
+func migrateRegistrationRecord(rec *registrationRecord) bool {
+	if rec.Key == "" {
+		return false
+	}
+	rec.KeyHash = hashKey(rec.Key)
+	rec.Display = keyDisplay(rec.Key)
+	if rec.ID == "" {
+		// Deterministic fallback id (avoids RNG in the load path); collision-free
+		// enough for a handful of legacy rows.
+		rec.ID = "k-" + rec.KeyHash[:12]
+	}
+	rec.Key = ""
+	return true
 }
 
 type registerRequest struct {
@@ -69,7 +126,9 @@ func registrationsPathFor(requestLogPath string) string {
 	return filepath.Join(filepath.Dir(requestLogPath), "registrations.json")
 }
 
-// loadRegistrationsFile reads persisted registrations; a missing file means none yet.
+// loadRegistrationsFile reads persisted registrations; a missing file means none
+// yet. Legacy v1 rows (plaintext key) are migrated to hashed form and the file is
+// rewritten at once, so a single load erases plaintext from disk permanently.
 func loadRegistrationsFile(path string, logger *slog.Logger) []registrationRecord {
 	if path == "" {
 		return nil
@@ -85,7 +144,33 @@ func loadRegistrationsFile(path string, logger *slog.Logger) []registrationRecor
 		}
 		return nil
 	}
+	migrated := false
+	for i := range recs {
+		if migrateRegistrationRecord(&recs[i]) {
+			migrated = true
+		}
+	}
+	if migrated {
+		if err := writeRegistrationsFile(path, recs); err != nil && logger != nil {
+			logger.Error("failed to rewrite registrations after hash migration", "path", path, "error", err)
+		} else if logger != nil {
+			logger.Info("registrations migrated to hashed key store", "path", path, "records", len(recs))
+		}
+	}
 	return recs
+}
+
+// writeRegistrationsFile atomically replaces the key store.
+func writeRegistrationsFile(path string, recs []registrationRecord) error {
+	data, err := json.MarshalIndent(recs, "", "  ")
+	if err != nil {
+		return err
+	}
+	tmp := path + ".tmp"
+	if err := os.WriteFile(tmp, data, 0o600); err != nil {
+		return err
+	}
+	return os.Rename(tmp, path)
 }
 
 // verifyEthSignature reports whether sigHex is an EIP-191 personal_sign signature of
@@ -123,6 +208,10 @@ func generateAPIKey() (string, error) {
 func (g *Gateway) handleRegister(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		jsonError(w, "method not allowed; use POST", http.StatusMethodNotAllowed)
+		return
+	}
+	if g.regIPLimiter != nil && !g.regIPLimiter.allow(clientIP(r)) {
+		jsonError(w, "too many registration requests from this address; retry later", http.StatusTooManyRequests)
 		return
 	}
 	var req registerRequest
@@ -171,24 +260,16 @@ func (g *Gateway) handleRegister(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	key, err := generateAPIKey()
-	if err != nil {
-		jsonError(w, "failed to generate key", http.StatusInternalServerError)
-		return
-	}
 	name := strings.TrimSpace(req.Name)
 	if name == "" {
 		name = "user-" + strings.ToLower(canonical[2:8])
 	}
-
-	if err := g.appendRegistration(registrationRecord{Key: key, Name: name, Wallet: canonical, CreatedAt: now}); err != nil {
-		g.logger.Error("failed to persist registration", "wallet", canonical, "error", err)
+	key, _, err := g.createKeyLocked(canonical, name, now)
+	if err != nil {
+		g.logger.Error("failed to create key", "wallet", canonical, "error", err)
 		jsonError(w, "failed to persist registration", http.StatusInternalServerError)
 		return
 	}
-	g.keysMu.Lock()
-	g.apiKeys[key] = apiKeyEntry{Name: name, Wallet: canonical}
-	g.keysMu.Unlock()
 	g.seenSigs[sigKey] = now.Add(registrationWindow)
 
 	// Register the wallet for on-chain balance refresh — otherwise a freshly-registered
@@ -226,20 +307,36 @@ func (g *Gateway) walletAlreadyRegistered(canonical string) bool {
 	return false
 }
 
+// createKeyLocked mints one key for wallet, persists its hashed record and
+// installs it into the auth table. Caller holds g.regMu (serializing all key-store
+// mutations). Returns the FULL key — the only moment it ever exists server-side.
+func (g *Gateway) createKeyLocked(wallet, name string, now time.Time) (string, registrationRecord, error) {
+	key, err := generateAPIKey()
+	if err != nil {
+		return "", registrationRecord{}, err
+	}
+	id, err := generateKeyID()
+	if err != nil {
+		return "", registrationRecord{}, err
+	}
+	rec := registrationRecord{
+		ID: id, Name: name, Wallet: wallet,
+		KeyHash: hashKey(key), Display: keyDisplay(key), CreatedAt: now,
+	}
+	if err := g.appendRegistration(rec); err != nil {
+		return "", registrationRecord{}, err
+	}
+	g.keysMu.Lock()
+	g.apiKeys[rec.KeyHash] = apiKeyEntry{Name: name, Wallet: wallet, ID: id}
+	g.keysMu.Unlock()
+	return key, rec, nil
+}
+
 // appendRegistration atomically rewrites the key store with the new record appended.
 // Caller holds g.regMu. A no-op (in-memory only) when persistence is disabled.
 func (g *Gateway) appendRegistration(rec registrationRecord) error {
 	if g.registrationsPath == "" {
 		return nil
 	}
-	recs := append(loadRegistrationsFile(g.registrationsPath, g.logger), rec)
-	data, err := json.MarshalIndent(recs, "", "  ")
-	if err != nil {
-		return err
-	}
-	tmp := g.registrationsPath + ".tmp"
-	if err := os.WriteFile(tmp, data, 0o600); err != nil {
-		return err
-	}
-	return os.Rename(tmp, g.registrationsPath)
+	return writeRegistrationsFile(g.registrationsPath, append(loadRegistrationsFile(g.registrationsPath, g.logger), rec))
 }

@@ -384,6 +384,32 @@ func (bc *BalanceCache) RestorePendingSpend(records []RequestRecord, costFn func
 
 // availableUSD calculates total available balance in USD minus pending spend.
 // Must be called with mu held (at least RLock).
+// AvailableUSDView is the PUBLIC read of the same valuation the 402 gate uses —
+// multi-token, depeg-aware, pending- and buffer-adjusted. The /v1/me dashboard
+// must call THIS rather than recompute: a hand-rolled FIL-only view shipped once
+// and showed $0 to a wallet whose USDFC the gate was happily accepting.
+func (bc *BalanceCache) AvailableUSDView(wallet string) *big.Float {
+	bc.mu.RLock()
+	defer bc.mu.RUnlock()
+	return bc.availableUSD(wallet)
+}
+
+// TokenBalancesView returns the wallet's on-chain holdings per token symbol
+// (human units), for balance-detail display.
+func (bc *BalanceCache) TokenBalancesView(wallet string) map[string]*big.Float {
+	bc.mu.RLock()
+	defer bc.mu.RUnlock()
+	out := map[string]*big.Float{}
+	if tokenBalances, ok := bc.chainBalances[wallet]; ok {
+		for _, tokenCfg := range bc.tokens {
+			if b, ok := tokenBalances[tokenCfg.Address]; ok && b.Sign() > 0 {
+				out[tokenCfg.Symbol] = weiToFloat(b, tokenCfg.Decimals)
+			}
+		}
+	}
+	return out
+}
+
 func (bc *BalanceCache) availableUSD(wallet string) *big.Float {
 	filPrice := bc.pricer.GetFILPriceUSD()
 	total := new(big.Float)
@@ -440,15 +466,50 @@ func (bc *BalanceCache) refreshAll(ctx context.Context) {
 
 func (bc *BalanceCache) refreshWallet(ctx context.Context, wallet string) {
 	userAddr := common.HexToAddress(wallet)
-	tokenBalances := make(map[string]*big.Int)
+
+	// Start from the LAST KNOWN balances, not an empty map. The gate refuses a
+	// paying user only on positive evidence of an empty balance — "the RPC did
+	// not answer" is not that evidence. The original code skipped failed reads
+	// and then overwrote the whole entry, so one transient RPC failure erased a
+	// perfectly valid cached balance and the next request got a wrong 402
+	// (24h-soak finding #3). Overspend against a stale value stays bounded by
+	// the per-wallet unsettled-spend cap, which is exactly what it exists for.
+	bc.mu.RLock()
+	tokenBalances := make(map[string]*big.Int, len(bc.tokens))
+	for addr, bal := range bc.chainBalances[wallet] {
+		tokenBalances[addr] = bal
+	}
+	bc.mu.RUnlock()
 
 	for _, tokenCfg := range bc.tokens {
 		tokenAddr := common.HexToAddress(tokenCfg.Address)
 		balance, err := bc.contract.GetUserBalance(ctx, userAddr, tokenAddr)
 		if err != nil {
-			bc.logger.Warn("failed to refresh balance",
+			bc.logger.Warn("failed to refresh balance; keeping last known value",
 				"wallet", wallet, "token", tokenCfg.Symbol, "error", err)
-			continue
+			continue // keep the previous value for this token
+		}
+		// A sudden positive→zero drop is how a broken RPC read looks (an empty
+		// eth_call body decodes as 0 — the "fake zero" glif lesson from M3). A
+		// real drain is rare and permanent; a fake zero is common and transient.
+		// Re-read once before believing it: a fake zero repeating twice in a row
+		// is far less likely, and a real zero costs one extra call, exactly once,
+		// on the transition.
+		if prev, ok := tokenBalances[tokenCfg.Address]; ok && prev.Sign() > 0 && balance.Sign() == 0 {
+			confirm, err2 := bc.contract.GetUserBalance(ctx, userAddr, tokenAddr)
+			if err2 != nil {
+				bc.logger.Warn("suspicious zero balance and the confirm read failed; keeping last known value",
+					"wallet", wallet, "token", tokenCfg.Symbol, "error", err2)
+				continue
+			}
+			if confirm.Sign() != 0 {
+				bc.logger.Warn("fake zero balance caught by confirm read",
+					"wallet", wallet, "token", tokenCfg.Symbol)
+				balance = confirm
+			} else {
+				bc.logger.Info("zero balance confirmed by second read",
+					"wallet", wallet, "token", tokenCfg.Symbol)
+			}
 		}
 		tokenBalances[tokenCfg.Address] = balance
 	}

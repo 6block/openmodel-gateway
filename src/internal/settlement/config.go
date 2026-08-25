@@ -6,8 +6,8 @@ import (
 )
 
 type Config struct {
-	Enabled            bool              `yaml:"enabled"`
-	RPCURL             string            `yaml:"rpc_url"`
+	Enabled bool   `yaml:"enabled"`
+	RPCURL  string `yaml:"rpc_url"`
 	// RPCURLs are additional FEVM RPC endpoints for failover (C2). rpc_url is tried
 	// first (backward compat); on a persistent transport failure the contract client
 	// rotates to the next healthy endpoint, so one flaky provider (a GLIF blip — the
@@ -15,6 +15,11 @@ type Config struct {
 	RPCURLs            []string          `yaml:"rpc_urls"`
 	ChainID            int64             `yaml:"chain_id"`
 	ContractAddress    string            `yaml:"contract_address"`
+	// ContractSchema selects the contract ABI generation: 2 = v1.2 and earlier
+	// (the default when unset — every existing deployment, mainnet included), 3 =
+	// v1.3+ (submitSettlement carries per-item request/token stats). Schema 3 is
+	// verified against the live contract at startup (SCHEMA_VERSION()).
+	ContractSchema int `yaml:"contract_schema"`
 	OperatorPrivateKey string            `yaml:"operator_private_key"`
 	IntervalMinutes    int               `yaml:"interval_minutes"`
 	MaxBatchSize       int               `yaml:"max_batch_size"`
@@ -48,14 +53,14 @@ type Config struct {
 	// at a self-hosted price oracle or an alternate provider (also how a controlled depeg
 	// drill is run on a live node). The response shape must match the provider being
 	// overridden (CoinGecko: {"usd-coin":{"usd":N}}; Binance: {"price":"N"}).
-	StablecoinCoinGeckoURL string `yaml:"stablecoin_coingecko_url"`
-	StablecoinBinanceURL   string `yaml:"stablecoin_binance_url"`
-	SupportedTokens    []TokenConfig     `yaml:"supported_tokens"`
-	BalanceRefreshSec  int               `yaml:"balance_refresh_sec"`
-	MinBalanceFIL      string            `yaml:"min_balance_fil"`
-	MaxPendingSpend    string            `yaml:"max_pending_spend_fil"`
-	DefaultMaxTokens   int               `yaml:"default_max_tokens"`
-	OperatorMinBalance string            `yaml:"operator_min_balance_fil"`
+	StablecoinCoinGeckoURL string        `yaml:"stablecoin_coingecko_url"`
+	StablecoinBinanceURL   string        `yaml:"stablecoin_binance_url"`
+	SupportedTokens        []TokenConfig `yaml:"supported_tokens"`
+	BalanceRefreshSec      int           `yaml:"balance_refresh_sec"`
+	MinBalanceFIL          string        `yaml:"min_balance_fil"`
+	MaxPendingSpend        string        `yaml:"max_pending_spend_fil"`
+	DefaultMaxTokens       int           `yaml:"default_max_tokens"`
+	OperatorMinBalance     string        `yaml:"operator_min_balance_fil"`
 	// ConfirmationDepth is how many blocks must build on top of a settlement tx's
 	// block before it is treated as final (reorg safety, C2). The cursor only
 	// advances after this depth, so a tx dropped by a reorg is re-submitted (on-chain
@@ -68,10 +73,10 @@ type Config struct {
 	// ReconcileIntervalMinutes is how often the automated three-way billing
 	// reconciliation runs (B4). 0 = default 30 min. ReconcileToleranceUSD is the
 	// drift (USD) tolerated before a run is flagged; empty = 1 cent.
-	ReconcileIntervalMinutes int    `yaml:"reconcile_interval_minutes"`
-	ReconcileToleranceUSD    string `yaml:"reconcile_tolerance_usd"`
-	SPAddressMap       map[string]string `yaml:"sp_address_map"`
-	DeductionPriority  []string          `yaml:"deduction_priority"`
+	ReconcileIntervalMinutes int               `yaml:"reconcile_interval_minutes"`
+	ReconcileToleranceUSD    string            `yaml:"reconcile_tolerance_usd"`
+	SPAddressMap             map[string]string `yaml:"sp_address_map"`
+	DeductionPriority        []string          `yaml:"deduction_priority"`
 	// DebtSuspendUSD is the outstanding carried-debt threshold (USD) at which a wallet
 	// is suspended from service (served 402 until the debt is collected). Empty/unset =
 	// suspension disabled; "0" = suspend on any positive debt (D3).

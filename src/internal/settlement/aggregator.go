@@ -55,7 +55,8 @@ type Aggregator struct {
 	modelPrices      map[string]*big.Float // model → USD per token (OUTPUT / base price, from ModelPricesUSD)
 	catalogInput     map[string]*big.Float // model → USD per input token (from ModelCatalog; presence enables the split)
 	catalogCacheRead map[string]*big.Float // model → USD per cached (prefix-hit) prompt token
-	spAddressMap     map[string]string     // miner address → EVM address
+	spAddressMap     map[string]string     // miner address → EVM address (static config)
+	minerPayoutMap   map[string]string     // miner address → EVM address (miner-SIGNED at self-registration; wins over static)
 	workerSPMap      map[string]string     // worker_id → miner address (from registry)
 	tokens           []TokenConfig
 	deductPriority   []string
@@ -343,6 +344,11 @@ func (a *Aggregator) resolveWorkerToEVM(workerID string) string {
 	if !ok {
 		return ""
 	}
+	// A payout address the miner itself signed at self-registration outranks the
+	// operator-maintained static map for that miner.
+	if evmAddr, ok := a.minerPayoutMap[minerAddr]; ok && evmAddr != "" {
+		return evmAddr
+	}
 	evmAddr, ok := a.spAddressMap[minerAddr]
 	if !ok {
 		return ""
@@ -545,6 +551,13 @@ func pow10(n int) *big.Int {
 // UpdateWorkerSPMap refreshes the worker→miner mapping from registry.
 func (a *Aggregator) UpdateWorkerSPMap(m map[string]string) {
 	a.workerSPMap = m
+}
+
+// UpdateMinerPayoutMap refreshes the miner → miner-signed EVM payout overlay
+// (from self-registered workers). Same call discipline as UpdateWorkerSPMap:
+// invoked from the settlement cycle before aggregation.
+func (a *Aggregator) UpdateMinerPayoutMap(m map[string]string) {
+	a.minerPayoutMap = m
 }
 
 // EstimateCostUSD estimates the USD cost for a request based on model and max_tokens.

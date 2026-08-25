@@ -54,7 +54,7 @@ func TestPredictive_RoutingSteersAwayFromYieldingWorker(t *testing.T) {
 	registry := worker.NewRegistry(logger, "")
 	for _, id := range []string{"w-soon", "w-clear"} {
 		registry.Register(worker.WorkerRegistration{ID: id, Endpoint: "http://x", SchedulerURL: "http://x", GPUCount: 1})
-		registry.UpdateState(id, "GPU_STATE_AVAILABLE", "running", 0, "default", 1)
+		registry.UpdateState(id, "GPU_STATE_AVAILABLE", "running", 0, "test-model", 1)
 	}
 	registry.SetUntilChange("w-soon", 10)
 	registry.SetUntilChange("w-clear", 3600)
@@ -80,7 +80,7 @@ func TestPredictive_AllYieldingSoonStillRoutes(t *testing.T) {
 	logger := testLogger()
 	registry := worker.NewRegistry(logger, "")
 	registry.Register(worker.WorkerRegistration{ID: "w0", Endpoint: "http://x", SchedulerURL: "http://x", GPUCount: 1})
-	registry.UpdateState("w0", "GPU_STATE_AVAILABLE", "running", 0, "default", 1)
+	registry.UpdateState("w0", "GPU_STATE_AVAILABLE", "running", 0, "test-model", 1)
 	registry.SetUntilChange("w0", 5)
 	if _, err := selectWorkerForModel(registry, "default", nil, 0); err != nil {
 		t.Fatalf("all-yielding-soon must still route (B2 resume beats a 503): %v", err)
@@ -93,7 +93,7 @@ func TestPredictive_RetryAfterUsesResumeEstimate(t *testing.T) {
 	registry := worker.NewRegistry(logger, "")
 	for _, id := range []string{"m1", "m2"} {
 		registry.Register(worker.WorkerRegistration{ID: id, Endpoint: "http://x", SchedulerURL: "http://x", GPUCount: 1})
-		registry.UpdateState(id, "GPU_STATE_WINDOW_POST", "paused", 0, "default", 1)
+		registry.UpdateState(id, "GPU_STATE_WINDOW_POST", "paused", 0, "test-model", 1)
 	}
 	registry.SetUntilChange("m1", 42)
 	registry.SetUntilChange("m2", 300) // clamps to 120 if it were the min
@@ -109,7 +109,7 @@ func TestPredictive_RetryAfterUsesResumeEstimate(t *testing.T) {
 	// No estimates at all → legacy fixed 30.
 	registry2 := worker.NewRegistry(logger, "")
 	registry2.Register(worker.WorkerRegistration{ID: "m", Endpoint: "http://x", SchedulerURL: "http://x", GPUCount: 1})
-	registry2.UpdateState("m", "GPU_STATE_WINDOW_POST", "paused", 0, "default", 1)
+	registry2.UpdateState("m", "GPU_STATE_WINDOW_POST", "paused", 0, "test-model", 1)
 	gw2 := New(registry2, config.GatewayConfig{RequestTimeoutSec: 1,
 		APIKeys: []config.APIKey{{Key: "test", Name: "u"}}}, logger)
 	defer gw2.Close()
@@ -123,7 +123,7 @@ func TestPredictive_503CarriesHonestRetryAfter(t *testing.T) {
 	logger := testLogger()
 	registry := worker.NewRegistry(logger, "")
 	registry.Register(worker.WorkerRegistration{ID: "m1", Endpoint: "http://127.0.0.1:1", SchedulerURL: "http://127.0.0.1:1", GPUCount: 1})
-	registry.UpdateState("m1", "GPU_STATE_WINNING_POST", "paused", 0, "default", 1)
+	registry.UpdateState("m1", "GPU_STATE_WINNING_POST", "paused", 0, "test-model", 1)
 	registry.SetUntilChange("m1", 17)
 
 	gw := New(registry, config.GatewayConfig{RequestTimeoutSec: 1, QueueTimeoutSec: 1,
@@ -133,7 +133,7 @@ func TestPredictive_503CarriesHonestRetryAfter(t *testing.T) {
 	defer gw.Close()
 
 	req, _ := http.NewRequest("POST", srv.URL+"/v1/chat/completions",
-		strings.NewReader(`{"model":"default","messages":[{"role":"user","content":"x"}],"max_tokens":4}`))
+		strings.NewReader(`{"model":"test-model","messages":[{"role":"user","content":"x"}],"max_tokens":4}`))
 	req.Header.Set("Authorization", "Bearer test")
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {

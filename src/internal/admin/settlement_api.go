@@ -29,22 +29,74 @@ type ContractReader interface {
 	PlatformFeeBps(ctx context.Context) (int64, error)
 }
 
+// frozenEarningsReader is the OPTIONAL v1.1 extension of ContractReader (earnings
+// freeze views). Kept separate so existing mocks/fakes keep compiling; the real
+// ContractClient implements it.
+type frozenEarningsReader interface {
+	GetTotalEarnings(ctx context.Context, sp, token common.Address) (*big.Int, error)
+	GetFrozenEarnings(ctx context.Context, sp, token common.Address) (*big.Int, error)
+	GetWithdrawableEarnings(ctx context.Context, sp, token common.Address) (*big.Int, error)
+}
+
+// readEarningsSplit reads an SP's per-token earnings. Against a v1.1 contract it
+// returns (total, frozen, withdrawable); against v1.0 — or when the v1.1 views
+// error (e.g. talking to the old deployed contract) — frozen/withdrawable are
+// empty and earnings carries getSPEarnings as before.
+func (sa *SettlementAPI) readEarningsSplit(ctx context.Context, evmAddr string) (earnings, frozen, withdrawable map[string]string) {
+	earnings = make(map[string]string)
+	frozen = make(map[string]string)
+	withdrawable = make(map[string]string)
+	fr, hasV11 := sa.contract.(frozenEarningsReader)
+	for _, token := range sa.tokens {
+		sp, tok := common.HexToAddress(evmAddr), common.HexToAddress(token.Address)
+		if hasV11 {
+			total, err := fr.GetTotalEarnings(ctx, sp, tok)
+			if err == nil {
+				if total.Sign() > 0 {
+					earnings[token.Symbol] = formatTokenAmount(total, token.Decimals)
+				}
+				if fz, err := fr.GetFrozenEarnings(ctx, sp, tok); err == nil && fz.Sign() > 0 {
+					frozen[token.Symbol] = formatTokenAmount(fz, token.Decimals)
+				}
+				if wd, err := fr.GetWithdrawableEarnings(ctx, sp, tok); err == nil && wd.Sign() > 0 {
+					withdrawable[token.Symbol] = formatTokenAmount(wd, token.Decimals)
+				}
+				continue
+			}
+			// Fall through: v1.0 contract on chain — the method reverts.
+		}
+		bal, err := sa.contract.GetSPEarnings(ctx, sp, tok)
+		if err != nil {
+			sa.logger.Warn("failed to query SP earnings", "sp", evmAddr, "token", token.Symbol, "error", err)
+			continue
+		}
+		if bal.Sign() > 0 {
+			earnings[token.Symbol] = formatTokenAmount(bal, token.Decimals)
+		}
+	}
+	return earnings, frozen, withdrawable
+}
+
 // SettlementAPI handles settlement-related admin endpoints.
 type SettlementAPI struct {
-	contract   ContractReader
-	balance    *settlement.BalanceCache
-	pricer     *settlement.Pricer
-	settler    *settlement.Settler
-	reconciler *settlement.Reconciler
-	tokens     []settlement.TokenConfig
-	spMap      map[string]string // miner address → EVM address
-	logger     *slog.Logger
+	contract      ContractReader
+	balance       *settlement.BalanceCache
+	pricer        *settlement.Pricer
+	settler       *settlement.Settler
+	reconciler    *settlement.Reconciler
+	tokens        []settlement.TokenConfig
+	spMap         map[string]string        // miner address → EVM address (static config)
+	minerPayoutFn func() map[string]string // live self-registered payout overlay; nil = static only
+	logger        *slog.Logger
 	// scanSem bounds how many request-log-scanning endpoints (receipt-proof,
 	// sp-earnings-detail) run concurrently (F4): each scan allocates a multi-MB reader +
 	// unmarshal garbage over a large log, so a burst of audit calls could stack memory
 	// and (with a tight container limit) OOM the gateway. A small semaphore serializes
 	// the heavy scans without failing callers — they briefly queue instead.
 	scanSem chan struct{}
+	// statsDeps supplies the catalog/developer counts for the public network-stats
+	// endpoint; unset fields are omitted from the response rather than sent as 0.
+	statsDeps NetworkStatsDeps
 }
 
 // NewSettlementAPI creates the settlement admin API handler.
@@ -116,8 +168,31 @@ const maxDetailLimit = 1000
 // makes "what is public" an explicit, auditable decision — never add a mutating or
 // client-identifying route here.
 func (sa *SettlementAPI) RegisterPublicRoutes(mux *http.ServeMux) {
-	mux.HandleFunc("/api/v1/sp-earnings-detail/", sa.handleSPEarningsDetail)
-	mux.HandleFunc("/api/v1/receipt-proof/", sa.handleReceiptProof)
+	mux.HandleFunc("/api/v1/sp-earnings-detail/", withPublicCORS(sa.handleSPEarningsDetail))
+	mux.HandleFunc("/api/v1/receipt-proof/", withPublicCORS(sa.handleReceiptProof))
+	// Aggregate-only network metrics (counts, no identities) — published so the
+	// grant metrics can be read by anyone without operator access.
+	mux.HandleFunc("/api/v1/network-stats", withPublicCORS(sa.handleNetworkStats))
+}
+
+// withPublicCORS opens these READ-ONLY public routes to browser fetch() from any
+// origin. The web UI's receipt viewer lives on the API origin (:18019) and reads
+// the public-query origin (:18020): same host, different port — a cross-origin
+// request the browser blocks without these headers. The old receipt link escaped
+// this only because a full-page navigation is exempt from CORS; an in-page fetch
+// is not. "*" widens nothing: the routes are public by design (anyone holding a
+// request_id may audit it), GET-only, and credential-free.
+func withPublicCORS(h http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Access-Control-Allow-Origin", "*")
+		w.Header().Set("Access-Control-Expose-Headers", "Retry-After")
+		if r.Method == http.MethodOptions {
+			w.Header().Set("Access-Control-Allow-Methods", "GET, OPTIONS")
+			w.WriteHeader(http.StatusNoContent)
+			return
+		}
+		h(w, r)
+	}
 }
 
 // GET /api/v1/receipt-proof/:request_id — the verifiable-billing projection (A1).
@@ -140,19 +215,46 @@ func (sa *SettlementAPI) handleReceiptProof(w http.ResponseWriter, r *http.Reque
 		return
 	}
 	var proof *settlement.ReceiptProof
+	var pending *settlement.UnsettledStatus
 	var err error
 	if werr := sa.withScanLimit(r.Context(), func() {
 		proof, err = sa.settler.BuildReceiptProof(rid)
+		if err != nil {
+			// Not in a committed batch — is it billed and merely awaiting one?
+			// "Not settled yet" and "no such request" are different answers, and
+			// the moment a user is most likely to open their receipt link is
+			// right after the reply, i.e. before the batch. Serving them an
+			// "error" there reads as lost money; it is just a queue.
+			pending, _ = sa.settler.FindUnsettled(rid)
+		}
 	}); werr != nil {
 		jsonError(w, "server busy, retry", http.StatusServiceUnavailable)
 		return
 	}
-	if err != nil {
-		jsonError(w, err.Error(), http.StatusNotFound)
-		return
-	}
 	w.Header().Set("Content-Type", "application/json")
-	_ = json.NewEncoder(w).Encode(proof)
+	switch {
+	case err == nil:
+		_ = json.NewEncoder(w).Encode(proof)
+	case pending != nil:
+		eta := sa.settler.SettleETA()
+		w.Header().Set("Retry-After", strconv.FormatInt(eta, 10))
+		w.WriteHeader(http.StatusAccepted) // 202: recorded, completion pending
+		rec := pending.Record
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"request_id":              rid,
+			"status":                  "pending_settlement",
+			"settled":                 false,
+			"message":                 "This request is recorded and billed; its settlement batch has not been committed on-chain yet. The full Merkle inclusion proof becomes available right after the next settlement pass.",
+			"next_settlement_eta_sec": eta,
+			"request_time":            rec.Timestamp,
+			"model":                   rec.Model,
+			"total_tokens":            rec.TotalTokens,
+			"worker_receipt":          rec.Receipt, // ed25519-signed; verifiable immediately
+			"verify_now":              "The worker_receipt signature can be checked immediately (verify-receipt.py steps 1-2); re-fetch this URL after the ETA for the on-chain steps.",
+		})
+	default:
+		jsonError(w, "unknown request id — no billing record found (check the id; records also rotate out after ~2×50MB of traffic)", http.StatusNotFound)
+	}
 }
 
 // GET /api/v1/sp-earnings-detail/:sp — per-request earnings for one SP. Lets an SP
@@ -277,26 +379,21 @@ func (sa *SettlementAPI) handleRevenue(w http.ResponseWriter, r *http.Request) {
 	type spRevenue struct {
 		MinerAddress string            `json:"miner_address"`
 		EVMAddress   string            `json:"evm_address"`
-		Earnings     map[string]string `json:"earnings"`
+		Earnings     map[string]string `json:"earnings"` // total credited (withdrawable + frozen)
+		// Present only against a v1.1 contract with an earnings freeze:
+		Frozen       map[string]string `json:"frozen_earnings,omitempty"`
+		Withdrawable map[string]string `json:"withdrawable_earnings,omitempty"`
 	}
 
 	var results []spRevenue
-	for minerAddr, evmAddr := range sa.spMap {
-		earnings := make(map[string]string)
-		for _, token := range sa.tokens {
-			bal, err := sa.contract.GetSPEarnings(ctx, common.HexToAddress(evmAddr), common.HexToAddress(token.Address))
-			if err != nil {
-				sa.logger.Warn("failed to query SP earnings", "sp", evmAddr, "token", token.Symbol, "error", err)
-				continue
-			}
-			if bal.Sign() > 0 {
-				earnings[token.Symbol] = formatTokenAmount(bal, token.Decimals)
-			}
-		}
+	for minerAddr, evmAddr := range sa.effectiveSPMap() {
+		earnings, frozen, withdrawable := sa.readEarningsSplit(ctx, evmAddr)
 		results = append(results, spRevenue{
 			MinerAddress: minerAddr,
 			EVMAddress:   evmAddr,
 			Earnings:     earnings,
+			Frozen:       frozen,
+			Withdrawable: withdrawable,
 		})
 	}
 
@@ -325,15 +422,15 @@ func (sa *SettlementAPI) handleRevenueBySP(w http.ResponseWriter, r *http.Reques
 	defer cancel()
 
 	evmAddr := sa.resolveToEVM(spAddr)
-	earnings := make(map[string]string)
-	for _, token := range sa.tokens {
-		bal, err := sa.contract.GetSPEarnings(ctx, common.HexToAddress(evmAddr), common.HexToAddress(token.Address))
-		if err != nil {
-			continue
-		}
-		if bal.Sign() > 0 {
-			earnings[token.Symbol] = formatTokenAmount(bal, token.Decimals)
-		}
+	earnings, frozen, withdrawable := sa.readEarningsSplit(ctx, evmAddr)
+	if len(frozen) > 0 || len(withdrawable) > 0 {
+		jsonResponse(w, http.StatusOK, map[string]interface{}{
+			"address":               evmAddr,
+			"earnings":              earnings,
+			"frozen_earnings":       frozen,
+			"withdrawable_earnings": withdrawable,
+		})
+		return
 	}
 
 	jsonResponse(w, http.StatusOK, map[string]interface{}{
@@ -488,6 +585,14 @@ func (sa *SettlementAPI) handleSettlementByID(w http.ResponseWriter, r *http.Req
 		"timestamp":     uint64OrZero(rec.Timestamp),
 		"processed":     processed,
 	}
+	// Batch inference stats exist on schema-3 (v1.3) contracts only; omit the keys
+	// entirely against older contracts instead of reporting a misleading 0.
+	if rec.RequestCount != nil {
+		onChain["request_count"] = uint64OrZero(rec.RequestCount)
+	}
+	if rec.TokenCount != nil {
+		onChain["token_count"] = uint64OrZero(rec.TokenCount)
+	}
 	resp := map[string]interface{}{
 		"batch_id": id,
 		"on_chain": onChain,
@@ -607,8 +712,38 @@ func (sa *SettlementAPI) handleFILPrice(w http.ResponseWriter, r *http.Request) 
 
 // --- helpers ---
 
+// SetMinerPayoutProvider wires the live miner → miner-signed payout overlay
+// (worker.Registry.ListMinerPayoutMap) so revenue endpoints cover SELF-registered
+// SPs, whose payout addresses never appear in the static sp_address_map. Found
+// live: with an empty static map, /api/v1/revenue listed nothing even though two
+// self-registered SPs had frozen earnings on chain.
+func (sa *SettlementAPI) SetMinerPayoutProvider(f func() map[string]string) {
+	sa.minerPayoutFn = f
+}
+
+// effectiveSPMap merges the static sp_address_map with the live self-registered
+// payout overlay; the miner-signed value wins for its miner (same precedence as
+// settlement attribution).
+func (sa *SettlementAPI) effectiveSPMap() map[string]string {
+	if sa.minerPayoutFn == nil {
+		return sa.spMap
+	}
+	dyn := sa.minerPayoutFn()
+	if len(dyn) == 0 {
+		return sa.spMap
+	}
+	m := make(map[string]string, len(sa.spMap)+len(dyn))
+	for k, v := range sa.spMap {
+		m[k] = v
+	}
+	for k, v := range dyn {
+		m[k] = v
+	}
+	return m
+}
+
 func (sa *SettlementAPI) resolveToEVM(addr string) string {
-	if evmAddr, ok := sa.spMap[addr]; ok {
+	if evmAddr, ok := sa.effectiveSPMap()[addr]; ok {
 		return evmAddr
 	}
 	return addr

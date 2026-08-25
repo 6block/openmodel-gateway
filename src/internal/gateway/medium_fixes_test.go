@@ -168,7 +168,7 @@ func TestResponseHeaderPassthrough(t *testing.T) {
 	defer srv.Close()
 
 	resp, err := http.Post(srv.URL+"/v1/chat/completions", "application/json",
-		strings.NewReader(`{"model":"default","messages":[{"role":"user","content":"hi"}]}`))
+		strings.NewReader(`{"model":"test-model","messages":[{"role":"user","content":"hi"}]}`))
 	if err != nil {
 		t.Fatal(err)
 	}

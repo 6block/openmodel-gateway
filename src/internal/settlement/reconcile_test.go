@@ -1,12 +1,12 @@
 package settlement
 
 import (
-	"time"
 	"context"
 	"math/big"
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
 
 	"github.com/prometheus/client_golang/prometheus/testutil"
 
@@ -138,7 +138,7 @@ func TestReconcileBalancedIncremental(t *testing.T) {
 // by settled+pending increment) is still flagged.
 func TestReconcileDriftDetectedIncremental(t *testing.T) {
 	h := newF3(t)
-	h.run() // baseline (empty)
+	h.run()                                                                // baseline (empty)
 	h.append(billableRecord("a", "w1", 10), billableRecord("b", "w1", 10)) // $20 new
 	h.st.settled = big.NewFloat(5)                                         // only $5 settled, nothing pending
 
@@ -209,5 +209,36 @@ func TestReconcileStatePersistsAcrossRestart(t *testing.T) {
 	}
 	if !rep.WithinTolerance {
 		t.Errorf("balanced across restart: drift=%s", rep.DriftUSD)
+	}
+}
+
+// A wallet that cannot pay: its unsettled spend converts to carried debt, and —
+// by design — STAYS inside pendingSpend so the balance gate keeps refusing it.
+// The reconciler must treat that as one liability, not two. The shipped formula
+// added debt as a third term and reported drift == -debt exactly; every debt-free
+// soak agreed with it, and the first real unpaid wallet made reconciliation cry
+// wolf (live: billed 2.020006 = settled 1.518021 + pending 0.501984, flagged at
+// drift -0.501984 because debt 0.501984 was added again).
+func TestReconcileBadDebtIsNotDrift(t *testing.T) {
+	h := newF3(t)
+	h.run() // baseline
+
+	// $10 billed; the wallet can pay nothing: all of it becomes carried debt,
+	// which the settler keeps inside pendingSpend AND writes to the debt ledger.
+	h.append(billableRecord("a", "w1", 10))
+	h.bc.AddPendingSpend(walletU, big.NewFloat(10))
+	h.st.debt = big.NewFloat(10)
+
+	rep := h.run()
+	if !rep.WithinTolerance {
+		t.Fatalf("bad debt double-counted as drift: billed=%s settled=%s pending=%s debt=%s drift=%s",
+			rep.BilledUSD, rep.SettledUSD, rep.PendingUSD, rep.DebtUSD, rep.DriftUSD)
+	}
+	// And a REAL leak must still alert with debt present: $10 more billed,
+	// nothing settled, nothing newly pending.
+	h.append(billableRecord("b", "w1", 10))
+	rep2 := h.run()
+	if rep2.WithinTolerance {
+		t.Fatal("a genuine shortfall must still be flagged when debt exists")
 	}
 }

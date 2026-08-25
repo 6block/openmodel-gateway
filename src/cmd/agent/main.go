@@ -9,16 +9,21 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"strings"
 	"sync"
 	"syscall"
 	"time"
 
+	faddress "github.com/filecoin-project/go-address"
+
 	"openmodel/sp-state-agent/internal/admin"
 	"openmodel/sp-state-agent/internal/config"
+	"openmodel/sp-state-agent/internal/filecoin"
 	"openmodel/sp-state-agent/internal/gateway"
 	"openmodel/sp-state-agent/internal/health"
 	"openmodel/sp-state-agent/internal/settlement"
 	"openmodel/sp-state-agent/internal/worker"
+	"openmodel/sp-state-agent/internal/workermtls"
 )
 
 func main() {
@@ -49,9 +54,31 @@ func main() {
 
 	registry := worker.NewRegistry(logger, savePath)
 
+	// Worker-direction mTLS (gateway's client certificate + private CA). Loaded
+	// once, shared by the poller, the request forwarders and the probe. Fails
+	// closed on half-configuration; empty config = plaintext, exactly as before.
+	if cfg.WorkerMTLS.CAFile == "" && cfg.WorkerMTLS.CertFile == "" && cfg.WorkerMTLS.KeyFile == "" {
+		// Loud, not silent: with no material the factory quietly degrades to
+		// plaintext defaults, and any https worker endpoint then fails its
+		// handshake with a misleading client-side alert (took the first external
+		// SP offline for hours before anyone looked). Deliberate for all-http
+		// fleets, so WARN rather than fail.
+		logger.Warn("worker_mtls not configured — polling/forwarding to https:// worker endpoints WILL fail the TLS handshake; only plain-http workers are servable")
+	}
+	workerTLS, err := workermtls.New(cfg.WorkerMTLS.CAFile, cfg.WorkerMTLS.CertFile, cfg.WorkerMTLS.KeyFile)
+	if err != nil {
+		logger.Error("worker mTLS configuration invalid", "error", err)
+		os.Exit(1)
+	}
+	if workerTLS.Enabled() {
+		logger.Info("worker mTLS enabled — https worker endpoints require the private-CA handshake",
+			"ca", cfg.WorkerMTLS.CAFile)
+	}
+
 	// Poller with state-change callback for logging and metrics.
 	pollInterval := time.Duration(cfg.Workers.PollIntervalSec) * time.Second
 	poller := worker.NewPoller(registry, pollInterval, cfg.Workers.OfflineFailThreshold, logger)
+	poller.SetWorkerMTLS(workerTLS)
 	if cfg.Workers.PollTimeoutSec > 0 {
 		poller.SetPollTimeout(time.Duration(cfg.Workers.PollTimeoutSec) * time.Second)
 	}
@@ -65,12 +92,21 @@ func main() {
 		logger.Warn("admin API authentication is DISABLED — set admin.token in config for production")
 	}
 	adminServer := admin.NewServer(cfg.Admin.Port, cfg.Admin.Token, registry, poller, logger)
+	adminServer.SetBanDefault(time.Duration(cfg.Ban.DefaultDurationSec) * time.Second)
 
 	// Gateway (port 3000) — OpenAI-compatible reverse proxy
 	if cfg.Gateway.ClientToken == "" && len(cfg.Gateway.APIKeys) == 0 {
 		logger.Warn("gateway client authentication is DISABLED — set gateway.client_token or gateway.api_keys for production")
 	}
 	gw := gateway.New(registry, cfg.Gateway, logger)
+	gw.SetWorkerMTLS(workerTLS)
+	if len(cfg.Gateway.TrustedProxies) > 0 {
+		if err := gateway.SetTrustedProxies(cfg.Gateway.TrustedProxies); err != nil {
+			logger.Error("gateway.trusted_proxies invalid", "error", err)
+			os.Exit(1) // a typo here silently collapses per-IP limits to one bucket — refuse to run
+		}
+		logger.Info("trusted reverse proxies configured — X-Forwarded-For honored from them", "proxies", cfg.Gateway.TrustedProxies)
+	}
 	// Verification sampling (A7 phase 1): retain a random fraction of served requests
 	// (prompt + response + claimed model + tokens) for offline SP fraud detection.
 	// Opt-in — nil (no cost) unless sample_rate > 0 and a sample_log_path is set.
@@ -80,9 +116,55 @@ func main() {
 	); sampler != nil {
 		gw.SetVerificationSampler(sampler)
 	}
+	// SP self-registration (miner-signed admission). Must be enabled before
+	// gw.Handler() builds the mux.
+	if cfg.SPRegistration.Enabled {
+		minPower := new(big.Int)
+		if s := strings.TrimSpace(cfg.SPRegistration.MinRawPowerBytes); s != "" {
+			v, ok := new(big.Int).SetString(s, 10)
+			if !ok || v.Sign() < 0 {
+				logger.Error("invalid sp_registration.min_raw_power_bytes", "value", s)
+				os.Exit(1)
+			}
+			minPower = v
+		}
+		minBalance, err := gateway.ParseFILToAtto(cfg.SPRegistration.MinMinerBalanceFIL)
+		if err != nil {
+			logger.Error("invalid sp_registration.min_miner_balance_fil", "error", err)
+			os.Exit(1)
+		}
+		gw.EnableSPRegistration(gateway.SPRegistrationOptions{
+			GatewayID:          cfg.SPRegistration.GatewayID,
+			MinRawPowerBytes:   minPower,
+			MinMinerBalance:    minBalance,
+			ChallengeTTL:       time.Duration(cfg.SPRegistration.ChallengeTTLSec) * time.Second,
+			RegisterRatePerMin: cfg.SPRegistration.RegisterRatePerMin,
+			MaxRegisteredSPs:   cfg.SPRegistration.MaxRegisteredSPs,
+		}, filecoin.NewClient(cfg.SPRegistration.FilecoinRPCURLs, logger))
+		if err := gw.EnableCertIssuer(cfg.SPRegistration.IssuerCACert, cfg.SPRegistration.IssuerCAKey,
+			time.Duration(cfg.SPRegistration.CertValiditySec)*time.Second); err != nil {
+			logger.Error("certificate issuer configuration invalid", "error", err)
+			os.Exit(1)
+		}
+		logger.Info("sp self-registration enabled",
+			"gateway_id", cfg.SPRegistration.GatewayID,
+			"rpc_endpoints", len(cfg.SPRegistration.FilecoinRPCURLs),
+			"min_raw_power_bytes", minPower.String(),
+			"min_miner_balance_atto", minBalance.String(),
+		)
+	}
 	gatewayServer := &http.Server{
 		Addr:    fmt.Sprintf(":%d", cfg.Gateway.Port),
 		Handler: gw.Handler(),
+	}
+	if cfg.SPRegistration.Enabled && cfg.SPRegistration.HTTPSPort > 0 {
+		go func() {
+			if err := gw.StartWorkerTLS(fmt.Sprintf(":%d", cfg.SPRegistration.HTTPSPort),
+				cfg.SPRegistration.GatewayID, gw.Handler()); err != nil {
+				logger.Error("worker-direction HTTPS failed", "error", err)
+				os.Exit(1) // an operator who configured it wants it up, not silently absent
+			}
+		}()
 	}
 
 	// Settlement engine (conditional on config)
@@ -95,6 +177,15 @@ func main() {
 	// settlement and public_query are enabled.
 	var publicServer *admin.PublicServer
 	if cfg.Settlement.Enabled {
+		// Filecoin address rendering/parsing (miner ids, f410 funding helper) must
+		// match the chain: mainnet uses the f prefix, everything else t. go-address
+		// keys this off a package-global; set it once before any address work.
+		if cfg.Settlement.ChainID == 314 {
+			faddress.CurrentNetwork = faddress.Mainnet
+		} else {
+			faddress.CurrentNetwork = faddress.Testnet
+		}
+
 		var err error
 		contractClient, err = settlement.NewContractClient(&cfg.Settlement, logger)
 		if err != nil {
@@ -142,6 +233,17 @@ func main() {
 			contractClient, balanceCache, pricer, settler, reconciler,
 			cfg.Settlement.SupportedTokens, cfg.Settlement.SPAddressMap, logger,
 		)
+		// Revenue endpoints must also cover SELF-registered SPs (their payout
+		// addresses live in the registry, not the static sp_address_map).
+		settlementAPI.SetMinerPayoutProvider(registry.ListMinerPayoutMap)
+		// Public network metrics: catalog size from the gateway's own resolution,
+		// active developers counted from the request log (cached; see
+		// settlement.ActiveWalletCounter). Both are counts only.
+		devCounter := settlement.NewActiveWalletCounter(cfg.Gateway.RequestLogPath)
+		settlementAPI.SetNetworkStatsDeps(admin.NetworkStatsDeps{
+			ProductionModels: gw.AvailableModelCount,
+			ActiveDevelopers: devCounter.Count,
+		})
 		adminServer.RegisterSettlementAPI(settlementAPI)
 
 		// Optional public read-only query port (SP earnings transparency). Kept on a
@@ -154,6 +256,12 @@ func main() {
 				settlementAPI, logger,
 			)
 			logger.Info("public query API enabled (read-only, no auth)", "port", cfg.PublicQuery.Port)
+			// Also mount the same read-only routes on the gateway mux itself, so a
+			// browser on the HTTPS web UI reads receipts SAME-ORIGIN. Without this
+			// the viewer on https://…:<https_port> must call the plaintext public
+			// port and the browser blocks it as mixed content. The standalone
+			// public port stays for third-party auditors and scripts.
+			gw.MountPublicQuery(settlementAPI.RegisterPublicRoutes)
 		}
 
 		logger.Info("settlement engine enabled",
@@ -167,6 +275,32 @@ func main() {
 
 	// Background context for poller and metrics goroutines.
 	bgCtx, cancelBg := context.WithCancel(context.Background())
+
+	// Admission gate needs the prober: a gate with nothing to verify claims would
+	// leave every self-registered worker permanently unverified → zero traffic.
+	// Fail loudly at start-up rather than silently starve the fleet.
+	if cfg.Probe.AdmissionGate && !cfg.Probe.Enabled {
+		logger.Error("probe.admission_gate requires probe.enabled: true (a gate with no prober starves every worker)")
+		os.Exit(1)
+	}
+	registry.SetAdmissionGate(cfg.Probe.AdmissionGate)
+	if cfg.Probe.AdmissionGate {
+		logger.Info("probe admission gate ON — self-registered workers route only on verified_models")
+	}
+
+	// Automated capability auditor: admission verification (gate) + TTL re-checks +
+	// periodic spot-checks. No-op unless probe.enabled; only self-registered workers.
+	gw.StartAuditor(bgCtx, gateway.ProbeConfig{
+		Enabled:         cfg.Probe.Enabled,
+		IntervalSec:     cfg.Probe.IntervalSec,
+		NumQuestions:    cfg.Probe.NumQuestions,
+		MinScore:        cfg.Probe.MinScore,
+		BanSeconds:      cfg.Probe.BanSeconds,
+		AdmissionGate:   cfg.Probe.AdmissionGate,
+		VerifyTTL:       time.Duration(cfg.Probe.VerifyTTLSec) * time.Second,
+		ModelFloors:     cfg.Probe.ModelFloors,
+		SpotMinInterval: time.Duration(cfg.Probe.SpotMinIntervalSec) * time.Second,
+	})
 
 	// Track background goroutines for graceful shutdown.
 	var wg sync.WaitGroup

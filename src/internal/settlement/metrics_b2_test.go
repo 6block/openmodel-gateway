@@ -77,7 +77,7 @@ func TestMetricsStuckTxAndPriceStale(t *testing.T) {
 	// --- stale price defers the cycle ---
 	mock2 := newMockContract()
 	s2, dir2 := newTestSettler(t, mock2, discardLogger())
-	s2.cfg.FILPriceSource = "auto"          // auto mode can be stale
+	s2.cfg.FILPriceSource = "auto"                 // auto mode can be stale
 	s2.pricer = NewPricer(s2.cfg, discardLogger()) // never refreshed → lastUpdateTime zero → stale
 	reqLog2 := filepath.Join(dir2, "requests.jsonl")
 	writeRequestLog(t, reqLog2, []RequestRecord{billableRecord("p1", "w1", 5)})

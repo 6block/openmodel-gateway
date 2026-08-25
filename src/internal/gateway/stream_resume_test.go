@@ -29,7 +29,7 @@ func newResumeGateway(t *testing.T, upstream string, resume bool, features []str
 	registry := worker.NewRegistry(logger, "")
 	for _, id := range []string{"w0", "w1"} {
 		registry.Register(worker.WorkerRegistration{ID: id, Endpoint: upstream, SchedulerURL: upstream, GPUCount: 1})
-		registry.UpdateState(id, "GPU_STATE_AVAILABLE", "running", 0, "default", 1)
+		registry.UpdateState(id, "GPU_STATE_AVAILABLE", "running", 0, "test-model", 1)
 		registry.SetFeatures(id, features, "")
 	}
 	gw := New(registry, config.GatewayConfig{
@@ -135,7 +135,7 @@ func readStream(t *testing.T, url, body string) (contents []string, errorFrames,
 	return contents, errorFrames, doneCount
 }
 
-const resumeBody = `{"model":"default","messages":[{"role":"user","content":"tell a story"}],"max_tokens":30,"stream":true}`
+const resumeBody = `{"model":"test-model","messages":[{"role":"user","content":"tell a story"}],"max_tokens":30,"stream":true}`
 
 // The headline behavior: a mining interruption mid-stream is invisible to the client —
 // content continues seamlessly on another worker, no error frame, exactly one [DONE],
@@ -248,7 +248,7 @@ func TestStreamResume_ClientSuppliedContinuationRejected(t *testing.T) {
 	defer cleanup()
 
 	req, _ := http.NewRequest("POST", gw.URL+"/v1/chat/completions",
-		strings.NewReader(`{"model":"default","messages":[{"role":"user","content":"x"}],"om_continuation":"sneaky","stream":true}`))
+		strings.NewReader(`{"model":"test-model","messages":[{"role":"user","content":"x"}],"om_continuation":"sneaky","stream":true}`))
 	req.Header.Set("Authorization", "Bearer test")
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
@@ -273,7 +273,7 @@ func TestStreamResume_ResumedBilledMetered(t *testing.T) {
 	registry := worker.NewRegistry(logger, "")
 	for _, id := range []string{"w0", "w1"} {
 		registry.Register(worker.WorkerRegistration{ID: id, Endpoint: up.URL, SchedulerURL: up.URL, GPUCount: 1})
-		registry.UpdateState(id, "GPU_STATE_AVAILABLE", "running", 0, "default", 1)
+		registry.UpdateState(id, "GPU_STATE_AVAILABLE", "running", 0, "test-model", 1)
 		registry.SetFeatures(id, []string{worker.FeatureContinuation}, "")
 	}
 	scfg := &settlement.Config{
@@ -316,7 +316,7 @@ func TestStreamResume_ResumedBilledMetered(t *testing.T) {
 }
 
 // A teardown error AFTER the worker's [DONE] (tunnel turning FIN into RST — observed on
-// the real fs3 hop) must NOT be treated as an interruption: the stream is complete and
+// a real tunneled worker hop) must NOT be treated as an interruption: the stream is complete and
 // must be billed, with a clean client-side termination.
 func TestStreamResume_TeardownErrorAfterDoneIsClean(t *testing.T) {
 	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

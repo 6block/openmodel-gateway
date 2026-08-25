@@ -14,7 +14,7 @@ func TestIsImplausiblePrice(t *testing.T) {
 		price float64
 		want  bool
 	}{
-		{"small move within band", 2.4, false},   // +20%
+		{"small move within band", 2.4, false},    // +20%
 		{"big move down within band", 1.1, false}, // -45%
 		{"gross spike over band", 5.0, true},      // +150%
 		{"flash crash to ~zero", 0.001, true},     // below absolute floor

@@ -2,32 +2,58 @@
 
 The OpenModel Gateway includes a **prepaid, on-chain settlement layer**. Users deposit FIL or stablecoins into an FVM smart contract; the gateway meters usage per request and a background engine batches consumption into periodic on-chain settlements that credit SPs and the platform.
 
+**Hosted mainnet deployment (alpha)** — the live endpoints every example below
+can be run against:
+
+| | |
+|---|---|
+| API + registration + web UI + public queries | `https://openmodel.filfox.info` |
+| Settlement contract (Filecoin mainnet) | `0x60D41baEaBe1ABE061AE82c44425debc35bA524A` |
+
+One origin behind a publicly-trusted certificate.
+
 For the inference API (`/v1/chat/completions`, streaming, model routing) see **inference-api.md**. The settlement layer adds new client-facing behaviors on that same endpoint — per-key rate/concurrency limits (**429**), a request-body cap (**413**), a debt-suspension path (**402 "account suspended"**), and a graceful-drain rejection (**503** on shutdown) — documented in §2.1 below. Beyond those, this document covers: **self-service registration (getting an API key)**, the **balance gate**, the **settlement Admin API**, and the **`settlement-cli`** tool.
 
 ---
 
-## Registration: getting an API key (wallet binding)
+## Registration & API keys (wallet binding)
 
-> ⚠️ **v1 — to be extended in M4**: hashed key storage, key rotation/recovery, multiple keys per wallet, and rate-limiting `/v1/register` against abuse. Put it behind HTTPS in production.
+A user self-registers an API key bound to their own EVM wallet — usage on that key
+is billed and settled to that wallet. Wallet ownership is proven by an
+**Ethereum signature** (EIP-191 personal_sign), so nobody can register with
+someone else's address. Keys are stored **hashed** on the gateway; the plaintext
+key is shown exactly once, at creation, and cannot be retrieved later — losing it
+means deleting it and creating a new one. A wallet can hold up to **10 keys**.
+Both registration and key management are IP-rate-limited.
 
-A user self-registers an API key bound to their own EVM wallet — usage on that key is then billed and settled to that wallet. Wallet ownership is proven by an **Ethereum signature**, so nobody can register with someone else's address (which would bill that person).
+### First key: POST /v1/register
 
-**`POST /v1/register`** — no existing key required; this is the self-service entry
-point. It is served on every listener the gateway exposes (the plain API port and,
-when configured, the TLS port that also serves the web UI), so use whichever
-address the operator published.
+One wallet registers once; this mints its first key. More keys come from
+`/v1/keys` below. Two ways to build the request:
 
-Request body:
-```json
-{
-  "wallet": "0x<your EVM address>",
-  "issued_at": 1782800000,
-  "signature": "0x<EIP-191 signature over the message below>",
-  "name": "optional label"
-}
+**Option A — fetch the exact text to sign** (recommended; one source of truth,
+no format drift):
+
+```
+GET /v1/register/message?wallet=0x<your EVM address>
 ```
 
-The signed message is **fixed byte-for-byte** (EIP-191 personal_sign); the server reconstructs it in the same format and verifies the signature recovers to `wallet`:
+returns
+
+```json
+{"wallet": "0x…", "issued_at": 1786500000, "message": "OpenModel API key registration\nwallet: 0x…\nissued_at: 1786500000"}
+```
+
+Sign `message` with the wallet (personal_sign), then:
+
+```
+POST /v1/register
+{"wallet": "0x…", "issued_at": 1786500000, "signature": "0x…", "name": "optional label"}
+```
+
+**Option B — build the message yourself** (byte-for-byte, `\n` separators, EIP-55
+checksummed address):
+
 ```
 OpenModel API key registration
 wallet: <EIP-55 checksummed address>
@@ -35,30 +61,105 @@ issued_at: <unix seconds>
 ```
 
 Success **200**:
+
 ```json
 {"api_key": "sk-om-…", "wallet": "0x…", "name": "user-…"}
 ```
 
-Then call `/v1/chat/completions` with `Authorization: Bearer sk-om-…`; usage is billed to that `wallet`, which **must be funded first** or the balance gate returns 402 (see §2). Registration immediately adds the wallet to on-chain balance refresh (surviving restarts), so **a funded wallet can spend within seconds of registering**.
-
-**Security & constraints:**
+Save `api_key` now — it is never shown again. Then call `/v1/chat/completions`
+with `Authorization: Bearer sk-om-…`; usage is billed to that wallet, which
+**must be funded first** or the balance gate returns 402 (see §2). Registration
+immediately adds the wallet to on-chain balance refresh (surviving restarts), so
+a funded wallet can spend within seconds of registering.
 
 | Case | Response |
 |---|---|
 | Recovered signer ≠ wallet | 401 |
 | `issued_at` outside the ±5-minute window | 400 |
 | Same signature replayed within the window | 409 |
-| Wallet already registered (incl. wallets already in config) | 409 |
+| Wallet already registered (incl. wallets in static config) | 409 — use `/v1/keys` for more keys |
 | Malformed wallet / non-POST | 400 / 405 |
-
-Four things stop replay: the signed message spells out its purpose and wallet, so a signature made for anything else won't fit; a signature is only valid for ±5 minutes; within that window the same signature is accepted only once; and each wallet gets exactly one key. **Registration completes in a single request — no server-issued nonce round-trip**; and under production HTTPS an attacker never sees the signature in the first place.
+| Too many attempts from one IP | 429 |
 
 **Signing example (ethers v6):**
+
 ```js
-const issued = Math.floor(Date.now() / 1000);
-const msg = `OpenModel API key registration\nwallet: ${wallet.address}\nissued_at: ${issued}`;
-const signature = await wallet.signMessage(msg); // EIP-191 personal_sign
-// POST /v1/register  body: { wallet: wallet.address, issued_at: issued, signature }
+const r = await (await fetch(`${GW}/v1/register/message?wallet=${wallet.address}`)).json();
+const signature = await wallet.signMessage(r.message); // EIP-191 personal_sign
+// POST /v1/register  body: { wallet: r.wallet, issued_at: r.issued_at, signature, name: "my-app" }
+```
+
+### Managing keys: POST /v1/keys
+
+Every management call is signed by the wallet, same pattern as registration:
+fetch the canonical text from `GET /v1/keys/message`, sign it, POST it back.
+Actions: **create**, **list**, **delete**.
+
+```
+GET /v1/keys/message?wallet=0x…&action=create&name=ci-bot
+GET /v1/keys/message?wallet=0x…&action=list
+GET /v1/keys/message?wallet=0x…&action=delete&key_id=<id>
+```
+
+Each returns `{wallet, action, issued_at, name, key_id, message}`; sign
+`message`, then:
+
+```
+POST /v1/keys
+{"wallet": "0x…", "action": "create", "issued_at": …, "signature": "0x…", "name": "ci-bot"}
+```
+
+Responses:
+
+- **create** → `{"api_key": "sk-om-…", "key": {"id", "name", "display", "created_at"}}` —
+  `api_key` shown once; `display` is the stored prefix used to recognise the key
+  in lists. An empty `name` autonames `key-N`. An 11th key returns **409** until
+  one is deleted.
+- **list** → `{"keys": [{"id", "name", "display", "created_at"}, …]}` — no
+  plaintext keys, ever.
+- **delete** → revocation is immediate; the next request with that key gets 401.
+  `key_id` comes from list/create.
+
+### Your account: GET /v1/me
+
+Key-authenticated self-view — the fastest way to answer "which wallet is this
+key, and can it pay?":
+
+```
+GET /v1/me
+Authorization: Bearer sk-om-…
+```
+
+```json
+{
+  "key": {"name": "user-…", "id": "…", "static": false},
+  "wallet": "0x…",
+  "balance": {
+    "fil_price_usd": "0.68",
+    "chain_fil": "0.010000",
+    "tokens": {"FIL": "0.010000", "USDFC": "0.000000"},
+    "pending_usd": "0.000000",
+    "available_usd": "0.006800"
+  },
+  "recent_usage": [ {"…": "last 20 requests on this key"} ]
+}
+```
+
+`available_usd` is computed by the **same** multi-token, buffer-adjusted
+valuation the 402 gate uses — if it is positive, a request will pass the balance
+gate.
+
+### Helper: GET /v1/f4addr
+
+Deposits from exchanges or Lotus wallets need the **f410** form of your EVM
+address as the send target. Pure derivation, no auth:
+
+```
+GET /v1/f4addr?wallet=0x<your EVM address>
+```
+
+```json
+{"wallet": "0x…", "f4": "f410f…"}
 ```
 
 ---
@@ -69,9 +170,19 @@ const signature = await wallet.signMessage(msg); // EIP-191 personal_sign
 deposit (on-chain)  →  balance gate (per request)  →  batched settlement (on-chain)  →  SP/platform withdraw
 ```
 
-- **Deposit** — users call the contract's `depositFIL()` / `depositToken()` to fund a prepaid balance.
+- **Deposit** — users call the contract's `depositFIL()` (payable; a bare FIL
+  transfer to the contract also credits) or, for stablecoins,
+  `approve()` on the token then `depositToken(token, amount)`. On the hosted
+  mainnet deployment two tokens are accepted: **FIL** and **USDFC**
+  (`0x80B98d3aa09ffff255c3ba4A241111Ff1262F045`, **18 decimals** — not 6).
+  Sending from an exchange or a Lotus wallet? Use the **f410** form of your
+  address as the target (`GET /v1/f4addr`, see above).
 - **Balance gate** — on every billable request the gateway reserves the estimated cost (`max_tokens × model price`) against `available = on-chain balance − pendingSpend`. Insufficient funds → **HTTP 402**. After the request, the reservation is reconciled to the actual token usage (failed / interrupted requests are not billed).
-- **Settlement** — every `interval_minutes`, the engine groups billable requests per `(wallet, SP, token)`, converts USD → token amount (stablecoin at par, FIL at the current FIL/USD rate), and submits batches to the contract. Each batch is written to a WAL before submission and recognized on-chain by its `detailsHash` — so if the process crashes and retries, the same batch can never be charged twice.
+- **Deduction priority** — when a wallet holds both tokens, settlement draws
+  **USDFC first, then FIL** (`deduction_priority`): a user who deposited a
+  stablecoin bought price stability on purpose, and the FIL balance is kept as
+  the buffer against FIL/USD movement.
+- **Settlement** — every `interval_minutes`, the engine groups billable requests per `(wallet, SP, token)`, converts USD → token amount (stablecoin at par, FIL at the current FIL/USD rate), and submits batches to the contract. Each batch is written to a WAL before submission and recognized on-chain by its `detailsHash` — so if the process crashes and retries, the same batch can never be charged twice. Since contract v1.3 each batch also records how many requests and prompt+completion tokens it covers; the contract's `cumulativeRequests()` / `cumulativeTokens()` expose all-time network volume in one call (see the [openmodel-contracts](https://github.com/6block/openmodel-contracts) README).
 - **Pricing** — `model_prices_usd` is **USD per 1,000,000 tokens** per model (with a `default`). The FIL/USD rate is `manual` or `auto` (CoinGecko → Binance fallback).
 
 Settlement is off by default (`settlement.enabled: false`); when off, the gateway behaves as a pure routing gateway.
@@ -103,7 +214,7 @@ Billing rules:
 | Stream interrupted by mining → **transparently resumed** | billed by the **gateway's own count of delivered tokens** (the re-fed prefix of a continuation segment is never double-billed) |
 | Stream interrupted and **not resumable** (degrades to an error event) | billed for tokens delivered; the server-fault interruption itself is not billed |
 | **Client abandons** a stream mid-flight | billed for tokens **delivered before the disconnect** (no free-riding by hanging up) |
-| Stream with no usage chunk | billed by the gateway's own delivered-frame count (no longer depends on the worker reporting usage) |
+| Stream with no usage chunk | billed by the gateway's own delivered-frame count |
 | 402 / 401 / 404 / 400 | not billed |
 
 > Since transparent stream resume and the stream-billing fix, streaming is metered against the
@@ -125,6 +236,7 @@ The settlement layer adds the following client-facing responses on `/v1/chat/com
 | 402 | Insufficient prepaid balance | `insufficient balance` | — |
 | 402 | **Account suspended for unpaid debt** | `account suspended` | — |
 | 413 | Request body exceeds `max_request_bytes` | `request body exceeds limit of N bytes` | — |
+| Missing `model`, or the retired `"default"` alias | 400 — name a model from `GET /v1/models` |
 | 429 | Per-key request rate exceeded | `rate limit exceeded for this API key` | `Retry-After: 1` |
 | 429 | Per-key concurrency limit reached | `too many concurrent requests for this API key` | `Retry-After: 1` |
 | 503 | Gateway draining (graceful shutdown) | `server is shutting down, please retry` | `Retry-After: 5` |
@@ -222,7 +334,7 @@ Authorization: Bearer <AGENT_ADMIN_TOKEN>
 | GET / POST | `/api/v1/reconcile` | Three-way billing reconciliation (billed vs settled+pending+debt); **409 on drift** |
 | GET | `/api/v1/state-check` | Verify integrity of persisted settlement state (post-restore); **409 on problems** |
 | GET | `/api/v1/sp-earnings-detail/:sp` | **Per-request earnings for one SP** (each inference request: earning + settled/pending + on-chain tx) |
-| GET | `/api/v1/receipt-proof/:request_id` | **Verifiable-billing proof for one request** (signed receipt + Merkle inclusion proof + on-chain batch; also on public port :3001, see §2.2) |
+| GET | `/api/v1/receipt-proof/:request_id` | Merkle inclusion proof for one request — **public routes only** (`:3001` and the gateway port), not served on `:9091` |
 
 ### GET /api/v1/settlements/:id
 
@@ -329,7 +441,10 @@ curl http://<host>:9091/api/v1/reconcile -H "Authorization: Bearer $TOK"
 
 - **HTTP 200** when `within_tolerance` is true; **409 Conflict** when drift exceeds the tolerance (so a deploy/CI gate can fail on drift); **503** when settlement is disabled; **500** on a read error.
 - `drift_usd = cumulative billed − (settled delta + pending delta + debt delta)`. A positive drift means under-settlement (potential lost revenue); negative means over-settlement (potential double counting). Investigate any non-zero drift beyond tolerance.
-- **Why incremental**: the old implementation re-summed whatever request log was still on disk to get an all-time "billed" figure. As soon as rotation deleted old backups — or the chain held settlements from before the reconciler ever started — the numbers stopped matching, and a steadily growing **false drift** appeared (we measured −7.36 USD in long-run testing), drowning out real alerts. Counting increments against a baseline makes the same scenario read drift=0.
+- **Incremental counting**: reconciliation counts newly billed/settled amounts
+  against a persisted baseline instead of re-summing the on-disk request log,
+  so log rotation and settlements predating the baseline can never appear as
+  drift.
 
 ### GET /api/v1/state-check
 
@@ -362,7 +477,7 @@ curl http://<host>:9091/api/v1/state-check -H "Authorization: Bearer $TOK"
 - `:sp` may be a **miner address** (resolved via `sp_address_map`) or an **EVM address**.
 - Query params: `since` (unix seconds — only requests at/after this time), `limit` (max items, newest first, default 200).
 - The earning per request is computed from the request log with the **exact same pricing logic settlement uses**, minus the on-chain platform fee (`platform_fee_bps`, read live from the contract) — so the detail always matches how billing actually works.
-- Settlement status (`settled` + `tx_hash`/`block_number`) comes straight from the **Merkle commitment ledger**: a request that made it into a confirmed on-chain batch shows `settled: true` along with that batch's tx; one that hasn't yet shows `settled: false` (pending). Historical requests settled before Merkle commitments were enabled (pre-2026-07-03) also show `settled: false` — the same line receipt-proof draws by returning 404 for them.
+- Settlement status (`settled` + `tx_hash`/`block_number`) comes straight from the **Merkle commitment ledger**: a request that made it into a confirmed on-chain batch shows `settled: true` along with that batch's tx; one that hasn't yet shows `settled: false` (pending).
 - **Totals cover only the returned page**: `total/settled/pending_earning_usd` and both counts describe just the items in this response — that's what `"scope": "returned_items"` is saying. For all-time settled totals use `/api/v1/revenue/:sp`, which keeps its own running total and answers instantly. The reason is simple: billing history keeps growing, so the endpoint walks from the newest records backwards and stops as soon as it has `limit` items — a query stays fast no matter how much history piles up, at the cost of totals that only reflect the page you fetched.
 
 ```bash
@@ -373,7 +488,7 @@ curl "http://<host>:9091/api/v1/sp-earnings-detail/0x3C44...?since=1782700000&li
 ```json
 {
   "sp": "0x3C44CdDdB6a900fa2b585dd299e03d12FA4293BC",
-  "platform_fee_bps": 300,
+  "platform_fee_bps": 300      // example; the hosted trial currently runs 0,
   "scope": "returned_items",
   "total_earning_usd": "14.55000000",
   "settled_earning_usd": "14.55000000",
@@ -384,7 +499,7 @@ curl "http://<host>:9091/api/v1/sp-earnings-detail/0x3C44...?since=1782700000&li
     {
       "request_id": "req-abc",
       "timestamp": "2026-06-30T12:00:00Z",
-      "model": "Qwen2.5-3B",
+      "model": "Qwen3-4B-Instruct-2507",
       "total_tokens": 10,
       "prompt_tokens": 4,
       "cached_tokens": 0,
@@ -402,18 +517,36 @@ curl "http://<host>:9091/api/v1/sp-earnings-detail/0x3C44...?since=1782700000&li
 
 #### Public read-only query port (SP self-service)
 
-The endpoint above lives on the admin port (**9091**) and needs the admin token — but that token is operator god-mode (register/deregister workers, force settlement, pause the contract), so it **must not be handed to a third-party SP**. For SP self-service there is a **separate, public, read-only port** that exposes ONLY two read-only routes: `sp-earnings-detail` and `receipt-proof` (verifiable billing, see §2.2):
+The endpoint above lives on the admin port (**9091**) and needs the admin token — but that token is operator god-mode (register/deregister workers, force settlement, pause the contract), so it **must not be handed to a third-party SP**. For SP self-service there is a **separate, public, read-only port** that exposes ONLY three read-only routes: `sp-earnings-detail`, `receipt-proof` (verifiable billing, see §2.2) and `network-stats`:
 
 - **Port**: **3001** in the reference deploy (grouped with the client gateway on 3000 as the other public-facing port; the code default is 9092, but 9092 is commonly taken by Prometheus).
 - **No auth**: anyone may query; just put the `:sp` address in the path. Open querying is intentional — the on-chain `spEarnings` mapping is already public, so exposing the off-chain per-request detail is just one more step of transparency, and it lets SPs cross-check that the operator settles fairly.
 - **No client identity**: the response carries only request_id / model / tokens / earning / tx — **never the paying client's wallet or api-key**. SP-earnings transparency is not client-activity transparency.
-- **Rate-limited**: anyone can hit this port, so a global token bucket (`rate_per_sec` / `rate_burst`) keeps the volume in check; over the limit you get **429**. `/health` is never rate-limited. Both routes are cheap to serve: `receipt-proof` jumps straight to the right ledger line through an index, and `sp-earnings-detail` walks from newest to oldest and stops once its page is full — however large the ledger grows, no single query ever reads all of it.
+- **Rate-limited**: anyone can hit this port, so a global token bucket (`rate_per_sec` / `rate_burst`) keeps the volume in check; over the limit you get **429**. `/health` is never rate-limited. All three routes are cheap to serve: `network-stats` answers from cached counters plus one contract read; `receipt-proof` jumps straight to the right ledger line through an index, and `sp-earnings-detail` walks from newest to oldest and stops once its page is full — however large the ledger grows, no single query ever reads all of it.
 - **Plain HTTP**: fine for an invite-only, small-amount trial; front it with a TLS reverse proxy before exposing it to untrusted networks at scale (to stop path tampering/impersonation of this money-adjacent response — on-chain `getSPEarnings` is still the unforgeable backstop).
 - Requires `settlement.enabled`; the port does not start when `public_query.enabled: false`.
 
 ```bash
 # no token needed
 curl "http://<host>:3001/api/v1/sp-earnings-detail/0x3C44...?limit=100"
+```
+
+**Earnings timing note**: settlement credits SP earnings into a **24-hour
+freeze window** (the dispute window — only still-frozen earnings can ever be
+seized, by the arbiter, with on-chain evidence). After it they mature and
+`withdrawEarnings` pays them out; see the SP-GUIDE in the openmodel repository.
+
+**`GET /api/v1/network-stats`** — aggregate network metrics, counts only (no
+identities): providers with settled revenue, models currently servable, active
+developers (distinct wallets with ≥ 10 successful billable requests in the
+trailing 90 days — the rule ships in the response as
+`active_developers_min_requests` / `active_developers_window_days`), plus a
+mirror of the contract's cumulative request/token counters (the contract stays
+authoritative). These routes are also mounted on the HTTPS web-UI listener, so
+`https://<host>:18020/api/v1/network-stats` serves the same data.
+
+```bash
+curl "http://<host>:3001/api/v1/network-stats"
 ```
 
 Config (`sp-state-agent.yaml`):
@@ -499,28 +632,29 @@ settlement:
                                      # endpoint is shown by GET /api/v1/operator-balance.
   chain_id: 314159
   contract_address: "0x..."
-  operator_private_key: ${SETTLEMENT_PRIVATE_KEY}
-  interval_minutes: 15
+  contract_schema: 3            # v1.3 contract (per-batch stats); 2 = v1.2
+  operator_private_key: ${OPERATOR_PRIVATE_KEY}
+  interval_minutes: 20        # keep well below the contract's refundDelaySec (see contract-design.md)
   max_batch_size: 50
   confirmation_depth: 5             # reorg safety: blocks of finality before the cursor advances; 0 = mined==final
   model_prices_usd:                 # USD per 1,000,000 tokens
-    "Qwen/Qwen2.5-3B-Instruct": "0.10"
+    "Qwen/Qwen3-4B-Instruct-2507": "0.60"
     "default": "0.20"
   fil_price_usd: "3.50"             # manual rate, or initial value for auto
   fil_price_source: "auto"          # "manual" | "auto"
   fil_price_sources: ["coingecko", "binance"]
   model_catalog:                    # optional: per-model input/cache-read split pricing + catalog metadata
-    "Qwen/Qwen2.5-3B-Instruct": { input: "0.04", cache_read: "0.01", context_window: 32768, max_output: 4096 }
+    "Qwen/Qwen3-4B-Instruct-2507": { input: "0.20", cache_read: "0.05", context_window: 32768, max_output: 4096 }
     # models with a catalog entry bill input/output/cache-hit; others bill total×output (backward compatible)
   # stablecoin depeg protection (optional; unset = stablecoin pinned at $1)
-  stablecoin_symbol: USDC
+  stablecoin_symbol: USDFC
   stablecoin_price_sources: [coingecko, binance]   # empty = not monitored
   stablecoin_depeg_bps: 200         # >2% off $1 → depegged: settlement skips it (falls to FIL) and it stops counting toward spendable credit
   stablecoin_price_refresh_sec: 300
   supported_tokens:
     - { symbol: "FIL",  address: "0x0000000000000000000000000000000000000000", decimals: 18 }
-    - { symbol: "USDC", address: "0x...",                                        decimals: 6  }
-  deduction_priority: ["USDC", "FIL"]
+    - { symbol: "USDFC", address: "0x...",                                        decimals: 18            # USDFC is 18 decimals (NOT 6 like USDC)  }
+  deduction_priority: ["USDFC", "FIL"]
   min_balance_fil: "0.001"          # reserve buffer kept un-spendable (absorbs estimate-vs-settlement drift)
   max_pending_spend_fil: "10"       # per-wallet unsettled-spend credit cap; 0 = off
   operator_min_balance_fil: "0.1"   # operator gas alert threshold

@@ -225,8 +225,8 @@ func TestPricerUnknownSource(t *testing.T) {
 // price are all treated as fetch failures.
 func TestPricerCoinGeckoBadResponses(t *testing.T) {
 	cases := map[string]http.HandlerFunc{
-		"non-200": func(w http.ResponseWriter, r *http.Request) { w.WriteHeader(429) },
-		"bad-json": func(w http.ResponseWriter, r *http.Request) { _, _ = w.Write([]byte(`{not json`)) },
+		"non-200":    func(w http.ResponseWriter, r *http.Request) { w.WriteHeader(429) },
+		"bad-json":   func(w http.ResponseWriter, r *http.Request) { _, _ = w.Write([]byte(`{not json`)) },
 		"zero-price": func(w http.ResponseWriter, r *http.Request) { _, _ = w.Write([]byte(`{"filecoin":{"usd":0}}`)) },
 	}
 	for name, h := range cases {

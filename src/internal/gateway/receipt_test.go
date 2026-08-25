@@ -70,10 +70,10 @@ func TestReceipt_NonStreamingCapturedAndVerified(t *testing.T) {
 		if r.Header.Get("X-Om-Receipt-Req") == "1" {
 			reqSHA := fmt.Sprintf("%x", sha256.Sum256(body))
 			respSHA := fmt.Sprintf("%x", sha256.Sum256([]byte(respText)))
-			rcpt := signTestReceipt(priv, pubHex, r.Header.Get("X-Request-Id"), "default",
+			rcpt := signTestReceipt(priv, pubHex, r.Header.Get("X-Request-Id"), "test-model",
 				reqSHA, respSHA, 6, 2, 0)
 			if tamper {
-				rcpt = signTestReceipt(priv, pubHex, r.Header.Get("X-Request-Id"), "default",
+				rcpt = signTestReceipt(priv, pubHex, r.Header.Get("X-Request-Id"), "test-model",
 					reqSHA, respSHA, 6, 99, 0) // lies about tokens vs usage
 			}
 			w.Header().Set("X-OM-Receipt", rcpt)
@@ -86,7 +86,7 @@ func TestReceipt_NonStreamingCapturedAndVerified(t *testing.T) {
 	logger := testLogger()
 	registry := worker.NewRegistry(logger, "")
 	registry.Register(worker.WorkerRegistration{ID: "w0", Endpoint: up.URL, SchedulerURL: up.URL, GPUCount: 1})
-	registry.UpdateState("w0", "GPU_STATE_AVAILABLE", "running", 0, "default", 1)
+	registry.UpdateState("w0", "GPU_STATE_AVAILABLE", "running", 0, "test-model", 1)
 	registry.SetFeatures("w0", []string{worker.FeatureReceipt}, pubHex)
 
 	dir := t.TempDir()
@@ -136,7 +136,7 @@ func TestReceipt_StreamCapturedAndStripped(t *testing.T) {
 		if r.Header.Get("X-Om-Receipt-Req") == "1" {
 			reqSHA := fmt.Sprintf("%x", sha256.Sum256(body))
 			respSHA := fmt.Sprintf("%x", sha256.Sum256([]byte("Hi")))
-			rcptB64 := signTestReceipt(priv, pubHex, r.Header.Get("X-Request-Id"), "default", reqSHA, respSHA, 3, 1, 0)
+			rcptB64 := signTestReceipt(priv, pubHex, r.Header.Get("X-Request-Id"), "test-model", reqSHA, respSHA, 3, 1, 0)
 			raw, _ := base64.StdEncoding.DecodeString(rcptB64)
 			fmt.Fprintf(w, "data: {\"om_receipt\": %s}\n\n", raw)
 		}
@@ -148,7 +148,7 @@ func TestReceipt_StreamCapturedAndStripped(t *testing.T) {
 	registry := worker.NewRegistry(logger, "")
 	for _, id := range []string{"w0", "w1"} {
 		registry.Register(worker.WorkerRegistration{ID: id, Endpoint: up.URL, SchedulerURL: up.URL, GPUCount: 1})
-		registry.UpdateState(id, "GPU_STATE_AVAILABLE", "running", 0, "default", 1)
+		registry.UpdateState(id, "GPU_STATE_AVAILABLE", "running", 0, "test-model", 1)
 		registry.SetFeatures(id, []string{worker.FeatureContinuation, worker.FeatureReceipt}, pubHex)
 	}
 	dir := t.TempDir()
@@ -197,7 +197,7 @@ func TestReceipt_StreamForwardedWhenClientOptsIn(t *testing.T) {
 		fmt.Fprint(w, "data: {\"choices\": [], \"usage\": {\"prompt_tokens\": 3, \"completion_tokens\": 1, \"total_tokens\": 4}}\n\n")
 		reqSHA := fmt.Sprintf("%x", sha256.Sum256(body))
 		respSHA := fmt.Sprintf("%x", sha256.Sum256([]byte("Hi")))
-		rcptB64 := signTestReceipt(priv, pubHex, r.Header.Get("X-Request-Id"), "default", reqSHA, respSHA, 3, 1, 0)
+		rcptB64 := signTestReceipt(priv, pubHex, r.Header.Get("X-Request-Id"), "test-model", reqSHA, respSHA, 3, 1, 0)
 		raw, _ := base64.StdEncoding.DecodeString(rcptB64)
 		fmt.Fprintf(w, "data: {\"om_receipt\": %s}\n\n", raw)
 		fmt.Fprint(w, "data: [DONE]\n\n")
@@ -207,7 +207,7 @@ func TestReceipt_StreamForwardedWhenClientOptsIn(t *testing.T) {
 	logger := testLogger()
 	registry := worker.NewRegistry(logger, "")
 	registry.Register(worker.WorkerRegistration{ID: "w0", Endpoint: up.URL, SchedulerURL: up.URL, GPUCount: 1})
-	registry.UpdateState("w0", "GPU_STATE_AVAILABLE", "running", 0, "default", 1)
+	registry.UpdateState("w0", "GPU_STATE_AVAILABLE", "running", 0, "test-model", 1)
 	registry.SetFeatures("w0", []string{worker.FeatureContinuation, worker.FeatureReceipt}, pubHex)
 	dir := t.TempDir()
 	gw := New(registry, config.GatewayConfig{
@@ -248,7 +248,7 @@ func TestBadJSONBodyIs400(t *testing.T) {
 	logger := testLogger()
 	registry := worker.NewRegistry(logger, "")
 	registry.Register(worker.WorkerRegistration{ID: "w0", Endpoint: "http://127.0.0.1:1", SchedulerURL: "http://127.0.0.1:1", GPUCount: 1})
-	registry.UpdateState("w0", "GPU_STATE_AVAILABLE", "running", 0, "default", 1)
+	registry.UpdateState("w0", "GPU_STATE_AVAILABLE", "running", 0, "test-model", 1)
 	gw := New(registry, config.GatewayConfig{
 		RequestTimeoutSec: 2,
 		APIKeys:           []config.APIKey{{Key: "test", Name: "user1"}},

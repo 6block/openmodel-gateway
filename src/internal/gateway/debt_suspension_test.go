@@ -37,7 +37,7 @@ func TestSuspendedWalletGets402(t *testing.T) {
 		discardLog())
 	gw.SetBalanceChecker(bc, scfg)
 
-	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(`{"model":"default"}`))
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(`{"model":"test-model"}`))
 	req.Header.Set("Authorization", "Bearer secret")
 	rec := httptest.NewRecorder()
 	gw.handleProxy(rec, req)

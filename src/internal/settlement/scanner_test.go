@@ -99,11 +99,11 @@ func TestScannerBillableFilter(t *testing.T) {
 	sc, logPath := testScanner(t)
 	now := time.Now()
 	writeRecords(t, logPath, []RequestRecord{
-		{Wallet: walletU, Status: 200, TotalTokens: 10, Timestamp: now},               // billable
-		{Wallet: walletU, Status: 503, TotalTokens: 0, ErrorReason: "all_retries", Timestamp: now}, // not billable (status)
+		{Wallet: walletU, Status: 200, TotalTokens: 10, Timestamp: now},                                   // billable
+		{Wallet: walletU, Status: 503, TotalTokens: 0, ErrorReason: "all_retries", Timestamp: now},        // not billable (status)
 		{Wallet: walletU, Status: 200, TotalTokens: 5, ErrorReason: "stream_interrupted", Timestamp: now}, // not billable (interrupted)
-		{Wallet: "", Status: 200, TotalTokens: 7, Timestamp: now},                     // not billable (no wallet)
-		{Wallet: walletU, Status: 200, TotalTokens: 0, Timestamp: now},                // not billable (0 tokens)
+		{Wallet: "", Status: 200, TotalTokens: 7, Timestamp: now},                                         // not billable (no wallet)
+		{Wallet: walletU, Status: 200, TotalTokens: 0, Timestamp: now},                                    // not billable (0 tokens)
 	})
 
 	records, _, _, err := sc.Peek()

@@ -60,7 +60,7 @@ func TestQueue_WorkerRecoversDuringWait(t *testing.T) {
 		resp, reqErr = http.Post(
 			gwServer.URL+"/v1/chat/completions",
 			"application/json",
-			strings.NewReader(`{"model":"default","messages":[{"role":"user","content":"test"}]}`),
+			strings.NewReader(`{"model":"test-model","messages":[{"role":"user","content":"test"}]}`),
 		)
 		close(done)
 	}()
@@ -104,7 +104,7 @@ func TestQueue_TimeoutReturns503(t *testing.T) {
 	resp, err := http.Post(
 		gwServer.URL+"/v1/chat/completions",
 		"application/json",
-		strings.NewReader(`{"model":"default","messages":[{"role":"user","content":"test"}]}`),
+		strings.NewReader(`{"model":"test-model","messages":[{"role":"user","content":"test"}]}`),
 	)
 	elapsed := time.Since(t0)
 
@@ -143,7 +143,7 @@ func TestQueue_MultipleRequestsQueued(t *testing.T) {
 			resp, err := http.Post(
 				gwServer.URL+"/v1/chat/completions",
 				"application/json",
-				strings.NewReader(fmt.Sprintf(`{"model":"default","messages":[{"role":"user","content":"req %d"}]}`, n)),
+				strings.NewReader(fmt.Sprintf(`{"model":"test-model","messages":[{"role":"user","content":"req %d"}]}`, n)),
 			)
 			if err != nil {
 				return
@@ -179,7 +179,7 @@ func TestQueue_NoQueueWhenWorkerAvailable(t *testing.T) {
 	resp, err := http.Post(
 		gwServer.URL+"/v1/chat/completions",
 		"application/json",
-		strings.NewReader(`{"model":"default","messages":[{"role":"user","content":"test"}]}`),
+		strings.NewReader(`{"model":"test-model","messages":[{"role":"user","content":"test"}]}`),
 	)
 	elapsed := time.Since(t0)
 
@@ -198,8 +198,13 @@ func TestQueue_NoQueueWhenWorkerAvailable(t *testing.T) {
 }
 
 // TestQueue_RecoversBeforeDeadlineSucceeds: a request arriving while the only
-// worker is mining must wait in the queue and succeed once the worker comes back —
-// even across more than one queue window — instead of returning 503.
+// worker is mining must ride through a brief yield transparently — the worker
+// recovers INSIDE the queue window and the request succeeds. This is the
+// WinningPoSt case: ~35s of mining against the default 60s window needs exactly
+// one window, never a re-queue. (Recovery LONGER than the window is the
+// WindowPoSt case and must fail fast instead — see
+// TestQueue_LongYieldFailsFastAfterQueueTimeout; the old expectation of
+// re-queuing across windows is the hang the 24h soak flagged as finding #1.)
 func TestQueue_RecoversBeforeDeadlineSucceeds(t *testing.T) {
 	gw, registry, _ := newTestGateway(t)
 	gw.queueTimeout = 2 * time.Second // > 1s poll interval
@@ -207,7 +212,11 @@ func TestQueue_RecoversBeforeDeadlineSucceeds(t *testing.T) {
 
 	registry.UpdateState("w1", "GPU_STATE_WINDOW_POST", "paused", 0, "model", 1)
 	go func() {
-		time.Sleep(2500 * time.Millisecond) // recover in the SECOND queue window (forces a re-queue)
+		// Recover inside the queue window, and clear of the window's edge: the
+		// queue re-checks every 1s, so recovery at 0.8s is seen by the t=1s tick.
+		// Recovery at 1.2s would race the t=2s tick against the t=2s deadline in
+		// the same select (a coin flip → flaky).
+		time.Sleep(800 * time.Millisecond)
 		registry.UpdateState("w1", "GPU_STATE_AVAILABLE", "running", 0, "model", 1)
 	}()
 
@@ -216,7 +225,7 @@ func TestQueue_RecoversBeforeDeadlineSucceeds(t *testing.T) {
 
 	t0 := time.Now()
 	resp, err := http.Post(srv.URL+"/v1/chat/completions", "application/json",
-		strings.NewReader(`{"model":"default","messages":[{"role":"user","content":"hi"}]}`))
+		strings.NewReader(`{"model":"test-model","messages":[{"role":"user","content":"hi"}]}`))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -225,7 +234,43 @@ func TestQueue_RecoversBeforeDeadlineSucceeds(t *testing.T) {
 		t.Fatalf("expected 200 after worker recovered in-window, got %d", resp.StatusCode)
 	}
 	if d := time.Since(t0); d < 1*time.Second {
-		t.Errorf("expected to wait for recovery (~1.5s), returned in %v", d)
+		t.Errorf("expected to wait for recovery (~1.2s), returned in %v", d)
+	}
+}
+
+// B1 short-circuit: when the only mining candidate advertises a recovery
+// estimate far beyond the queue window, the 503 must be immediate — burning the
+// whole window before saying "come back in 18 minutes" helps nobody.
+func TestQueue_MiningEstimateBeyondBudgetFailsImmediately(t *testing.T) {
+	gw, registry, _ := newTestGateway(t) // queueTimeout=5s
+
+	registry.UpdateState("w1", "GPU_STATE_WINDOW_POST", "paused", 0, "model", 1)
+	registry.SetUntilChange("w1", 1100) // ~18 min to resume — a WindowPoSt
+
+	gwServer := httptest.NewServer(gw.Handler())
+	defer gwServer.Close()
+
+	t0 := time.Now()
+	resp, err := http.Post(
+		gwServer.URL+"/v1/chat/completions",
+		"application/json",
+		strings.NewReader(`{"model":"test-model","messages":[{"role":"user","content":"x"}]}`),
+	)
+	elapsed := time.Since(t0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusServiceUnavailable {
+		t.Fatalf("want 503, got %d", resp.StatusCode)
+	}
+	if elapsed > 2*time.Second {
+		t.Fatalf("known-long yield must 503 immediately, took %v", elapsed)
+	}
+	// Retry-After must reflect the actual estimate (clamped to 120), not the 30s fallback.
+	if ra := resp.Header.Get("Retry-After"); ra != "120" {
+		t.Fatalf("Retry-After should carry the clamped honest estimate 120, got %q", ra)
 	}
 }
 
@@ -265,12 +310,49 @@ func TestRetry_WorkerReturns503ThenRecovers(t *testing.T) {
 	srv := httptest.NewServer(gw.Handler())
 	defer srv.Close()
 	resp, err := http.Post(srv.URL+"/v1/chat/completions", "application/json",
-		strings.NewReader(`{"model":"default","messages":[{"role":"user","content":"hi"}]}`))
+		strings.NewReader(`{"model":"test-model","messages":[{"role":"user","content":"hi"}]}`))
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != 200 {
 		t.Fatalf("expected 200 after worker stopped returning 503, got %d", resp.StatusCode)
+	}
+}
+
+// Soak finding #1: with every worker mining, a request must fail fast after ONE
+// queueTimeout window (503 + Retry-After) — not silently re-queue window after
+// window until requestTimeout. During a 19-minute WindowPoSt the old behavior
+// hung every request for 5 minutes; clients gave up at 90s having received
+// nothing at all.
+func TestQueue_LongYieldFailsFastAfterQueueTimeout(t *testing.T) {
+	gw, registry, _ := newTestGateway(t) // queueTimeout=5s, requestTimeout=10s
+
+	registry.UpdateState("w1", "GPU_STATE_WINDOW_POST", "paused", 0, "model", 1)
+
+	gwServer := httptest.NewServer(gw.Handler())
+	defer gwServer.Close()
+
+	t0 := time.Now()
+	resp, err := http.Post(
+		gwServer.URL+"/v1/chat/completions",
+		"application/json",
+		strings.NewReader(`{"model":"test-model","messages":[{"role":"user","content":"x"}]}`),
+	)
+	elapsed := time.Since(t0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusServiceUnavailable {
+		t.Fatalf("want 503, got %d", resp.StatusCode)
+	}
+	// One queue window (5s) plus scheduling slack — NOT the 10s request timeout.
+	if elapsed < 4*time.Second || elapsed > 8*time.Second {
+		t.Fatalf("503 should arrive right after the queue window (~5s), took %v", elapsed)
+	}
+	if resp.Header.Get("Retry-After") == "" {
+		t.Fatal("503 must carry a Retry-After header")
 	}
 }

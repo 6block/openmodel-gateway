@@ -1,0 +1,14 @@
+[
+  {
+    "signer": "t3sl32esvdr7jmjplvx7mqdium2elhmmvsvhmr4ezw2nzygxi74xc4yyswr5jiahcfomlbkam3tnb6mhzopgva",
+    "sig_type": 2,
+    "sig_base64": "tLgJeL1mA0MBkY0fw9lxsxLcrAuNOxrMtNjojtOS7vByrsAL3B8sVRK2PflT5IH0C6VbvhRxvXWaKz6+fmIiqRRsnkCN9UtmyaghOfT93hTogAZM9mdPLxr+2kbkjkKT",
+    "message": "OpenModel real-Lotus fixture v1 (miner t0182063)"
+  },
+  {
+    "signer": "t3selxb3czlbb777nns7zsm7g64wix5w5xmp56e5arbdm7vx3nvaqznb5dvxjqy54krr2q7ewo5no5qe7is5da",
+    "sig_type": 2,
+    "sig_base64": "px0dMFTQFwpe6A8cfQiWgpiaRE9KhW631YwMjEi08UX9uOuvwI9gNjPmIx+mGq+bEidGreChbR6I2dRmaPPzK/bMJqcaWEsOLFbZTnFsfHqigB6V2xuGuZq28VKFHCV4",
+    "message": "OpenModel real-Lotus fixture v1 (miner t0185520)"
+  }
+]

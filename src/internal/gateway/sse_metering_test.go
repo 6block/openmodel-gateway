@@ -16,7 +16,7 @@ func TestSSEDeliveredCompletionMetering(t *testing.T) {
 		`data: {"choices":[{"delta":{"content":" world"}}]}` + "\n\n", // +1
 		`data: {"choices":[{"delta":{"content":""}}]}` + "\n\n",       // empty content → 0
 		`data: {"choices":[{"delta":{"content":"!"}}]}` + "\n\n",      // +1
-		`data: [DONE]` + "\n\n",                                       // sentinel → 0
+		`data: [DONE]` + "\n\n", // sentinel → 0
 	}
 	for _, c := range chunks {
 		if _, err := w.Write([]byte(c)); err != nil {
