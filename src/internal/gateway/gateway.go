@@ -1477,6 +1477,12 @@ type resolvedModel struct {
 	ContextWindow int
 	MaxOutput     int
 	Available     bool
+	// Modality / PriceUnit from the catalog entry with defaults applied
+	// ("text" / "token"); see settlement.ModelInfo.
+	Modality  string
+	PriceUnit string
+	// MaxImages is the catalog's per-request image cap for vision models (0 = unset).
+	MaxImages int
 }
 
 // resolveModels merges the configured price/catalog keys with the models actually
@@ -1569,6 +1575,8 @@ func (g *Gateway) resolveModels() []resolvedModel {
 		out = append(out, resolvedModel{
 			ID: id, Input: input, Output: priceOf(prices, id), CacheRead: info.CacheReadUSD,
 			ContextWindow: info.ContextWindow, MaxOutput: info.MaxOutput, Available: avail[id],
+			Modality: info.EffectiveModality(), PriceUnit: info.EffectivePriceUnit(),
+			MaxImages: info.MaxImagesPerRequest,
 		})
 	}
 	return out
@@ -1591,7 +1599,7 @@ func (g *Gateway) handleCatalog(w http.ResponseWriter, r *http.Request) {
 
 	out := []map[string]interface{}{}
 	for _, m := range g.resolveModels() {
-		out = append(out, map[string]interface{}{
+		entry := map[string]interface{}{
 			"id":                          m.ID,
 			"input_price_usd_per_1m":      m.Input,
 			"output_price_usd_per_1m":     m.Output,
@@ -1599,7 +1607,16 @@ func (g *Gateway) handleCatalog(w http.ResponseWriter, r *http.Request) {
 			"context_window":              m.ContextWindow,
 			"max_output":                  m.MaxOutput,
 			"available":                   m.Available,
-		})
+			// What the model does and what its prices are per. Text models and
+			// image-understanding (vision) models are both priced per token; vision
+			// models additionally accept image parts in chat messages.
+			"modality":   m.Modality,
+			"price_unit": m.PriceUnit,
+		}
+		if m.MaxImages > 0 {
+			entry["max_images_per_request"] = m.MaxImages
+		}
+		out = append(out, entry)
 	}
 	resp := map[string]interface{}{"object": "list", "data": out}
 	// The FIL/USD rate billing currently uses — the same number settlement converts
@@ -1920,10 +1937,50 @@ func extractInt(body []byte, field string) int {
 	return 0
 }
 
+// imagePromptTokenEstimate is the reservation charged per image part in a chat
+// message when estimating prompt tokens. Vision-language models tokenize an image
+// into visual tokens that ARE billed as prompt tokens (they occupy the prompt
+// budget exactly like text); measured on Qwen3-VL, visual tokens run ≈ pixels/1000
+// (512×512 ≈ 260, 1024×1024 ≈ 1030, 1 MP ≈ 1050). This is a deliberately
+// conservative reservation (over-counting is safe — the reservation reconciles
+// to the worker-reported usage after the request); the worker's real count is
+// what gets billed.
+const imagePromptTokenEstimate = 256
+
+// messageContentChars counts the text characters of one chat message `content`
+// and the number of image parts. `content` is either a plain string or the
+// OpenAI multimodal array `[{"type":"text","text":…},{"type":"image_url",…}]`
+// (vision requests). Any other shape counts as nothing.
+func messageContentChars(content interface{}) (chars, images int) {
+	switch c := content.(type) {
+	case string:
+		return len(c), 0
+	case []interface{}:
+		for _, part := range c {
+			pm, ok := part.(map[string]interface{})
+			if !ok {
+				continue
+			}
+			switch pm["type"] {
+			case "text":
+				if t, ok := pm["text"].(string); ok {
+					chars += len(t)
+				}
+			case "image_url", "image":
+				images++
+			}
+		}
+	}
+	return chars, images
+}
+
 // estimatePromptTokens makes a rough, conservative estimate of the input (prompt) token
 // count from the request body, used only to size the up-front balance reservation so a
 // large prompt with a tiny max_tokens can't slip past the gate under-reserved. It uses a
-// ~4-chars-per-token heuristic over the chat `messages[].content` (or `prompt`) text.
+// ~4-chars-per-token heuristic over the chat `messages[].content` (or `prompt`) text,
+// plus imagePromptTokenEstimate per image part (vision requests carry their image as
+// billable visual prompt tokens; the text-only heuristic would otherwise reserve
+// nothing for it and, in the stream-abort billing fallback, bill the image at zero).
 // Over-counting is safe: the reservation is reconciled to the real usage after the
 // request completes. Returns 0 on unparseable bodies (the max_tokens estimate still applies).
 func estimatePromptTokens(body []byte) int {
@@ -1931,16 +1988,16 @@ func estimatePromptTokens(body []byte) int {
 	if err := json.Unmarshal(body, &parsed); err != nil {
 		return 0
 	}
-	chars := 0
+	chars, images := 0, 0
 	if msgs, ok := parsed["messages"].([]interface{}); ok {
 		for _, m := range msgs {
 			mm, ok := m.(map[string]interface{})
 			if !ok {
 				continue
 			}
-			if c, ok := mm["content"].(string); ok {
-				chars += len(c)
-			}
+			c, i := messageContentChars(mm["content"])
+			chars += c
+			images += i
 		}
 	}
 	switch p := parsed["prompt"].(type) {
@@ -1953,7 +2010,7 @@ func estimatePromptTokens(body []byte) int {
 			}
 		}
 	}
-	return chars / 4
+	return chars/4 + images*imagePromptTokenEstimate
 }
 
 // sseCaptureWriter wraps http.ResponseWriter to pass through SSE chunks

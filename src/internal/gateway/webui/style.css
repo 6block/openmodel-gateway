@@ -55,6 +55,11 @@ body {
 .card h3 { font-size: 12px; text-transform: uppercase; letter-spacing: .8px; color: var(--muted); }
 .kv { display: flex; justify-content: space-between; align-items: center; gap: 8px; font-size: 14px; }
 .kv > span { color: var(--muted); }
+/* An author `display` rule outranks the UA sheet's [hidden]→display:none, so any
+ * element that sets display AND is toggled with the hidden attribute stays
+ * visible. `.kv` does exactly that (display:flex above), which made the Image size
+ * row show up even on models that cannot read images. Make hidden win outright. */
+[hidden] { display: none !important; }
 .row { display: flex; gap: 8px; flex-wrap: wrap; }
 /* An amount field must never shrink below its own placeholder: in the 287px
    sidebar the currency select and button left it a 54px content box, which cut
@@ -153,9 +158,33 @@ button.small { padding: 3px 9px; font-size: 12px; }
  * curl command on the right. */
 .mono.wrap { display: block; white-space: pre-wrap; word-break: break-all; background: var(--bg); border: 1px solid var(--border); border-radius: 6px; padding: 8px; margin: 6px 0; max-width: 100%; }
 
-#composer { display: flex; gap: 10px; padding: 14px clamp(16px, 6vw, 90px); border-top: 1px solid var(--border); background: var(--panel); }
+#composer { display: flex; flex-direction: column; gap: 8px; padding: 14px clamp(16px, 6vw, 90px); border-top: 1px solid var(--border); background: var(--panel); }
+.composer-row { display: flex; gap: 10px; align-items: flex-end; }
 #composer textarea { flex: 1; resize: none; }
 #statusline { padding: 4px clamp(16px, 6vw, 90px) 10px; background: var(--panel); min-height: 24px; }
+
+/* ---- image attachments ---- */
+/* The strip sits above the textarea inside the composer, so a dropped/pasted
+ * image appears exactly where the message is being written — no modal, no
+ * separate screen. Hidden entirely until something is attached. */
+#attach-strip { display: flex; flex-direction: column; gap: 6px; }
+#attach-thumbs { display: flex; gap: 8px; flex-wrap: wrap; }
+.attach-thumb { position: relative; border: 1px solid var(--border); border-radius: 8px;
+  overflow: hidden; background: var(--panel2); }
+.attach-thumb img { display: block; width: 84px; height: 84px; object-fit: cover; }
+.attach-thumb .attach-x { position: absolute; top: 2px; right: 2px; background: rgba(0,0,0,.72);
+  border: none; color: #fff; border-radius: 5px; padding: 0 5px; font-size: 12px; cursor: pointer; line-height: 18px; }
+.attach-thumb .attach-tok { font-size: 10.5px; color: var(--muted); text-align: center; padding: 2px 4px; }
+.attach-meta { display: flex; align-items: center; gap: 10px; }
+.attach-meta .budget { flex: 1; max-width: 260px; height: 6px; border-radius: 4px;
+  background: var(--bg); border: 1px solid var(--border); overflow: hidden; }
+.attach-meta .budget > i { display: block; height: 100%; width: 0%; background: var(--ok); transition: width .18s, background .18s; }
+.attach-meta .budget > i.warn { background: #e8b339; }
+.attach-meta .budget > i.over { background: var(--danger); }
+/* Images shown inside a sent message bubble */
+.msg .msg-imgs { display: flex; gap: 6px; flex-wrap: wrap; margin-bottom: 7px; }
+.msg .msg-imgs img { max-width: 150px; max-height: 150px; border-radius: 7px; display: block; }
+#composer.droptarget { outline: 2px dashed var(--accent); outline-offset: -4px; }
 
 /* ---- narrow screens ---- */
 @media (max-width: 760px) {

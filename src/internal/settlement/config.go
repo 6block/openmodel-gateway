@@ -12,14 +12,14 @@ type Config struct {
 	// first (backward compat); on a persistent transport failure the contract client
 	// rotates to the next healthy endpoint, so one flaky provider (a GLIF blip — the
 	// 24h soak was bitten by exactly this) no longer stalls settlement/balance refresh.
-	RPCURLs            []string          `yaml:"rpc_urls"`
-	ChainID            int64             `yaml:"chain_id"`
-	ContractAddress    string            `yaml:"contract_address"`
+	RPCURLs         []string `yaml:"rpc_urls"`
+	ChainID         int64    `yaml:"chain_id"`
+	ContractAddress string   `yaml:"contract_address"`
 	// ContractSchema selects the contract ABI generation: 2 = v1.2 and earlier
 	// (the default when unset — every existing deployment, mainnet included), 3 =
 	// v1.3+ (submitSettlement carries per-item request/token stats). Schema 3 is
 	// verified against the live contract at startup (SCHEMA_VERSION()).
-	ContractSchema int `yaml:"contract_schema"`
+	ContractSchema     int               `yaml:"contract_schema"`
 	OperatorPrivateKey string            `yaml:"operator_private_key"`
 	IntervalMinutes    int               `yaml:"interval_minutes"`
 	MaxBatchSize       int               `yaml:"max_batch_size"`
@@ -100,11 +100,60 @@ type TokenConfig struct {
 // per 1M tokens. InputUSD / CacheReadUSD supplement ModelPricesUSD (the output
 // price); CacheReadUSD is the discounted rate for prompt tokens served from the
 // prefix cache. ContextWindow / MaxOutput are display-only for the catalog.
+//
+// Modality and PriceUnit describe what kind of model this is and what the price
+// is per. Both default to the text-model values ("text" / "token") so every
+// existing catalog entry keeps its meaning without edits. Image-understanding
+// models (Modality "vision") still bill per token: their image input is
+// tokenized into visual prompt tokens by the worker and reported in the same
+// prompt_tokens field, so the whole token pipeline applies unchanged.
 type ModelInfo struct {
 	InputUSD      string `yaml:"input"`
 	CacheReadUSD  string `yaml:"cache_read"`
 	ContextWindow int    `yaml:"context_window"`
 	MaxOutput     int    `yaml:"max_output"`
+	// Modality: "text" (default), "vision" (image understanding — chat with image
+	// parts), "image" (image generation), "asr" (speech-to-text), "tts"
+	// (text-to-speech). Grouping/display only; routing is by model id.
+	Modality string `yaml:"modality"`
+	// PriceUnit: "token" (default; prices are per 1M tokens), "image" (per
+	// generated image) or "audio_second" (per second of audio). Anything other
+	// than "token" is reserved for the image-generation / speech modalities; the
+	// token biller refuses to price a model declared in another unit.
+	PriceUnit string `yaml:"price_unit"`
+	// MaxImagesPerRequest caps how many image parts a single chat request to a
+	// vision model may carry (0 = worker default). Display-only in the catalog
+	// today; a per-request clamp is the natural next consumer.
+	MaxImagesPerRequest int `yaml:"max_images_per_request"`
+}
+
+// Recognised ModelInfo.Modality and ModelInfo.PriceUnit values.
+const (
+	ModalityText   = "text"
+	ModalityVision = "vision"
+	ModalityImage  = "image"
+	ModalityASR    = "asr"
+	ModalityTTS    = "tts"
+
+	PriceUnitToken       = "token"
+	PriceUnitImage       = "image"
+	PriceUnitAudioSecond = "audio_second"
+)
+
+// EffectiveModality returns the modality with the text default applied.
+func (m ModelInfo) EffectiveModality() string {
+	if m.Modality == "" {
+		return ModalityText
+	}
+	return m.Modality
+}
+
+// EffectivePriceUnit returns the price unit with the token default applied.
+func (m ModelInfo) EffectivePriceUnit() string {
+	if m.PriceUnit == "" {
+		return PriceUnitToken
+	}
+	return m.PriceUnit
 }
 
 func (c *Config) ApplyDefaults() {
@@ -219,6 +268,29 @@ func (c *Config) Validate() error {
 			if _, _, err := big.ParseFloat(v, 10, 128, big.ToNearestEven); err != nil {
 				return fmt.Errorf("settlement.model_catalog[%q].%s = %q is not a valid number", model, field, v)
 			}
+		}
+		// modality / price_unit are closed vocabularies: a typo ("vison") would
+		// silently fall back to text/token and mis-describe the model to every
+		// client reading the catalog.
+		switch info.Modality {
+		case "", ModalityText, ModalityVision, ModalityImage, ModalityASR, ModalityTTS:
+		default:
+			return fmt.Errorf("settlement.model_catalog[%q].modality = %q is not one of text|vision|image|asr|tts", model, info.Modality)
+		}
+		switch info.PriceUnit {
+		case "", PriceUnitToken, PriceUnitImage, PriceUnitAudioSecond:
+		default:
+			return fmt.Errorf("settlement.model_catalog[%q].price_unit = %q is not one of token|image|audio_second", model, info.PriceUnit)
+		}
+		// Only token-priced modalities are billable on this version: the
+		// per-image / per-second billers arrive with the image-generation and
+		// speech milestones. Refuse the mismatch now rather than bill a per-image
+		// model as if its price were per 1M tokens.
+		if u := info.EffectivePriceUnit(); u != PriceUnitToken {
+			return fmt.Errorf("settlement.model_catalog[%q].price_unit = %q is not billable yet (only token-priced models are supported)", model, u)
+		}
+		if info.MaxImagesPerRequest < 0 {
+			return fmt.Errorf("settlement.model_catalog[%q].max_images_per_request must be >= 0", model)
 		}
 	}
 	return nil

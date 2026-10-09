@@ -142,6 +142,15 @@ settlement:
     # model card maximum.
     "/models/Qwen--Qwen3-32B-AWQ": {input: "0.60", cache_read: "0.15", context_window: 8192, max_output: 4096}
     "/models/Qwen--Qwen3.8-27B-FP8": {input: "0.60", cache_read: "0.15", context_window: 8192, max_output: 4096}
+    # Qwen3-VL-8B (image understanding): chat requests may carry image parts;
+    # the image is tokenized into visual prompt tokens and billed per token like
+    # text — visual tokens run ≈ pixels/1000 (512px ≈ 260, 1024px ≈ 1030). modality
+    # tags the entry for clients; price_unit stays the default "token".
+    # No max_images_per_request: the number of images a request may carry is bounded
+    # by the context window, not by a count. The worker accepts as many as fit and
+    # rejects an over-long prompt with a 4xx, which is the same error a too-long text
+    # prompt gets.
+    "/models/Qwen--Qwen3-VL-8B-Instruct": {input: "0.30", cache_read: "0.08", context_window: 8192, max_output: 4096, modality: vision}
   # ---- tokens ----
   supported_tokens:
     - {symbol: FIL, address: "0x0000000000000000000000000000000000000000", decimals: 18}

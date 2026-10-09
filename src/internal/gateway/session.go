@@ -4,6 +4,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"strings"
 	"sync"
 	"time"
 )
@@ -103,7 +104,10 @@ func sessionKeyOf(apiKeyName, header string, body []byte) string {
 }
 
 // messagesPrefix returns the first up-to-two messages (role+content) as a stable
-// conversation fingerprint, or the prompt for /v1/completions.
+// conversation fingerprint, or the prompt for /v1/completions. For a multimodal
+// content array (vision requests) only the text parts feed the fingerprint —
+// image payloads are excluded so a multi-megabyte data URI is never hashed per
+// request and re-encoding the same image cannot break the session's affinity.
 func messagesPrefix(body []byte) string {
 	var p struct {
 		Messages []struct {
@@ -120,7 +124,7 @@ func messagesPrefix(body []byte) string {
 		if i >= 2 {
 			break
 		}
-		if s, ok := m.Content.(string); ok {
+		if s := contentText(m.Content); s != "" {
 			out += m.Role + ":" + s + "\n"
 		}
 	}
@@ -129,6 +133,29 @@ func messagesPrefix(body []byte) string {
 	}
 	if s, ok := p.Prompt.(string); ok && s != "" {
 		return "prompt:" + s
+	}
+	return ""
+}
+
+// contentText extracts the text of a chat message `content`: the string itself, or
+// the concatenated "text" parts of an OpenAI multimodal array. Image parts and any
+// other shape contribute nothing.
+func contentText(content any) string {
+	switch c := content.(type) {
+	case string:
+		return c
+	case []any:
+		var b strings.Builder
+		for _, part := range c {
+			pm, ok := part.(map[string]any)
+			if !ok || pm["type"] != "text" {
+				continue
+			}
+			if t, ok := pm["text"].(string); ok {
+				b.WriteString(t)
+			}
+		}
+		return b.String()
 	}
 	return ""
 }

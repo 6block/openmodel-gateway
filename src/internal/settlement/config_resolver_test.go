@@ -1,6 +1,9 @@
 package settlement
 
-import "testing"
+import (
+	"strings"
+	"testing"
+)
 
 // TestApplyDefaultsFillsAll verifies every default-fill branch on an empty config.
 func TestApplyDefaultsFillsAll(t *testing.T) {
@@ -152,5 +155,57 @@ func TestRegistryResolverNilLister(t *testing.T) {
 	r := NewRegistryResolver(nil)
 	if got := r.GetWorkerSPMap(); got != nil {
 		t.Errorf("nil lister should yield nil map, got %v", got)
+	}
+}
+
+// modality / price_unit are closed vocabularies, and only token-priced entries
+// are billable on this version: a typo or a not-yet-supported unit must be a
+// startup error, never a silently mis-described or mis-billed model.
+func TestValidate_CatalogModalityAndPriceUnit(t *testing.T) {
+	base := func() *Config {
+		c := &Config{
+			Enabled: true, RPCURL: "http://rpc", ChainID: 1, ContractAddress: "0xabc",
+			OperatorPrivateKey: "k", ModelPricesUSD: map[string]string{"default": "0.20"},
+			FILPriceUSD: "3.0", FILPriceSource: "manual",
+			SupportedTokens:   []TokenConfig{{Symbol: "FIL", Address: "0x0", Decimals: 18}},
+			DeductionPriority: []string{"FIL"},
+		}
+		c.ApplyDefaults()
+		return c
+	}
+	ok := base()
+	ok.ModelCatalog = map[string]ModelInfo{"v": {Modality: ModalityVision, PriceUnit: PriceUnitToken, MaxImagesPerRequest: 2}}
+	if err := ok.Validate(); err != nil {
+		t.Fatalf("vision/token entry must validate: %v", err)
+	}
+	if got := ok.ModelCatalog["v"].EffectiveModality(); got != "vision" {
+		t.Fatalf("EffectiveModality: %q", got)
+	}
+	if got := (ModelInfo{}).EffectivePriceUnit(); got != "token" {
+		t.Fatalf("default price unit: %q", got)
+	}
+
+	typo := base()
+	typo.ModelCatalog = map[string]ModelInfo{"v": {Modality: "vison"}}
+	if err := typo.Validate(); err == nil || !strings.Contains(err.Error(), "modality") {
+		t.Fatalf("modality typo must be rejected, got %v", err)
+	}
+
+	unit := base()
+	unit.ModelCatalog = map[string]ModelInfo{"g": {Modality: ModalityImage, PriceUnit: PriceUnitImage}}
+	if err := unit.Validate(); err == nil || !strings.Contains(err.Error(), "not billable yet") {
+		t.Fatalf("per-image pricing must be refused until its biller exists, got %v", err)
+	}
+
+	badUnit := base()
+	badUnit.ModelCatalog = map[string]ModelInfo{"g": {PriceUnit: "per_pixel"}}
+	if err := badUnit.Validate(); err == nil || !strings.Contains(err.Error(), "price_unit") {
+		t.Fatalf("unknown price_unit must be rejected, got %v", err)
+	}
+
+	neg := base()
+	neg.ModelCatalog = map[string]ModelInfo{"v": {Modality: ModalityVision, MaxImagesPerRequest: -1}}
+	if err := neg.Validate(); err == nil {
+		t.Fatal("negative image cap must be rejected")
 	}
 }

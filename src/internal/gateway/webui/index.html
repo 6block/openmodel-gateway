@@ -131,6 +131,15 @@
           <input type="checkbox" id="thinking-toggle"> show reasoning (slower, billed as output)
         </label>
       </div>
+      <div class="kv" id="img-size-row" hidden><span>Image size</span>
+        <select id="img-size">
+          <option value="512">≤512 px</option>
+          <option value="1024" selected>≤1024 px</option>
+          <option value="0">original</option>
+        </select>
+      </div>
+      <p class="hint" id="img-size-hint" hidden></p>
+      <p class="hint" id="vision-hint" hidden></p>
       <details id="pricing-details">
         <summary class="hint">All model pricing</summary>
         <div id="pricing-table"></div>
@@ -154,9 +163,17 @@
       </div>
     </div>
     <div id="composer">
-      <textarea id="input" rows="2" placeholder="Message… (Enter to send, Shift+Enter for newline)"></textarea>
-      <button id="btn-stop" class="danger" hidden>Stop</button>
-      <button id="btn-send" class="primary" disabled>Send</button>
+      <div id="attach-strip" hidden>
+        <div id="attach-thumbs"></div>
+        <div class="attach-meta hint"><span id="attach-count"></span><span id="attach-budget"></span></div>
+      </div>
+      <div class="composer-row">
+        <button id="btn-attach" class="small" title="Attach images (or drag &amp; drop / paste)">＋ Image</button>
+        <textarea id="input" rows="2" placeholder="Message… (Enter to send, Shift+Enter for newline; drop or paste images to attach)"></textarea>
+        <button id="btn-stop" class="danger" hidden>Stop</button>
+        <button id="btn-send" class="primary" disabled>Send</button>
+      </div>
+      <input type="file" id="file-input" accept="image/*" multiple hidden>
     </div>
     <div id="statusline" class="hint"></div>
   </main>

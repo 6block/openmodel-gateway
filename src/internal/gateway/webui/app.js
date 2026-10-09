@@ -12,7 +12,7 @@
 "use strict";
 
 const $ = (id) => document.getElementById(id);
-const LS = { key: "om_api_key", wallet: "om_wallet", msgs: "om_messages", session: "om_session", refunds: "om_refunds", walletRdns: "om_wallet_rdns" };
+const LS = { key: "om_api_key", wallet: "om_wallet", msgs: "om_messages", session: "om_session", refunds: "om_refunds", walletRdns: "om_wallet_rdns", imgSize: "om_img_size" };
 
 /* API keys are wallet-scoped: a key bills the wallet it was registered under,
  * so adopting one wallet's key while ANOTHER wallet is connected silently
@@ -62,7 +62,9 @@ const state = {
   thinking: false,      // per-request opt-in: ask the model to reason before answering
   filPrice: 0,          // USD per FIL (live when /v1/me refreshes it)
   prices: null,         // {out, inp, cache} USD per TOKEN for the default model
-  catalog: null,        // model id → {input, output, cache, available} USD per 1M tokens
+  catalog: null,        // model id → {input, output, cache, available, modality, context_window, max_output}
+  attach: [],           // images staged for the NEXT message: [{dataUrl,w,h,name,bytes,tokens}]
+  attachSrc: [],        // decoded originals, 1:1 with `attach`; kept so a size change re-encodes them
 };
 
 state.apiKey = initialKey();
@@ -100,6 +102,9 @@ async function boot() {
   updateDepositEstimate();
   initWalletDiscovery();
   wireEvents();
+  $("img-size").value = localStorage.getItem(LS.imgSize) || "1024";
+  onModelChanged();          // sets the attach button's visibility for the first model
+  renderAttachments();
   renderKey();
   renderMessages();
   if (state.apiKey) { loadModels(); refreshMe(); }
@@ -223,7 +228,12 @@ function wireEvents() {
     persist();
     renderMessages();
   };
-  $("model-select").onchange = updateModelPrice;
+  $("model-select").onchange = () => {
+    localStorage.setItem(LS.model, $("model-select").value);
+    $("model-select").dataset.want = $("model-select").value;
+    updateModelPrice();
+    onModelChanged();
+  };
   $("btn-loadkeys").onclick = loadKeyList;
   $("btn-createkey").onclick = createKey;
   $("btn-copynewkey").onclick = () => navigator.clipboard.writeText($("new-key-full").textContent);
@@ -261,6 +271,51 @@ function wireEvents() {
   $("thinking-toggle").onchange = (e) => { state.thinking = e.target.checked; };
   $("deposit-amount").addEventListener("input", updateDepositEstimate);
   $("btn-send").onclick = send;
+
+  /* ---- image attachments ---- */
+  $("btn-attach").onclick = () => {
+    if (!modelIsVision()) {
+      setStatus("The selected model does not read images — pick a vision model first.");
+      return;
+    }
+    $("file-input").click();
+  };
+  $("file-input").onchange = (e) => { addFiles(e.target.files); e.target.value = ""; };
+  $("img-size").onchange = async () => {
+    localStorage.setItem(LS.imgSize, $("img-size").value);
+    try {
+      await reencodeAttachments();   // applies to images already attached, not just the next one
+    } catch (e) {
+      setStatus(errMsg(e));
+    }
+  };
+  // Drag & drop anywhere in the composer, plus paste-into-textarea for screenshots.
+  const comp = $("composer");
+  comp.addEventListener("dragover", (e) => {
+    if (!Array.from(e.dataTransfer.types || []).includes("Files")) return;
+    e.preventDefault();
+    comp.classList.add("droptarget");
+  });
+  comp.addEventListener("dragleave", () => comp.classList.remove("droptarget"));
+  comp.addEventListener("drop", (e) => {
+    comp.classList.remove("droptarget");
+    if (!e.dataTransfer.files || !e.dataTransfer.files.length) return;
+    e.preventDefault();
+    addFiles(e.dataTransfer.files);
+  });
+  document.addEventListener("paste", (e) => {
+    const items = e.clipboardData && e.clipboardData.items;
+    if (!items) return;
+    const files = [];
+    for (const it of items) {
+      if (it.kind === "file" && it.type.startsWith("image/")) {
+        const f = it.getAsFile();
+        if (f) files.push(f);
+      }
+    }
+    if (files.length) { e.preventDefault(); addFiles(files); }
+  });
+  $("input").addEventListener("input", renderBudget);   // typed text counts against the budget
   $("input").addEventListener("keydown", (e) => {
     if (e.key === "Enter" && !e.shiftKey) {
       e.preventDefault();
@@ -864,12 +919,19 @@ function buildCatalog(cfg) {
   // "0.20"/"0.60"); parsing to float here would strip trailing zeros. No
   // arithmetic is done on these — the bar/table just interpolate them.
   state.catalog = {};
+  _catalogIndex = null;   // the normalized lookup must be rebuilt for the new catalog
   for (const m of cfg.models_pricing || []) {
     state.catalog[m.id] = {
       input: m.input_per_mtok || "0",
       output: m.output_per_mtok || "0",
       cache: m.cache_read_per_mtok || "0",
       available: !!m.available,
+      // Vision plumbing (see the attachments section): modality gates the attach
+      // UI, the window/output pair sizes the token budget. Absent on older
+      // gateways, where the UI falls back to a text-only, 8192-window view.
+      modality: m.modality || "",
+      context_window: m.context_window || 0,
+      max_output: m.max_output || 0,
     };
   }
   const d = cfg.prices_usd;
@@ -894,19 +956,56 @@ function buildCatalog(cfg) {
 
 function fillModelOptions(ids) {
   const sel = $("model-select");
-  const cur = sel.value;
-  sel.innerHTML = "";
+  // Canonicalize to the CATALOG spelling before building the options. The picker is
+  // filled twice — once from /v1/webconfig (catalog spelling) and again from
+  // /v1/models (worker spelling) — and those differ ("/models/Qwen--Qwen3-VL-8B-
+  // Instruct" vs "Qwen/Qwen3-VL-8B-Instruct"). Keeping whichever came last made every
+  // downstream `catalog[id]` lookup miss, which is how the picker ended up showing a
+  // vision model's name while the price line and the attach button behaved as if a
+  // text model were selected. Normalizing here fixes all of those at once.
+  const seen = new Set();
+  const canonical = [];
   for (const id of ids) {
+    // Prefer the configured key when this id names a catalog model; otherwise keep
+    // the id as given (a model the catalog does not price).
+    const key = _catalogIndex && _catalogIndex[normalizeModelID(id)]
+      ? (Object.keys(state.catalog).find((k) => k !== "default" && normalizeModelID(k) === normalizeModelID(id)) || id)
+      : id;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    canonical.push(key);
+  }
+  // Restore by REMEMBERED id, not by "is the current value still in the list".
+  // Rebuilding the options resets selectedIndex to 0; if the current value is not in
+  // the new list the old code simply left that reset in place.
+  const cur = sel.value || sel.dataset.want || localStorage.getItem(LS.model) || "";
+  sel.innerHTML = "";
+  for (const id of canonical) {
     const o = document.createElement("option");
     o.value = id;
     o.textContent = friendlyModelName(id);
     sel.appendChild(o);
   }
-  if (ids.includes(cur)) sel.value = cur;
+  // Match the remembered choice on the normalized key too, so a value remembered
+  // under one spelling is still restored when the options arrive in the other.
+  const curNorm = normalizeModelID(cur);
+  const match = canonical.find((id) => id === cur || normalizeModelID(id) === curNorm);
+  if (match) {
+    sel.value = match;
+  } else if (canonical.length) {
+    // No remembered match: prefer a vision model, since attaching images is the
+    // capability this picker most often exists to reach.
+    const vis = canonical.find((id) => { const e = catalogEntry(id); return e && e.modality === "vision"; });
+    sel.value = vis || canonical[0];
+  }
+  sel.dataset.want = sel.value;
+  onModelChanged();
 }
 
 function priceFor(modelId) {
-  return (state.catalog && state.catalog[modelId]) || (state.catalog && state.catalog.default) || null;
+  // catalogEntry (not a raw key lookup) so the price line shows the right tier
+  // whether the selected id came from the catalog spelling or the live list's.
+  return catalogEntry(modelId) || (state.catalog && state.catalog.default) || null;
 }
 
 /* The current model's rate, shown both in the sidebar and as the chat-pane bar. */
@@ -949,18 +1048,330 @@ async function loadModels() {
   } catch { /* dropdown keeps whatever the public catalog populated */ }
 }
 
+/* Build the outgoing messages array. Turns that carried images keep them, but only
+ * the newest turn re-sends the pixels: history images would be re-billed on every
+ * follow-up and, with no per-request image cap, would eventually push the prompt
+ * past the context window on their own. Older turns carry a text marker instead so
+ * the model can still see that a picture was discussed. */
+function buildRequestMessages() {
+  let lastImgIdx = -1;
+  state.messages.forEach((m, i) => { if (m.role === "user" && m.images && m.images.length) lastImgIdx = i; });
+  return state.messages.map((m, i) => {
+    if (m.role === "user" && m.images && m.images.length) {
+      if (i !== lastImgIdx) {
+        return { role: "user", content: (m.content ? m.content + " " : "") + "[image omitted from history]" };
+      }
+      const parts = [];
+      if (m.content) parts.push({ type: "text", text: m.content });
+      for (const url of m.images) parts.push({ type: "image_url", image_url: { url } });
+      return { role: "user", content: parts };
+    }
+    return { role: m.role, content: m.content };
+  });
+}
+
+/* ---------------- image attachments ----------------
+ *
+ * The model's catalog entry decides everything here: `modality` says whether the
+ * selected model reads images at all, and `context_window` / `max_output` bound
+ * how much can be sent. There is deliberately NO image-count limit — the worker
+ * accepts as many as fit, and the real ceiling is the context window, enforced
+ * here before anything is uploaded so a request that would be rejected (or, worse,
+ * billed almost nothing and answered blind) is never sent.
+ *
+ * Token accounting, measured against Qwen3-VL on the real hardware:
+ *   visual tokens ≈ pixels / 1000   → 512² ≈ 258, 1024² ≈ 1026 per image.
+ * Text is estimated at ~4 chars per token, the same heuristic the gateway uses to
+ * size its balance reservation. Both are estimates: the authoritative count comes
+ * back in `usage.prompt_tokens` after the request, and that is what is billed.
+ */
+const ATTACH_MAX_BYTES = 7 * 1024 * 1024;   // matches the worker's per-image reject point
+const IMG_FALLBACK_CTX = 8192;              // used when the catalog omits the window
+
+/* Catalog lookup that tolerates the two spellings the gateway uses for one model.
+ *
+ * /v1/webconfig and /v1/catalog key their entries by the CONFIG spelling
+ * ("/models/Qwen--Qwen3-VL-8B-Instruct"), while /v1/models lists the worker-reported
+ * spelling ("Qwen/Qwen3-VL-8B-Instruct") — the same model, and the gateway accepts
+ * either on a request. The picker is filled from both sources (catalog first, then
+ * the live list), so a raw `catalog[sel.value]` lookup misses whenever the live list
+ * won — price fell back to the default tier and the vision checks read "not a vision
+ * model", which is exactly the "name looks right, features are wrong" symptom.
+ * Compare on a normalized key instead: drop the "/models/" prefix and treat "--" and
+ * "/" as the same separator. */
+function normalizeModelID(id) {
+  return String(id || "")
+    .replace(/^\/?models\//i, "")
+    .replace(/--/g, "/")
+    .replace(/^\/+/, "")
+    .toLowerCase();
+}
+
+let _catalogIndex = null;   // normalized id → catalog entry; rebuilt when the catalog changes
+
+function catalogEntry(id) {
+  if (!state.catalog) return null;
+  if (!_catalogIndex) {
+    _catalogIndex = {};
+    for (const k of Object.keys(state.catalog)) {
+      if (k === "default") continue;
+      _catalogIndex[normalizeModelID(k)] = state.catalog[k];
+    }
+  }
+  return state.catalog[id] || _catalogIndex[normalizeModelID(id)] || null;
+}
+
+function modelMeta() {
+  return catalogEntry($("model-select").value);
+}
+
+/* Whether the currently selected model accepts image parts. */
+function modelIsVision() {
+  const m = modelMeta();
+  return !!(m && m.modality === "vision");
+}
+
+function ctxWindow() {
+  const m = modelMeta();
+  return (m && m.context_window) || IMG_FALLBACK_CTX;
+}
+
+function outReserve() {
+  const m = modelMeta();
+  return (m && m.max_output) || 0;
+}
+
+/* Input budget: everything except the space reserved for the reply. */
+function availTokens() { return Math.max(0, ctxWindow() - outReserve()); }
+
+function imgTokens(a) { return a.tokens || Math.round((a.w * a.h) / 1000); }
+function attachTokens() { return state.attach.reduce((n, a) => n + imgTokens(a), 0); }
+
+/* Prompt text already in the conversation, plus what is typed now. Cheap and
+ * deliberately conservative — over-counting only makes the bar warn earlier. */
+function promptTextTokens() {
+  let chars = $("input").value.length;
+  for (const m of state.messages) {
+    if (typeof m.content === "string") chars += m.content.length;
+    else if (Array.isArray(m.content)) for (const p of m.content) if (p.type === "text") chars += (p.text || "").length;
+  }
+  return Math.round(chars / 4) + 8;
+}
+
+function usedTokens() { return attachTokens() + promptTextTokens(); }
+function overBudget() { return Math.max(0, usedTokens() - availTokens()); }
+
+/* The size ceiling currently selected, or 0 for "keep the original". Small images
+ * are never enlarged: blowing up a 90×80 icon to 1024² invents pixels the model
+ * cannot read and bills ~1k tokens for them. */
+function targetSide(bmp) {
+  const want = parseInt($("img-size").value, 10) || 0;
+  if (!want) return 0;
+  return Math.max(bmp.width, bmp.height) <= want ? 0 : want;
+}
+
+function loadBitmap(file) {
+  if (window.createImageBitmap) return createImageBitmap(file).catch(() => loadViaImg(file));
+  return loadViaImg(file);
+}
+
+function loadViaImg(file) {
+  return new Promise((res, rej) => {
+    const url = URL.createObjectURL(file);
+    const im = new Image();
+    im.onload = () => { URL.revokeObjectURL(url); res(im); };
+    im.onerror = () => { URL.revokeObjectURL(url); rej(new Error("cannot decode this image")); };
+    im.src = url;
+  });
+}
+
+/* Re-encode every kept original at the current size setting. Keeping the decoded
+ * bitmap is what lets a size change apply to images already attached — without it
+ * the setting would only affect the next file chosen. */
+async function reencodeAttachments() {
+  const out = [];
+  for (const src of state.attachSrc) {
+    const bmp = src.bmp;
+    const side = targetSide(bmp);
+    let w = bmp.width, h = bmp.height;
+    if (side > 0) {
+      const scale = side / Math.max(w, h);
+      w = Math.max(1, Math.round(w * scale));
+      h = Math.max(1, Math.round(h * scale));
+    }
+    const cv = document.createElement("canvas");
+    cv.width = w; cv.height = h;
+    const ctx = cv.getContext("2d");
+    ctx.fillStyle = "#fff";   // JPEG has no alpha: transparent pixels would go black
+    ctx.fillRect(0, 0, w, h);
+    ctx.drawImage(bmp, 0, 0, w, h);
+    let dataUrl = cv.toDataURL("image/jpeg", 0.9);
+    if (dataUrl.length > ATTACH_MAX_BYTES * 1.37) dataUrl = cv.toDataURL("image/jpeg", 0.7);
+    const bytes = Math.round((dataUrl.length - dataUrl.indexOf(",") - 1) * 0.75);
+    if (bytes > ATTACH_MAX_BYTES) {
+      throw new Error(src.name + " is still " + (bytes / 1048576).toFixed(1) + " MiB after resizing (limit 7 MiB)");
+    }
+    out.push({ dataUrl, w, h, name: src.name, bytes, tokens: Math.round((w * h) / 1000) });
+  }
+  state.attach = out;
+  renderAttachments();
+}
+
+async function addFiles(files) {
+  if (!modelIsVision()) {
+    setStatus("The selected model does not read images — pick a vision model first.");
+    return;
+  }
+  const list = Array.from(files).filter((f) => {
+    if (!f.type.startsWith("image/")) { setStatus("Skipped a non-image file: " + (f.name || "?")); return false; }
+    return true;
+  });
+  if (!list.length) return;
+  // Snapshot before mutating: a rejected addition must undo ONLY the new files and
+  // leave whatever was already staged in place. Truncating the arrays by count
+  // instead loses the earlier attachments too (they all get re-encoded together).
+  const prevSrc = state.attachSrc.slice();
+  const prevAtt = state.attach.slice();
+  try {
+    for (const f of list) state.attachSrc.push({ bmp: await loadBitmap(f), name: f.name || "pasted.png" });
+    await reencodeAttachments();
+  } catch (e) {
+    state.attachSrc = prevSrc;
+    state.attach = prevAtt;
+    renderAttachments();
+    setStatus(errMsg(e));
+    return;
+  }
+  const over = overBudget();
+  if (over > 0) {
+    // Refuse the addition outright rather than let Send produce a guaranteed 400.
+    state.attachSrc = prevSrc;
+    state.attach = prevAtt;
+    renderAttachments();
+    setStatus("That would exceed the model's input budget by ~" + over + " tokens. "
+      + "Remove an image, choose a smaller size, or start a new conversation.");
+    return;
+  }
+  setStatus(state.attach.length + " image" + (state.attach.length > 1 ? "s" : "") + " attached ("
+    + attachTokens() + " of " + availTokens() + " input tokens used).");
+}
+
+/* Switching models can invalidate staged images: a text-only model cannot accept
+ * them, and a different vision model may have a different window/budget. Clearing
+ * is the honest move — silently sending them would be a guaranteed 400. */
+function onModelChanged() {
+  const vision = modelIsVision();
+  $("btn-attach").hidden = !vision;
+  if (!vision && state.attach.length) {
+    state.attach = [];
+    state.attachSrc = [];
+    setStatus("The newly selected model does not read images, so the attached "
+      + "image(s) were removed.");
+  }
+  renderAttachments();
+}
+
+function renderAttachments() {
+  const strip = $("attach-strip");
+  const box = $("attach-thumbs");
+  const has = state.attach.length > 0;
+  strip.hidden = !has;
+  box.innerHTML = "";
+  state.attach.forEach((a, i) => {
+    const d = document.createElement("div");
+    d.className = "attach-thumb";
+    d.innerHTML = '<img src="' + a.dataUrl + '" alt="">'
+      + '<button class="attach-x" title="Remove">×</button>'
+      + '<div class="attach-tok">' + a.w + "×" + a.h + " · " + imgTokens(a) + " tok</div>";
+    d.querySelector(".attach-x").onclick = () => {
+      state.attach.splice(i, 1);
+      state.attachSrc.splice(i, 1);
+      renderAttachments();
+      setStatus(state.attach.length
+        ? state.attach.length + " image" + (state.attach.length > 1 ? "s" : "") + " attached ("
+          + attachTokens() + " of " + availTokens() + " input tokens used)."
+        : "Image removed.");
+    };
+    box.appendChild(d);
+  });
+  renderBudget();
+  updateImgSizeHint();
+  // A size change re-encodes in place, so re-state the totals; without this the
+  // status line keeps quoting the count from before the change.
+  if (has) $("attach-count").textContent = state.attach.length + " image"
+    + (state.attach.length > 1 ? "s" : "") + " · " + attachTokens() + " tok";
+}
+
+function renderBudget() {
+  const el = $("attach-budget");
+  if (!el) return;
+  const avail = availTokens(), used = usedTokens(), over = overBudget();
+  const pct = avail ? Math.min(100, (used / avail) * 100) : 0;
+  const cls = over > 0 ? "over" : (pct >= 80 ? "warn" : "");
+  el.innerHTML = '<span class="budget"><i class="' + cls + '" style="width:' + pct.toFixed(1) + '%"></i></span> '
+    + used + " / " + avail + " tok"
+    + (over > 0 ? ' — <b>over by ' + over + '</b>' : "");
+  // Send stays disabled while over budget: there is no request that would succeed.
+  $("btn-send").disabled = state.streaming || !state.apiKey || over > 0;
+}
+
+function updateImgSizeHint() {
+  const row = $("img-size-row"), hint = $("img-size-hint"), vh = $("vision-hint");
+  const on = modelIsVision();
+  row.hidden = !on;
+  hint.hidden = !on;
+  if (!on) {
+    // Point out how to get the feature instead of silently hiding it: a user who
+    // cannot find the attach button has no way to learn it depends on the model.
+    const hasVision = Object.keys(state.catalog || {}).some((id) => state.catalog[id].modality === "vision");
+    vh.hidden = !hasVision;
+    if (hasVision) {
+      vh.textContent = "Image input is available on the vision model — pick it above to attach images.";
+    }
+    return;
+  }
+  vh.hidden = true;
+  let w = 0, h = 0;
+  for (const s of state.attachSrc) {
+    if (s.bmp.width * s.bmp.height > w * h) { w = s.bmp.width; h = s.bmp.height; }
+  }
+  const long = Math.max(w, h);
+  const desc = (want) => {
+    if (!want || !long || long <= want) return long ? ("as-is " + w + "×" + h) : "as-is";
+    const scale = want / long;
+    const tw = Math.round(w * scale), th = Math.round(h * scale);
+    return tw + "×" + th + " ≈ " + Math.round((tw * th) / 1000) + " tok each";
+  };
+  const opts = $("img-size").options;
+  opts[0].textContent = "≤512 px" + (long ? " (" + desc(512) + ")" : "");
+  opts[1].textContent = "≤1024 px" + (long ? " (" + desc(1024) + ")" : "");
+  opts[2].textContent = "original" + (long ? " (" + desc(0) + ")" : "");
+  hint.textContent = "Images are sent as prompt tokens (~pixels/1000; 1024² ≈ 1030 tok). "
+    + "This model takes " + availTokens() + " input tokens per request.";
+}
+
 /* ---------------- chat ---------------- */
 
 async function send() {
   const text = $("input").value.trim();
-  if (!text || !state.apiKey || state.streaming) return;
+  const imgs = state.attach.map((a) => a.dataUrl);
+  if ((!text && !imgs.length) || !state.apiKey || state.streaming) return;
   const model = $("model-select").value;
   if (!model) {
     setStatus("No model is available right now — pick one once a model comes online.");
     return;
   }
+  if (overBudget()) {
+    // Nothing that follows can succeed: the prompt would not fit.
+    setStatus("This request is ~" + overBudget() + " tokens over the model's input budget. "
+      + "Remove an image, pick a smaller size, or start a new conversation.");
+    return;
+  }
   $("input").value = "";
-  state.messages.push({ role: "user", content: text });
+  state.messages.push({ role: "user", content: text, images: imgs });
+  state.attach = [];
+  state.attachSrc = [];
+  renderAttachments();
   const assistant = { role: "assistant", content: "", meta: {} };
   state.messages.push(assistant);
   persist();
@@ -991,7 +1402,7 @@ async function send() {
           model,
           stream: true,
           enable_thinking: state.thinking,
-          messages: state.messages.slice(0, -1).map(({ role, content }) => ({ role, content })),
+          messages: buildRequestMessages().slice(0, -1),   // drop the empty streaming placeholder
         }),
       });
       if ((res.status !== 503 && res.status !== 502) || attempt >= 12) break;
@@ -1087,6 +1498,29 @@ function renderMessages(streaming) {
     const div = document.createElement("div");
     div.className = "msg " + m.role + (m.meta && m.meta.error ? " error" : "");
     div.innerHTML = mdLite(m.content || (streaming ? "▌" : ""));
+    if (m.images && m.images.length) {
+      // Show what was actually sent. Only the newest turn's pixels go back to the
+      // model, but every turn keeps its thumbnails so the transcript reads correctly.
+      const strip = document.createElement("div");
+      strip.className = "msg-imgs";
+      for (const url of m.images) {
+        const im = document.createElement("img");
+        im.src = url; im.alt = "attached image";
+        strip.appendChild(im);
+      }
+      div.prepend(strip);
+    } else if (m.imageCount) {
+      // Restored transcript: the bytes were never stored (see persist), so say so
+      // rather than showing a bubble that reads as if it were plain text.
+      const strip = document.createElement("div");
+      strip.className = "msg-imgs";
+      const note = document.createElement("span");
+      note.className = "hint";
+      note.textContent = "[" + m.imageCount + " image" + (m.imageCount > 1 ? "s" : "")
+        + " sent in this message — not kept in browser history]";
+      strip.appendChild(note);
+      div.prepend(strip);
+    }
     if (m.reasoning) {
       const th = document.createElement("details");
       th.className = "think";
@@ -1180,7 +1614,23 @@ function errMsg(e) { return (e && (e.message || e.toString())) || "unknown error
 function errBody(b) { return (b && b.error && (b.error.message || JSON.stringify(b.error))) || JSON.stringify(b); }
 function setStatus(s) { $("statusline").textContent = s; }
 function persist() {
-  localStorage.setItem(LS.msgs, JSON.stringify(state.messages.slice(-80)));
+  // Stored WITHOUT the image bytes. The base64 of even one screenshot is larger
+  // than the whole transcript budget (localStorage is ~5 MB per origin), so keeping
+  // the DataURLs here would silently wipe the conversation the moment an image was
+  // attached. A count is stored instead, so the restored transcript can say "an
+  // image was sent here" without pretending to have it.
+  const slim = state.messages.slice(-80).map((m) => {
+    if (!m.images || !m.images.length) return m;
+    const { images, ...rest } = m;
+    return { ...rest, imageCount: images.length };
+  });
+  try {
+    localStorage.setItem(LS.msgs, JSON.stringify(slim));
+  } catch (e) {
+    // Quota can still be hit by very long text transcripts; dropping the oldest
+    // half is better than losing the whole conversation to an exception.
+    try { localStorage.setItem(LS.msgs, JSON.stringify(slim.slice(-40))); } catch { /* give up */ }
+  }
   localStorage.setItem(LS.session, state.sessionId);
 }
 

@@ -115,3 +115,31 @@ func TestSelectWithAffinity(t *testing.T) {
 		t.Fatal(err)
 	}
 }
+
+// Multimodal content arrays: the session fingerprint is built from the TEXT parts
+// only. The same conversation with a re-encoded image (different bytes, same
+// text) must land on the same key, and a multi-megabyte image must not be hashed.
+func TestSessionKeyOf_MultimodalContent(t *testing.T) {
+	mm := func(img string) []byte {
+		return []byte(`{"messages":[{"role":"user","content":[` +
+			`{"type":"text","text":"describe this"},` +
+			`{"type":"image_url","image_url":{"url":"` + img + `"}}]}]}`)
+	}
+	k1 := sessionKeyOf("api", "", mm("data:image/png;base64,AAAA"))
+	if k1 == "" {
+		t.Fatal("multimodal body must yield a message-derived key")
+	}
+	if k2 := sessionKeyOf("api", "", mm("data:image/png;base64,BBBB")); k2 != k1 {
+		t.Fatalf("image bytes must not affect the key: %q vs %q", k1, k2)
+	}
+	// Same text as a plain string → same fingerprint (text is the identity).
+	plain := []byte(`{"messages":[{"role":"user","content":"describe this"}]}`)
+	if k3 := sessionKeyOf("api", "", plain); k3 != k1 {
+		t.Fatalf("string vs text-part content should fingerprint identically: %q vs %q", k1, k3)
+	}
+	// Image-only content has no text → no message-derived key (falls back to balanced routing).
+	imgOnly := []byte(`{"messages":[{"role":"user","content":[{"type":"image_url","image_url":{"url":"x"}}]}]}`)
+	if k := sessionKeyOf("api", "", imgOnly); k != "" {
+		t.Fatalf("image-only content should not produce a key, got %q", k)
+	}
+}
