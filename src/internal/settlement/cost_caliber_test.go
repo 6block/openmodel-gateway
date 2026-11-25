@@ -40,7 +40,7 @@ func TestCostCaliber_SharedFormulaMatchesAggregator(t *testing.T) {
 	}
 	for i, rec := range cases {
 		want := agg.RecordCostUSD(rec)
-		got := CostBreakdownUSD(rec.Model, rec.PromptTokens, rec.CompletionTokens, rec.CachedTokens, rec.TotalTokens, out, inp, cr)
+		got := CostBreakdownUSD(rec.Model, rec.PromptTokens, rec.CompletionTokens, rec.CachedTokens, rec.TotalTokens, out, inp, cr, nil, 0)
 		if want.Cmp(got) != 0 {
 			t.Errorf("case %d: aggregator=%s shared=%s — formulas diverged", i, want.Text('f', 6), got.Text('f', 6))
 		}
@@ -48,7 +48,7 @@ func TestCostCaliber_SharedFormulaMatchesAggregator(t *testing.T) {
 
 	// Split sanity: 80 prompt (30 cached) + 20 completion
 	// = 50×0.5 + 30×0.25 + 20×1 = 25 + 7.5 + 20 = 52.5, NOT flat 100×1 = 100.
-	got := CostBreakdownUSD("default", 80, 20, 30, 100, out, inp, cr)
+	got := CostBreakdownUSD("default", 80, 20, 30, 100, out, inp, cr, nil, 0)
 	if got.Cmp(big.NewFloat(52.5)) != 0 {
 		t.Errorf("split cost: want 52.5, got %s", got.Text('f', 6))
 	}

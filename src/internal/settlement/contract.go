@@ -35,6 +35,15 @@ const (
 	gasReplacePercent = 13
 )
 
+// Contract ABI generations this client can speak, as agreed with the deployed contract's
+// SCHEMA_VERSION(). Named so the number is not spelled out at each comparison (a typo in
+// one branch would be a silent schema mismatch).
+const (
+	schemaV2 = 2 // v1.2 and earlier: 5-arg submitSettlement, no stats fields
+	schemaV3 = 3 // v1.3: per-item request/token stats, one token-shaped volume column
+	schemaV4 = 4 // v1.4: per-item per-unit volume, so tokens and images each get a column
+)
+
 // bumpGasPrice returns p increased by percent (integer percent), rounded down.
 func bumpGasPrice(p *big.Int, percent int64) *big.Int {
 	if p == nil || p.Sign() <= 0 {
@@ -76,6 +85,15 @@ var contractABIJSON string
 //
 //go:embed abi_v3.json
 var contractABIV3JSON string
+
+// abi_v4.json is the v1.4 contract ABI (schema 4): the v1.3 stats column is replaced
+// by a per-item (units, quantities) pair and the record/cumulative volume is tallied
+// per unit (UNIT_TOKEN / UNIT_IMAGE / UNIT_AUDIO_SECOND), so a network that serves
+// tokens and images reports each in its own counter instead of one token-shaped
+// number. The money, balance, freeze and refund paths are untouched.
+//
+//go:embed abi_v4.json
+var contractABIV4JSON string
 
 // buildEndpoints returns the failover-ordered, de-duplicated RPC endpoint list:
 // rpc_url first (backward compat, always tried first), then rpc_urls in order.
@@ -142,8 +160,10 @@ type ContractClient struct {
 	contractAddr common.Address
 	abi          abi.ABI
 	// schema is the contract ABI generation this client speaks: 2 = v1.2 and
-	// earlier (5-arg submitSettlement), 3 = v1.3 (7-arg with batch stats). It picks
-	// which embedded ABI `abi` was parsed from and gates the stats fields end to end.
+	// earlier (5-arg submitSettlement), 3 = v1.3 (7-arg with request/token stats),
+	// 4 = v1.4 (8-arg with per-item (unit, quantity) and per-unit volume counters).
+	// It picks which embedded ABI `abi` was parsed from and gates the stats fields
+	// end to end.
 	schema       int
 	operatorKey  *ecdsa.PrivateKey
 	operatorAddr common.Address
@@ -172,12 +192,15 @@ func NewContractClient(cfg *Config, logger *slog.Logger) (*ContractClient, error
 	if schema == 0 {
 		schema = 2 // default: the v1.2 ABI every existing deployment (incl. mainnet) runs
 	}
-	if schema != 2 && schema != 3 {
-		return nil, fmt.Errorf("settlement.contract_schema must be 2 or 3, got %d", schema)
+	if schema != schemaV2 && schema != schemaV3 && schema != schemaV4 {
+		return nil, fmt.Errorf("settlement.contract_schema must be %d, %d or %d, got %d", schemaV2, schemaV3, schemaV4, schema)
 	}
 	abiSrc := contractABIJSON
-	if schema == 3 {
+	switch schema {
+	case schemaV3:
 		abiSrc = contractABIV3JSON
+	case schemaV4:
+		abiSrc = contractABIV4JSON
 	}
 	parsed, err := abi.JSON(strings.NewReader(abiSrc))
 	if err != nil {
@@ -211,20 +234,22 @@ func NewContractClient(cfg *Config, logger *slog.Logger) (*ContractClient, error
 		chainID:      big.NewInt(cfg.ChainID),
 		logger:       logger,
 	}
-	if schema == 3 {
-		// Schema 3 against a v1.2 contract would fail at settle time with an opaque
-		// revert (7-arg selector unknown there). Verify SCHEMA_VERSION() up front so a
-		// schema/address mismatch is a loud startup error naming the fix. Retried a
-		// few times so one flaky RPC response cannot block an otherwise-valid start.
-		if err := c.verifySchemaV3(); err != nil {
+	if schema >= schemaV3 {
+		// Schema 3 (or 4) against an older contract would fail at settle time with an
+		// opaque revert (the newer selector is unknown there). Verify SCHEMA_VERSION()
+		// up front so a schema/address mismatch is a loud startup error naming the fix.
+		// Retried a few times so one flaky RPC response cannot block an otherwise-valid
+		// start.
+		if err := c.verifySchema(); err != nil {
 			return nil, err
 		}
 	}
 	return c, nil
 }
 
-// verifySchemaV3 confirms the configured contract really speaks schema 3.
-func (c *ContractClient) verifySchemaV3() error {
+// verifySchema confirms the configured contract really speaks the schema the client
+// was configured for, so a mismatch dies at startup instead of at first settlement.
+func (c *ContractClient) verifySchema() error {
 	var lastErr error
 	for attempt := 0; attempt < 3; attempt++ {
 		if attempt > 0 {
@@ -247,12 +272,12 @@ func (c *ContractClient) verifySchemaV3() error {
 			lastErr = err
 			continue
 		}
-		if out.Int64() != 3 {
-			return fmt.Errorf("contract %s reports SCHEMA_VERSION=%d, config says contract_schema: 3 — wrong contract address or wrong schema", c.contractAddr.Hex(), out.Int64())
+		if out.Int64() != int64(c.schema) {
+			return fmt.Errorf("contract %s reports SCHEMA_VERSION=%d, config says contract_schema: %d — wrong contract address or wrong schema", c.contractAddr.Hex(), out.Int64(), c.schema)
 		}
 		return nil
 	}
-	return fmt.Errorf("contract %s does not answer SCHEMA_VERSION() (last error: %w) — if this is a v1.2 or older contract, set settlement.contract_schema: 2 (or remove the field); if it is v1.3, check the RPC endpoints", c.contractAddr.Hex(), lastErr)
+	return fmt.Errorf("contract %s does not answer SCHEMA_VERSION() (last error: %w) — if this is a v1.2 or older contract, set settlement.contract_schema: 2 (or remove the field); if it is v1.3 or v1.4, check the RPC endpoints", c.contractAddr.Hex(), lastErr)
 }
 
 // --- View Functions ---
@@ -366,32 +391,81 @@ func (c *ContractClient) SettlementNonce(ctx context.Context) (uint64, error) {
 // These are the public volume metrics: one call each, no log indexing. Against a
 // schema-2 contract the getters do not exist and the call reverts — callers must
 // treat the error as "not available on this deployment", never as zero.
+//
+// On schema 4 the volume is read per unit and summed into the token-shaped `tokens`
+// return so the existing single-number callers keep working; `volume` carries the
+// per-unit breakdown for callers that want it (nil on schema 3, which has only the
+// one token-shaped column). Summing is honest here because the caller's question —
+// "how much volume has this contract settled" — is unit-agnostic; a caller that
+// needs tokens alone reads volume[UNIT_TOKEN].
 func (c *ContractClient) CumulativeStats(ctx context.Context) (requests, tokens uint64, err error) {
-	read := func(name string) (uint64, error) {
-		data, err := c.abi.Pack(name)
-		if err != nil {
-			return 0, fmt.Errorf("pack %s: %w", name, err)
-		}
-		result, err := c.callContract(ctx, data)
-		if err != nil {
-			return 0, err
-		}
-		out := new(big.Int)
-		if err := c.unpackInto(&out, name, result); err != nil {
-			return 0, err
-		}
-		return out.Uint64(), nil
-	}
-	if c.schema < 3 {
-		return 0, 0, fmt.Errorf("cumulative counters need contract schema 3 (this client speaks %d)", c.schema)
-	}
-	if requests, err = read("cumulativeRequests"); err != nil {
+	requests, err = c.readUint64(ctx, "cumulativeRequests")
+	if err != nil {
 		return 0, 0, err
 	}
-	if tokens, err = read("cumulativeTokens"); err != nil {
-		return 0, 0, err
+	if c.schema < schemaV3 {
+		return 0, 0, fmt.Errorf("cumulative counters need contract schema %d (this client speaks %d)", schemaV3, c.schema)
+	}
+	if c.schema < schemaV4 {
+		// Schema 3 has one token-shaped volume column.
+		if tokens, err = c.readUint64(ctx, "cumulativeTokens"); err != nil {
+			return 0, 0, err
+		}
+		return requests, tokens, nil
+	}
+	// Schema 4: sum the per-unit counters. Summing is honest for THIS question —
+	// "how much volume in total" — because the caller is not distinguishing units;
+	// a caller that needs tokens alone reads volume[UNIT_TOKEN].
+	for u := 0; u < UnitCount; u++ {
+		v, verr := c.readUint64At(ctx, "cumulativeVolume", new(big.Int).SetUint64(uint64(u)))
+		if verr != nil {
+			return 0, 0, verr
+		}
+		tokens += v
 	}
 	return requests, tokens, nil
+}
+
+// CumulativeVolumeByUnit reads the per-unit cumulative volume (schema 4+). The slice
+// is indexed by the contract's UNIT_* constants. On an older schema there is no
+// per-unit counter and the caller gets a reasoned error rather than a zero slice,
+// which would be indistinguishable from "anything settled yet".
+func (c *ContractClient) CumulativeVolumeByUnit(ctx context.Context) ([]uint64, error) {
+	if c.schema < schemaV4 {
+		return nil, fmt.Errorf("per-unit volume needs contract schema %d (this client speaks %d)", schemaV4, c.schema)
+	}
+	volume := make([]uint64, UnitCount)
+	for u := 0; u < UnitCount; u++ {
+		v, err := c.readUint64At(ctx, "cumulativeVolume", new(big.Int).SetUint64(uint64(u)))
+		if err != nil {
+			return nil, err
+		}
+		volume[u] = v
+	}
+	return volume, nil
+}
+
+// readUint64 calls a no-argument uint256 view and returns it as uint64.
+func (c *ContractClient) readUint64(ctx context.Context, name string) (uint64, error) {
+	return c.readUint64At(ctx, name)
+}
+
+// readUint64At calls a uint256 view with the given arguments (e.g. a public array
+// getter's index) and returns the result as uint64.
+func (c *ContractClient) readUint64At(ctx context.Context, name string, args ...interface{}) (uint64, error) {
+	data, err := c.abi.Pack(name, args...)
+	if err != nil {
+		return 0, fmt.Errorf("pack %s: %w", name, err)
+	}
+	result, err := c.callContract(ctx, data)
+	if err != nil {
+		return 0, err
+	}
+	out := new(big.Int)
+	if err := c.unpackInto(&out, name, result); err != nil {
+		return 0, err
+	}
+	return out.Uint64(), nil
 }
 
 // PlatformFeeBps reads the on-chain platform fee in basis points. Used by the SP
@@ -414,8 +488,9 @@ func (c *ContractClient) PlatformFeeBps(ctx context.Context) (int64, error) {
 }
 
 // OnChainSettlement mirrors the contract's SettlementRecord struct, returned by
-// getSettlement(batchId). Field names map to the ABI tuple components. The two
-// stats fields exist on schema-3 contracts only; against schema 2 they stay nil.
+// getSettlement(batchId). Field names map to the ABI tuple components. The stats
+// fields follow the schema: absent on 2, a single token-shaped TokenCount on 3, and a
+// per-unit VolumeByUnit on 4 (with TokenCount then nil).
 type OnChainSettlement struct {
 	BatchId      *big.Int
 	Timestamp    *big.Int
@@ -424,7 +499,11 @@ type OnChainSettlement struct {
 	FailedCount  *big.Int
 	DetailsHash  [32]byte
 	RequestCount *big.Int
-	TokenCount   *big.Int
+	// TokenCount is the schema-3 token-shaped volume. Schema 4 replaced it with
+	// VolumeByUnit; on a schema-4 read it stays nil and VolumeByUnit carries the data.
+	TokenCount *big.Int
+	// VolumeByUnit is the schema-4 per-unit volume, indexed by the UNIT_* constants.
+	VolumeByUnit [UnitCount]*big.Int
 }
 
 // onChainSettlementV2 is the schema-2 tuple shape (no stats fields); ConvertType
@@ -436,6 +515,31 @@ type onChainSettlementV2 struct {
 	SettledCount *big.Int
 	FailedCount  *big.Int
 	DetailsHash  [32]byte
+}
+
+// onChainSettlementV3 is the schema-3 tuple shape: v2 plus the two stats fields.
+type onChainSettlementV3 struct {
+	BatchId      *big.Int
+	Timestamp    *big.Int
+	TotalAmount  *big.Int
+	SettledCount *big.Int
+	FailedCount  *big.Int
+	DetailsHash  [32]byte
+	RequestCount *big.Int
+	TokenCount   *big.Int
+}
+
+// onChainSettlementV4 is the schema-4 tuple shape: the schema-3 stats column replaced
+// by the per-unit volume array.
+type onChainSettlementV4 struct {
+	BatchId      *big.Int
+	Timestamp    *big.Int
+	TotalAmount  *big.Int
+	SettledCount *big.Int
+	FailedCount  *big.Int
+	DetailsHash  [32]byte
+	RequestCount *big.Int
+	VolumeByUnit [UnitCount]*big.Int
 }
 
 func zeroBigInts(n int) []*big.Int {
@@ -463,7 +567,8 @@ func (c *ContractClient) GetSettlement(ctx context.Context, batchID uint64) (OnC
 // unpackSettlement decodes a getSettlement return (a single tuple) into
 // OnChainSettlement using the standard abigen pattern (Unpack + ConvertType), which
 // — unlike UnpackIntoInterface — correctly handles a sole tuple output. The tuple
-// shape follows the schema: 6 fields on schema 2, 8 on schema 3.
+// shape follows the schema: 6 fields on schema 2, 8 on schema 3, 8 on schema 4 (the
+// last one a uint256[UNIT_COUNT] rather than a scalar, hence the distinct shape structs).
 func unpackSettlement(parsed abi.ABI, schema int, result []byte) (OnChainSettlement, error) {
 	var out OnChainSettlement
 	unpacked, err := parsed.Unpack("getSettlement", result)
@@ -473,18 +578,41 @@ func unpackSettlement(parsed abi.ABI, schema int, result []byte) (OnChainSettlem
 	if len(unpacked) == 0 {
 		return out, fmt.Errorf("empty getSettlement result")
 	}
-	if schema >= 3 {
-		out = *abi.ConvertType(unpacked[0], new(OnChainSettlement)).(*OnChainSettlement)
-		return out, nil
-	}
-	v2 := *abi.ConvertType(unpacked[0], new(onChainSettlementV2)).(*onChainSettlementV2)
-	out = OnChainSettlement{
-		BatchId:      v2.BatchId,
-		Timestamp:    v2.Timestamp,
-		TotalAmount:  v2.TotalAmount,
-		SettledCount: v2.SettledCount,
-		FailedCount:  v2.FailedCount,
-		DetailsHash:  v2.DetailsHash,
+	switch {
+	case schema >= schemaV4:
+		v4 := *abi.ConvertType(unpacked[0], new(onChainSettlementV4)).(*onChainSettlementV4)
+		out = OnChainSettlement{
+			BatchId:      v4.BatchId,
+			Timestamp:    v4.Timestamp,
+			TotalAmount:  v4.TotalAmount,
+			SettledCount: v4.SettledCount,
+			FailedCount:  v4.FailedCount,
+			DetailsHash:  v4.DetailsHash,
+			RequestCount: v4.RequestCount,
+			VolumeByUnit: v4.VolumeByUnit,
+		}
+	case schema == schemaV3:
+		v3 := *abi.ConvertType(unpacked[0], new(onChainSettlementV3)).(*onChainSettlementV3)
+		out = OnChainSettlement{
+			BatchId:      v3.BatchId,
+			Timestamp:    v3.Timestamp,
+			TotalAmount:  v3.TotalAmount,
+			SettledCount: v3.SettledCount,
+			FailedCount:  v3.FailedCount,
+			DetailsHash:  v3.DetailsHash,
+			RequestCount: v3.RequestCount,
+			TokenCount:   v3.TokenCount,
+		}
+	default:
+		v2 := *abi.ConvertType(unpacked[0], new(onChainSettlementV2)).(*onChainSettlementV2)
+		out = OnChainSettlement{
+			BatchId:      v2.BatchId,
+			Timestamp:    v2.Timestamp,
+			TotalAmount:  v2.TotalAmount,
+			SettledCount: v2.SettledCount,
+			FailedCount:  v2.FailedCount,
+			DetailsHash:  v2.DetailsHash,
+		}
 	}
 	return out, nil
 }
@@ -496,12 +624,49 @@ type SettlementBatch struct {
 	SPs     []common.Address
 	Amounts []*big.Int
 	Tokens  []common.Address
-	// Per-item inference stats (schema 3): request count and prompt+completion token
-	// sum of the requests aggregated into each item. Ignored when the client speaks
-	// schema 2 — the arrays never reach the wire there.
+	// Per-item inference stats. RequestCounts is the number of requests aggregated into
+	// the item. ItemVolume[i] is that item's volume broken out by unit, indexed by the
+	// UNIT_* constants, so a batch can carry tokens and images at once and the contract
+	// tallies each in its own counter.
+	//
+	// A batch is grouped by (user, SP), and a user can serve a text and an image request
+	// against the same SP in one window — hence a VECTOR per item rather than one unit
+	// tag. A single tag could not express the mixed item, and a batch-level total could
+	// not be trimmed when one item is skipped for insufficient balance (it would let a
+	// re-submitted debt count twice).
+	//
+	// Schema 3 takes a single token-shaped column instead (TokenCounts, the deprecated
+	// field below); schema 2 takes neither. The arrays never reach the wire on a schema
+	// that does not declare them.
 	RequestCounts []*big.Int
-	TokenCounts   []*big.Int
-	DetailsHash   [32]byte
+	ItemVolume    [][UnitCount]*big.Int
+	// TokenCounts is the schema-3 token-shaped volume column, retained so a caller built
+	// against schema 3 keeps compiling. On schema 4 it is IGNORED — ItemVolume carries
+	// the volume — because writing a schema-3-shaped column into a schema-4 call would
+	// file every quantity under tokens and corrupt the per-unit counters.
+	TokenCounts []*big.Int
+	DetailsHash [32]byte
+}
+
+// itemVolumeArg renders a batch's per-item volume for the ABI, zero-filling a missing or
+// short slice so an older WAL (written before the volume columns existed) still submits:
+// the money math is untouched and the stats honestly report 0.
+func itemVolumeArg(batch SettlementBatch) [][UnitCount]*big.Int {
+	out := make([][UnitCount]*big.Int, len(batch.Users))
+	for i := range out {
+		for u := 0; u < UnitCount; u++ {
+			out[i][u] = big.NewInt(0)
+		}
+		if i >= len(batch.ItemVolume) {
+			continue
+		}
+		for u := 0; u < UnitCount; u++ {
+			if v := batch.ItemVolume[i][u]; v != nil {
+				out[i][u] = v
+			}
+		}
+	}
+	return out
 }
 
 func (c *ContractClient) SubmitSettlement(ctx context.Context, batch SettlementBatch) (*types.Transaction, error) {
@@ -511,17 +676,22 @@ func (c *ContractClient) SubmitSettlement(ctx context.Context, batch SettlementB
 	}
 
 	args := []interface{}{batch.Users, batch.SPs, batch.Amounts, batch.Tokens, batch.DetailsHash}
-	if c.schema >= 3 {
-		reqCounts, tokCounts := batch.RequestCounts, batch.TokenCounts
+	if c.schema >= schemaV3 {
+		reqCounts := batch.RequestCounts
 		// A WAL written by an older build has no stats arrays; zero-fill rather than
 		// refuse — the money math is untouched and the stats honestly report 0.
 		if len(reqCounts) != len(batch.Users) {
 			reqCounts = zeroBigInts(len(batch.Users))
 		}
-		if len(tokCounts) != len(batch.Users) {
-			tokCounts = zeroBigInts(len(batch.Users))
+		if c.schema >= schemaV4 {
+			args = []interface{}{batch.Users, batch.SPs, batch.Amounts, batch.Tokens, reqCounts, itemVolumeArg(batch), batch.DetailsHash}
+		} else {
+			tokCounts := batch.TokenCounts
+			if len(tokCounts) != len(batch.Users) {
+				tokCounts = zeroBigInts(len(batch.Users))
+			}
+			args = []interface{}{batch.Users, batch.SPs, batch.Amounts, batch.Tokens, reqCounts, tokCounts, batch.DetailsHash}
 		}
-		args = []interface{}{batch.Users, batch.SPs, batch.Amounts, batch.Tokens, reqCounts, tokCounts, batch.DetailsHash}
 	}
 
 	cli := c.curClient()

@@ -49,6 +49,40 @@ func TestMerkle_LeafCanonicalStability(t *testing.T) {
 	}
 }
 
+// The asset leaf is the second published shape. Pin it byte-for-byte as well: it is
+// what an external verifier rebuilds for a non-token record, so drift here silently
+// invalidates every image/audio proof.
+func TestMerkle_AssetLeafCanonicalStability(t *testing.T) {
+	leaf := AssetLeaf("req-img-1", "0xW", "0xSP", "flux-schnell",
+		PriceUnitImage, 1, "abc123", "sighex")
+	want := sha256.Sum256([]byte(`{"asset_hash":"abc123","model":"flux-schnell","price_unit":"image","quantity":1,"request_id":"req-img-1","sig":"sighex","sp":"0xSP","wallet":"0xW"}`))
+	if leaf != want {
+		t.Fatal("AssetLeaf canonical format drifted — this breaks every external verifier of a non-token record")
+	}
+}
+
+// The two shapes must never collide: the same identity values under a different unit
+// have to produce different commitments, or a token record could be passed off as an
+// asset record (or the reverse) without the hash noticing.
+func TestMerkle_TokenAndAssetLeavesAreDistinct(t *testing.T) {
+	tok := ReceiptLeaf("r1", "0xW", "0xSP", "m", 0, 0, 0, "")
+	asset := AssetLeaf("r1", "0xW", "0xSP", "m", PriceUnitImage, 0, "", "")
+	if tok == asset {
+		t.Fatal("a token leaf and an asset leaf must never be equal — the unit is part of the commitment")
+	}
+}
+
+// An empty unit must commit as "token": a caller that passes the zero value is asking
+// for the token shape, and the committed bytes must say so explicitly rather than
+// leaving the field blank.
+func TestMerkle_AssetLeafNormalisesEmptyUnit(t *testing.T) {
+	viaEmpty := AssetLeaf("r1", "0xW", "0xSP", "m", "", 2, "h", "s")
+	viaToken := AssetLeaf("r1", "0xW", "0xSP", "m", PriceUnitToken, 2, "h", "s")
+	if viaEmpty != viaToken {
+		t.Fatal("an unset unit must commit identically to the explicit token unit")
+	}
+}
+
 // Full cycle with records → merkle ledger persisted → BuildReceiptProof returns a
 // proof that verifies end-to-end, including sha256(legacy‖root)==details_hash and
 // details_hash == what was submitted on-chain (mock).

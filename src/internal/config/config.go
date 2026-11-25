@@ -152,6 +152,18 @@ type GatewayConfig struct {
 	RateBurstPerKey     int     `yaml:"rate_burst_per_key"`     // Token-bucket burst size; 0 = ceil(rate) or 1
 	MaxConcurrentPerKey int     `yaml:"max_concurrent_per_key"` // Max in-flight requests per API key; 0 = unlimited
 	MaxRequestBytes     int64   `yaml:"max_request_bytes"`      // Max request body size in bytes; 0 = default 10 MiB
+	// MaxAudioUploadBytes caps one transcription upload (multipart body); 0 = 25 MiB,
+	// the same ceiling OpenAI's audio API uses. Separate from MaxRequestBytes because
+	// audio is legitimately far larger than any JSON request.
+	MaxAudioUploadBytes int64 `yaml:"max_audio_upload_bytes"`
+	// MaxResponseBytes caps a worker reply the gateway buffers (images, synthesized
+	// audio); 0 = 64 MiB. Exceeding it is an error, never a silent truncation.
+	MaxResponseBytes int64 `yaml:"max_response_bytes"`
+
+	// PublicBaseURL is the external scheme://host clients reach this port at, used for
+	// the links of response_format "url" image generations. Empty = derived from each
+	// request's Host header (and X-Forwarded-Proto from a trusted proxy).
+	PublicBaseURL string `yaml:"public_base_url"`
 
 	// WebUI serves the embedded chat + wallet-registration single-page app on the
 	// gateway port (same origin as the API, so no CORS surface). Off by default.

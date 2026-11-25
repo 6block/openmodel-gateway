@@ -14,6 +14,10 @@ known to actually work.
 | `settlement-debt.json` | debt ledger lost → overdrawn usage can never be recovered (and debt-suspension state is lost) |
 | `pending-settlement.json` | settlement WAL; if the crash happened mid-settlement → the replay basis is gone |
 | `settlement-deadletter.jsonl` | unparsed billable records lost → SPs miss their share |
+| `settlement-items.jsonl` | per-item settlement ledger → per-SP earnings detail and settlement audit lose their history |
+| `merkle-batches.jsonl`, `receipt-records.jsonl`, `receipt-index.jsonl` | billing proofs → `receipt-proof` can no longer prove already-settled requests |
+| `reconcile-cursor.json`, `reconcile-state.json` | reconciliation position → the reconciler rescans and its totals restart |
+| `registrations.json` | self-registered API keys (stored hashed) → every self-registered user's key stops working |
 | `workers.json` | worker registry → workers must re-register after a restart before routing resumes |
 | `requests.jsonl[.N]` | **the billing source of truth**; losing it = billing data for that window is gone for good |
 
@@ -23,8 +27,9 @@ known to actually work.
 and prunes old backups by retention days.
 
 ```bash
-# manual
-DATA_DIR=/data ./deploy/backup/backup-state.sh /backups
+# manual — as root (or the owner of DATA_DIR): registrations.json is mode 0600,
+# and the script stops with an error rather than skip a file it cannot read
+sudo DATA_DIR=/data ./deploy/backup/backup-state.sh /backups
 
 # scheduled (every 15 min — keep it SHORTER than the settlement interval,
 # so a restore can never lose a full settlement cycle)

@@ -1,6 +1,7 @@
 package gateway
 
 import (
+	"encoding/json"
 	"errors"
 	"math/rand"
 	"path/filepath"
@@ -44,6 +45,81 @@ func workerVerifiedFor(w *worker.Worker, model string) bool {
 	return false
 }
 
+// requestNeeds is what one request demands of a worker's per-model limits.
+type requestNeeds struct {
+	images int // image parts in the messages (exact)
+	tokens int // estimated prompt tokens + requested output tokens
+}
+
+// needsOf reads a chat/completions body. Zero value for anything else.
+func needsOf(body []byte) requestNeeds {
+	var p struct {
+		Messages []struct {
+			Content interface{} `json:"content"`
+		} `json:"messages"`
+		MaxTokens int `json:"max_tokens"`
+	}
+	if json.Unmarshal(body, &p) != nil {
+		return requestNeeds{}
+	}
+	n := requestNeeds{tokens: estimatePromptTokens(body) + p.MaxTokens}
+	for _, m := range p.Messages {
+		_, i := messageContentChars(m.Content)
+		n.images += i
+	}
+	return n
+}
+
+// fits reports whether w's reported limits for model can take the request. Images
+// are counted exactly; the token estimate is rough (~4 chars/token), so a worker is
+// ruled out only when the estimate exceeds its context by a clear margin.
+func fits(w *worker.Worker, model string, n requestNeeds) bool {
+	if len(w.ModelLimits) == 0 {
+		return true
+	}
+	m, ok := loadedMatch(w, model)
+	if !ok {
+		return true
+	}
+	lim, ok := w.ModelLimits[m]
+	if !ok {
+		return true
+	}
+	if lim.MaxImages > 0 && n.images > lim.MaxImages {
+		return false
+	}
+	if lim.ContextLimit > 0 && n.tokens > lim.ContextLimit*5/4 {
+		return false
+	}
+	return true
+}
+
+// selectWorkerFor is selectWorkerForModel restricted to workers whose limits fit the
+// request — when at least one such worker is servable. Otherwise it routes exactly as
+// before and the chosen worker answers with its own precise 400 (never a worse
+// outcome than ignoring the limits).
+func selectWorkerFor(registry *worker.Registry, model string, n requestNeeds, exclude map[string]bool, overloadFactor ...float64) (*worker.Worker, error) {
+	if n.images > 0 || n.tokens > 0 {
+		ex := map[string]bool{}
+		for k, v := range exclude {
+			ex[k] = v
+		}
+		ruledOut := false
+		for _, w := range registry.List() {
+			if !fits(&w, model, n) {
+				ex[w.ID] = true
+				ruledOut = true
+			}
+		}
+		if ruledOut {
+			if w, err := selectWorkerForModel(registry, model, ex, overloadFactor...); err == nil {
+				return w, nil
+			}
+		}
+	}
+	return selectWorkerForModel(registry, model, exclude, overloadFactor...)
+}
+
 func selectWorkerForModel(registry *worker.Registry, model string, exclude map[string]bool, overloadFactor ...float64) (*worker.Worker, error) {
 	workers := registry.List()
 
@@ -85,16 +161,26 @@ func selectWorkerForModel(registry *worker.Registry, model string, exclude map[s
 		if exclude != nil && exclude[w.ID] {
 			continue
 		}
+		// The model's own pool is still reloading: not servable here yet, even
+		// though other pools on the same worker are.
+		if !isDefault && !poolReadyFor(&w, model) {
+			continue
+		}
+		// One pool of this multi-pool worker is switching models: requests for that
+		// pool's models wait; the worker's other models are routed as usual.
+		if !isDefault && switchingCovers(&w, model) {
+			continue
+		}
 
-		wt := computeWeight(&w)
+		wt := computeWeightFor(&w, model)
 
 		if isDefault {
 			fallback = append(fallback, candidate{worker: w, weight: wt})
 			continue
 		}
 
-		// Check if this worker already has the model loaded
-		if modelMatches(w.LoadedModel, model) {
+		// Check if this worker already has the model loaded (any of its pools)
+		if workerHasLoaded(&w, model) {
 			loaded = append(loaded, candidate{worker: w, weight: wt})
 			continue
 		}
@@ -102,7 +188,7 @@ func selectWorkerForModel(registry *worker.Registry, model string, exclude map[s
 		// Check if this worker supports the model (can load it)
 		if workerSupportsModel(&w, model) {
 			// Prefer idle workers for model switch (busy workers would interrupt in-flight requests)
-			if w.State == worker.StateIdle {
+			if w.State == worker.StateIdle || poolIdleFor(&w, model) {
 				supported = append(supported, candidate{worker: w, weight: wt})
 			}
 			continue
@@ -285,11 +371,32 @@ func yieldingSoon(w *worker.Worker, now time.Time) bool {
 //	busy (N requests):  weight = max(1, GPUCount / (1 + N/GPUCount))
 //	about to yield:     weight ×= yieldSoonPenalty (B1)
 func computeWeight(w *worker.Worker) float64 {
+	return computeWeightFor(w, "")
+}
+
+// computeWeightFor weighs w for a request for model. On a multi-pool worker the GPU
+// count and load are those of the pool that serves the model (if resident); otherwise
+// the worker as a whole.
+func computeWeightFor(w *worker.Worker, model string) float64 {
 	gpus := w.GPUCount
+	load := effectiveLoad(w)
+	if model != "" && len(w.PoolCapacity) > 0 {
+		if m, ok := loadedMatch(w, model); ok {
+			if c, ok := w.PoolCapacity[m]; ok {
+				gpus = c
+				// The pool's polled load, plus whatever the gateway has dispatched to this
+				// worker since the last poll (InFlight beyond ActiveRequests) — the same
+				// fresher-than-the-poll signal effectiveLoad uses for a whole worker.
+				load = w.PoolActive[m]
+				if extra := w.InFlight - w.ActiveRequests; extra > 0 {
+					load += extra
+				}
+			}
+		}
+	}
 	if gpus <= 0 {
 		gpus = 1
 	}
-	load := effectiveLoad(w)
 	weight := float64(gpus)
 	if load > 0 {
 		loadFactor := float64(load) / float64(gpus)
@@ -304,6 +411,92 @@ func computeWeight(w *worker.Worker) float64 {
 	return weight
 }
 
+// loadedModels is every model the worker has resident right now. A multi-pool worker
+// reports several; an older worker reports one, carried in LoadedModel. Both are
+// folded together so callers never have to remember which field to read.
+func loadedModels(w *worker.Worker) []string {
+	if len(w.LoadedModels) > 0 {
+		return w.LoadedModels
+	}
+	if w.LoadedModel != "" {
+		return []string{w.LoadedModel}
+	}
+	return nil
+}
+
+// loadedMatch returns the resident model on w that serves the requested model
+// (same model under either spelling), and whether there is one. The returned
+// spelling is the worker's own, which is what a request should be rewritten to so
+// the worker does not mistake a spelling difference for a model switch.
+func loadedMatch(w *worker.Worker, model string) (string, bool) {
+	for _, m := range loadedModels(w) {
+		if modelMatches(m, model) {
+			return m, true
+		}
+	}
+	return "", false
+}
+
+// poolIdleFor: on a multi-pool worker, "busy" usually means some OTHER pool has work.
+// Under mixed load the test worker was busy almost all the time (image/speech/4B traffic), so a
+// request needing its text pool to switch (32B ↔ VL) never found it "idle" and timed out
+// in the queue after 60 s — 34 VL and 17 32B requests in one 10-minute run. The pool
+// that would switch is idle when none of its models has requests in flight; the worker
+// itself then still waits for that pool's in-flight work before switching.
+func poolIdleFor(w *worker.Worker, model string) bool {
+	if len(w.PoolGroups) == 0 || len(w.SwitchingModels) > 0 {
+		return false
+	}
+	for _, g := range w.PoolGroups {
+		in := false
+		for _, m := range g {
+			if modelMatches(m, model) || modelMatches(model, m) {
+				in = true
+				break
+			}
+		}
+		if !in {
+			continue
+		}
+		for _, m := range g {
+			if w.PoolActive[m] > 0 {
+				return false
+			}
+		}
+		return true
+	}
+	return false
+}
+
+func switchingCovers(w *worker.Worker, model string) bool {
+	for _, m := range w.SwitchingModels {
+		if modelMatches(m, model) || modelMatches(model, m) {
+			return true
+		}
+	}
+	return false
+}
+
+// poolReadyFor reports whether the pool serving model on w is running. A multi-pool
+// worker is "running" as soon as any pool is; the model's own pool may still be
+// reloading after a yield. Single-engine workers (no pool info) are always ready here
+// — their worker-level state already says it.
+func poolReadyFor(w *worker.Worker, model string) bool {
+	if len(w.PoolNotReady) == 0 {
+		return true
+	}
+	if m, ok := loadedMatch(w, model); ok {
+		return !w.PoolNotReady[m]
+	}
+	return true
+}
+
+// workerHasLoaded reports whether any of the worker's resident models serves model.
+func workerHasLoaded(w *worker.Worker, model string) bool {
+	_, ok := loadedMatch(w, model)
+	return ok
+}
+
 // routableModels is the set of models THIS worker can actually serve a request
 // for right now: loaded ∪ supported, filtered by the admission gate's verified
 // list for self-registered workers when the gate is on. This is the single
@@ -311,10 +504,7 @@ func computeWeight(w *worker.Worker) float64 {
 // model shown to users but not routable (or vice versa) is a lie in one
 // direction or the other.
 func routableModels(w *worker.Worker, gateOn bool) []string {
-	cand := []string{}
-	if w.LoadedModel != "" {
-		cand = append(cand, w.LoadedModel)
-	}
+	cand := append([]string{}, loadedModels(w)...)
 	cand = append(cand, w.SupportedModels...)
 	if !gateOn || !w.SelfRegistered {
 		return cand

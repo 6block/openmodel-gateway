@@ -55,9 +55,11 @@ func (g *Gateway) handleWorkerSelf(w http.ResponseWriter, r *http.Request) {
 	// One row per claimed model (loaded ∪ supported), deduped, claim order kept.
 	seen := map[string]bool{}
 	claims := []string{}
-	if wk.LoadedModel != "" {
-		claims = append(claims, wk.LoadedModel)
-		seen[wk.LoadedModel] = true
+	for _, m := range wk.LoadedModels {
+		if !seen[m] {
+			claims = append(claims, m)
+			seen[m] = true
+		}
 	}
 	for _, m := range wk.SupportedModels {
 		if !seen[m] {
@@ -135,7 +137,10 @@ func (g *Gateway) handleWorkerReverify(w http.ResponseWriter, r *http.Request) {
 	}
 	model := strings.TrimSpace(req.Model)
 
-	claimed := wk.LoadedModel == model
+	claimed := false
+	for _, m := range wk.LoadedModels {
+		claimed = claimed || m == model
+	}
 	for _, m := range wk.SupportedModels {
 		claimed = claimed || m == model
 	}
@@ -151,6 +156,22 @@ func (g *Gateway) handleWorkerReverify(w http.ResponseWriter, r *http.Request) {
 	if g.auditor == nil {
 		jsonError(w, "probe auditor is not running on this gateway", http.StatusServiceUnavailable)
 		return
+	}
+	// The auditor examines claims that are NOT verified; a verified model is only
+	// re-confirmed when its evidence expires. Resetting one here would schedule
+	// nothing, so say so plainly instead of answering "scheduled" — and leave the
+	// rate-limit slot unused.
+	for _, vm := range wk.VerifiedModels {
+		if modelMatches(vm, model) || modelMatches(model, vm) {
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"worker_id": wk.ID,
+				"model":     model,
+				"status":    "already_verified",
+				"note":      "this model is verified and serving; nothing to re-examine (verification is re-confirmed automatically when it expires)",
+			})
+			return
+		}
 	}
 
 	key := wk.ID + "|" + model
@@ -190,6 +211,7 @@ func (g *Gateway) workerFromToken(r *http.Request) (*workerView, bool) {
 	}
 	return &workerView{
 		ID: wk.ID, MinerAddress: wk.MinerAddress, LoadedModel: wk.LoadedModel,
+		LoadedModels:    loadedModels(wk),
 		SupportedModels: wk.SupportedModels, VerifiedModels: wk.VerifiedModels,
 		VerifiedAt: wk.VerifiedAt, BannedUntil: wk.BannedUntil, BanReason: wk.BanReason,
 	}, true
@@ -201,6 +223,7 @@ type workerView struct {
 	ID              string
 	MinerAddress    string
 	LoadedModel     string
+	LoadedModels    []string // every resident model (multi-pool workers report several)
 	SupportedModels []string
 	VerifiedModels  []string
 	VerifiedAt      time.Time

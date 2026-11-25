@@ -48,7 +48,7 @@ func TestPollSendsWorkerToken(t *testing.T) {
 	if _, _, err := p.fetchGPUState(context.Background(), "w-test", rdy.URL, "wtok"); err != nil {
 		t.Fatal(err)
 	}
-	if _, _, _, _, _, _, err := p.fetchInferenceHealth(context.Background(), "w-test", hlt.URL, "wtok"); err != nil {
+	if _, _, _, _, _, _, _, _, err := p.fetchInferenceHealth(context.Background(), "w-test", hlt.URL, "wtok"); err != nil {
 		t.Fatal(err)
 	}
 	if readyAuth != "Bearer wtok" {
@@ -80,7 +80,7 @@ func TestFetchGPUState_Malformed(t *testing.T) {
 func TestFetchInferenceHealth_Non200(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { w.WriteHeader(500) }))
 	defer srv.Close()
-	if _, _, _, _, _, _, err := newPoller(t).fetchInferenceHealth(context.Background(), "w-test", srv.URL, ""); err == nil {
+	if _, _, _, _, _, _, _, _, err := newPoller(t).fetchInferenceHealth(context.Background(), "w-test", srv.URL, ""); err == nil {
 		t.Error("expected error on non-200 /health")
 	}
 }
@@ -90,7 +90,7 @@ func TestFetchInferenceHealth_DecodeError(t *testing.T) {
 		fmt.Fprintln(w, "{ not valid json")
 	}))
 	defer srv.Close()
-	if _, _, _, _, _, _, err := newPoller(t).fetchInferenceHealth(context.Background(), "w-test", srv.URL, ""); err == nil {
+	if _, _, _, _, _, _, _, _, err := newPoller(t).fetchInferenceHealth(context.Background(), "w-test", srv.URL, ""); err == nil {
 		t.Error("expected JSON decode error")
 	}
 }
@@ -102,7 +102,7 @@ func TestFetchInferenceHealth_MultiGPU(t *testing.T) {
 		fmt.Fprintln(w, `{"status":"ok","engine_state":"running","active_requests":2,"loaded_model":"m","multi_gpu":{"engine_count":8}}`)
 	}))
 	defer srv.Close()
-	es, ar, lm, ec, _, _, err := newPoller(t).fetchInferenceHealth(context.Background(), "w-test", srv.URL, "")
+	es, ar, lm, ec, _, _, _, _, err := newPoller(t).fetchInferenceHealth(context.Background(), "w-test", srv.URL, "")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -116,4 +116,40 @@ func TestFetchInferenceHealth_MultiGPU(t *testing.T) {
 
 func TestPollNow_UnknownWorker(t *testing.T) {
 	newPoller(t).PollNow(context.Background(), "ghost") // must not panic
+}
+
+func TestPoolMapsFromMultiPoolHealth(t *testing.T) {
+	cap, act, notReady := poolMaps(&multiGPUInfo{Pools: []poolInfo{
+		{EngineState: "loading", Models: []string{"/models/a"}, Devices: []int{0, 1, 2, 3}, ActiveRequests: 2},
+		{EngineState: "running", Models: []string{"/models/b"}, Devices: []int{7}, ActiveRequests: 0},
+		{Models: []string{"/models/c", "/models/d"}, Devices: []int{5}},
+	}})
+	if cap["/models/a"] != 4 || act["/models/a"] != 2 || cap["/models/b"] != 1 || cap["/models/d"] != 1 {
+		t.Fatalf("capacity %v active %v", cap, act)
+	}
+	// A pool still reloading (a) is not ready; running (b) or unreported (c, d) is.
+	if !notReady["/models/a"] || notReady["/models/b"] || notReady["/models/c"] {
+		t.Fatalf("notReady %v", notReady)
+	}
+	if c, a, n := poolMaps(nil); c != nil || a != nil || n != nil {
+		t.Fatal("a single-engine worker has no pool maps")
+	}
+}
+
+func TestModelLimitsFromHealth(t *testing.T) {
+	multi := &multiGPUInfo{Pools: []poolInfo{
+		{Models: []string{"/models/vl"}, Limits: ModelLimit{MaxImages: 32, ContextLimit: 8192}},
+		{Models: []string{"/models/sdxl"}},
+	}}
+	got := modelLimits(multi, "/models/vl")
+	if got["/models/vl"] != (ModelLimit{MaxImages: 32, ContextLimit: 8192}) || len(got) != 1 {
+		t.Fatalf("pool limits %v", got)
+	}
+	single := &multiGPUInfo{single: ModelLimit{MaxImages: 1, ContextLimit: 4096}}
+	if got := modelLimits(single, "/models/vl"); got["/models/vl"].MaxImages != 1 {
+		t.Fatalf("single-engine limits %v", got)
+	}
+	if modelLimits(&multiGPUInfo{}, "/models/x") != nil || modelLimits(nil, "x") != nil {
+		t.Fatal("no reported limits → nil (older workers impose nothing)")
+	}
 }

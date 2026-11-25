@@ -42,6 +42,83 @@ func TestReceipt_CrossLanguageFixtureVerifies(t *testing.T) {
 	}
 }
 
+// A receipt's attested QUANTITY must match what the gateway parsed from the response.
+// Without this comparison an asset-billed receipt is taken on its word, and a worker
+// could attest one image while returning none — or bill for four while rendering one.
+func TestReceipt_AssetQuantityMustMatchResponseUsage(t *testing.T) {
+	pub, priv, _ := ed25519.GenerateKey(nil)
+	pubHex := hex.EncodeToString(pub)
+
+	asset := &ReceiptInfo{V: 1, RequestID: "r1", Model: "flux-schnell",
+		RequestSHA256: "a", ResponseSHA256: "b", Quantity: 4, AssetHash: "h",
+		TS: 1, Pubkey: pubHex}
+	asset.Sig = hex.EncodeToString(ed25519.Sign(priv, canonicalReceiptPayload(asset)))
+
+	// Gateway parsed 4 images from the response → agrees.
+	ok := *asset
+	verifyReceipt(&ok, pubHex, nil, tokenUsage{AssetQty: 4}, true)
+	if !ok.Verified {
+		t.Fatalf("matching quantity must verify: %s", ok.VerifyError)
+	}
+	// Gateway parsed 1 image → the worker over-claimed, reject.
+	over := *asset
+	verifyReceipt(&over, pubHex, nil, tokenUsage{AssetQty: 1}, true)
+	if over.Verified {
+		t.Fatal("a receipt claiming more images than the response carries must NOT verify")
+	}
+	// Gateway parsed 0 images → nothing was produced, reject.
+	none := *asset
+	verifyReceipt(&none, pubHex, nil, tokenUsage{AssetQty: 0}, true)
+	if none.Verified {
+		t.Fatal("a receipt claiming images when the response carries none must NOT verify")
+	}
+}
+
+// A token receipt must still be checked on token counts, and must not accidentally be
+// compared on quantity (which is 0 for it) — that would let a token worker skip the
+// usage check entirely by leaving quantity zero and lying about tokens.
+func TestReceipt_TokenReceiptStillCheckedOnTokens(t *testing.T) {
+	pub, priv, _ := ed25519.GenerateKey(nil)
+	pubHex := hex.EncodeToString(pub)
+	r := &ReceiptInfo{V: 1, RequestID: "r1", Model: "m", RequestSHA256: "a",
+		ResponseSHA256: "b", PromptTokens: 100, CompletionTokens: 25, CachedTokens: 10,
+		TS: 1, Pubkey: pubHex}
+	r.Sig = hex.EncodeToString(ed25519.Sign(priv, canonicalReceiptPayload(r)))
+
+	good := *r
+	verifyReceipt(&good, pubHex, nil, tokenUsage{PromptTokens: 100, CompletionTokens: 25, CachedTokens: 10}, true)
+	if !good.Verified {
+		t.Fatalf("matching token counts must verify: %s", good.VerifyError)
+	}
+	lie := *r
+	verifyReceipt(&lie, pubHex, nil, tokenUsage{PromptTokens: 100, CompletionTokens: 999, CachedTokens: 10}, true)
+	if lie.Verified {
+		t.Fatal("a token receipt overstating completion tokens must NOT verify")
+	}
+}
+
+// The two payload shapes must never be confused by the verifier either.
+func TestReceipt_ShapesNotConfusedByName(t *testing.T) {
+	pub, priv, _ := ed25519.GenerateKey(nil)
+	pubHex := hex.EncodeToString(pub)
+
+	// A receipt with BOTH token counts and a quantity is malformed: the shape is
+	// decided by quantity, so its token counts are not covered by the signature at all.
+	both := &ReceiptInfo{V: 1, RequestID: "r1", Model: "flux-schnell",
+		RequestSHA256: "a", ResponseSHA256: "b",
+		PromptTokens: 50, CompletionTokens: 5, Quantity: 2, AssetHash: "h",
+		TS: 1, Pubkey: pubHex}
+	both.Sig = hex.EncodeToString(ed25519.Sign(priv, canonicalReceiptPayload(both)))
+
+	// The quantity check governs; the ungated token counts are simply not part of the
+	// commitment, so a mismatched token count cannot fail (nor pass) this receipt.
+	v := *both
+	verifyReceipt(&v, pubHex, nil, tokenUsage{AssetQty: 2, CompletionTokens: 999}, true)
+	if !v.Verified {
+		t.Fatalf("asset receipt is governed by its quantity: %s", v.VerifyError)
+	}
+}
+
 // signTestReceipt builds a worker-side receipt in Go for integration tests, using the
 // same canonical payload the verifier rebuilds.
 func signTestReceipt(priv ed25519.PrivateKey, pubHex, rid, model, reqSHA, respSHA string,
@@ -52,6 +129,62 @@ func signTestReceipt(priv ed25519.PrivateKey, pubHex, rid, model, reqSHA, respSH
 	r.Sig = hex.EncodeToString(ed25519.Sign(priv, canonicalReceiptPayload(r)))
 	b, _ := json.Marshal(r)
 	return base64.StdEncoding.EncodeToString(b)
+}
+
+// An asset-billed receipt attests a quantity and an asset digest instead of token
+// counts. Pin the payload byte-for-byte: the worker signs it and the gateway (and later
+// an external verifier) rebuilds it, so drift on either side breaks every such receipt.
+func TestReceipt_AssetPayloadCanonicalStability(t *testing.T) {
+	r := &ReceiptInfo{V: 1, RequestID: "req-img-1", Model: "flux-schnell",
+		RequestSHA256: "aaaa", ResponseSHA256: "bbbb",
+		Quantity: 1, AssetHash: "abc123", TS: 1783076903}
+	got := string(canonicalReceiptPayload(r))
+	want := `{"asset_hash":"abc123","model":"flux-schnell","quantity":1,"request_id":"req-img-1","request_sha256":"aaaa","response_sha256":"bbbb","ts":1783076903,"v":1}`
+	if got != want {
+		t.Fatalf("asset receipt payload drifted — this breaks every non-token receipt\n want %s\n got  %s", want, got)
+	}
+}
+
+// The token payload must not gain, lose or reorder a byte when the asset fields exist
+// but are zero: a token model's receipt is the frozen ten-field shape.
+func TestReceipt_TokenPayloadUnchangedByAssetFields(t *testing.T) {
+	r := &ReceiptInfo{V: 1, RequestID: "req-1", Model: "m", RequestSHA256: "a",
+		ResponseSHA256: "b", PromptTokens: 10, CompletionTokens: 5, CachedTokens: 2,
+		TS: 1783076903, Pubkey: "pk"}
+	got := string(canonicalReceiptPayload(r))
+	want := `{"cached_tokens":2,"completion_tokens":5,"model":"m","prompt_tokens":10,"pubkey":"pk","request_id":"req-1","request_sha256":"a","response_sha256":"b","ts":1783076903,"v":1}`
+	if got != want {
+		t.Fatalf("token receipt payload changed — historical receipts would stop verifying\n want %s\n got  %s", want, got)
+	}
+}
+
+// A receipt that carries a quantity must NOT verify under the token shape (and vice
+// versa): which shape applies is fixed by the model's catalog unit, so a worker cannot
+// pick the shape that suits it.
+func TestReceipt_AssetAndTokenShapesDoNotInterchange(t *testing.T) {
+	pub, priv, _ := ed25519.GenerateKey(nil)
+	pubHex := hex.EncodeToString(pub)
+
+	asset := &ReceiptInfo{V: 1, RequestID: "r1", Model: "flux-schnell",
+		RequestSHA256: "a", ResponseSHA256: "b", Quantity: 2, AssetHash: "h",
+		TS: 1, Pubkey: pubHex}
+	asset.Sig = hex.EncodeToString(ed25519.Sign(priv, canonicalReceiptPayload(asset)))
+
+	// Same receipt, but treated as a token model: the rebuilt payload differs, so the
+	// signature must not verify.
+	stolen := *asset
+	stolen.Quantity, stolen.AssetHash = 0, ""
+	verifyReceipt(&stolen, pubHex, nil, tokenUsage{}, false)
+	if stolen.Verified {
+		t.Fatal("an asset receipt must not verify under the token payload shape")
+	}
+	// And under its own shape it does verify — proving the mismatch above was the shape,
+	// not a broken signature.
+	asAsset := *asset
+	verifyReceipt(&asAsset, pubHex, nil, tokenUsage{}, false)
+	if !asAsset.Verified {
+		t.Fatalf("asset receipt must verify under the asset shape: %s", asAsset.VerifyError)
+	}
 }
 
 // Non-streaming: a worker-signed receipt arrives via the X-OM-Receipt header, is

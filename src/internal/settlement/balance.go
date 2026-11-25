@@ -1,6 +1,7 @@
 package settlement
 
 import (
+	"sync/atomic"
 	"context"
 	"log/slog"
 	"math/big"
@@ -21,6 +22,7 @@ type balanceContract interface {
 
 // BalanceCache caches on-chain balances and tracks pending (unsettled) spending.
 type BalanceCache struct {
+	warm atomic.Bool // first full refresh done (see Warm)
 	mu sync.RWMutex
 
 	// on-chain balances: wallet → token_addr → balance
@@ -196,6 +198,7 @@ func (bc *BalanceCache) WalletCount() int {
 // Start begins periodic balance refreshing.
 func (bc *BalanceCache) Start(ctx context.Context) {
 	bc.refreshAll(ctx)
+	bc.warm.Store(true)
 
 	ticker := time.NewTicker(time.Duration(bc.refreshSec) * time.Second)
 	defer ticker.Stop()
@@ -208,6 +211,17 @@ func (bc *BalanceCache) Start(ctx context.Context) {
 			bc.refreshAll(ctx)
 		}
 	}
+}
+
+// Warm reports whether the first full balance refresh after start has finished.
+// Before that every wallet reads as zero, which is not the same as "insufficient":
+// found on the test gateway, a restart turned ~12 s of traffic into 402s while the
+// first refresh walked the wallets over RPC. Callers answer 503 "starting" instead.
+func (bc *BalanceCache) Warm() bool {
+	if bc == nil {
+		return true
+	}
+	return bc.warm.Load()
 }
 
 // HasSufficientBalance checks if the wallet has enough balance (across all tokens)
@@ -311,6 +325,7 @@ func (bc *BalanceCache) AddPendingSpend(wallet string, usd *big.Float) {
 // ForceRefresh triggers an immediate balance refresh for all wallets.
 func (bc *BalanceCache) ForceRefresh(ctx context.Context) {
 	bc.refreshAll(ctx)
+	bc.warm.Store(true)
 }
 
 // GetAllBalances returns a snapshot of all cached balances (for settlement aggregation).
@@ -518,3 +533,6 @@ func (bc *BalanceCache) refreshWallet(ctx context.Context, wallet string) {
 	bc.chainBalances[wallet] = tokenBalances
 	bc.mu.Unlock()
 }
+
+// ResetWarmForTest returns the cache to its just-started state (tests only).
+func (bc *BalanceCache) ResetWarmForTest() { bc.warm.Store(false) }

@@ -46,6 +46,11 @@ type settlementContract interface {
 // pending file freezes the planned batches so a crash-retry reproduces identical
 // batch hashes for on-chain dedup, preventing double-charging.
 type Settler struct {
+	// landTimeout / landPoll: how long and how often to wait for a submission that was
+	// pending across a restart to land (0 = defaults; tests shorten them).
+	landTimeout time.Duration
+	landPoll    time.Duration
+
 	cfg         *Config
 	contract    settlementContract
 	scanner     *Scanner
@@ -174,6 +179,41 @@ func (s *Settler) Start(ctx context.Context) {
 			s.settleWithRecover(ctx)
 		}
 	}
+}
+
+// waitProcessed polls processedBatches until the batch is recorded on chain or the
+// timeout passes.
+func (s *Settler) waitProcessed(ctx context.Context, hash [32]byte, timeout time.Duration) bool {
+	deadline := time.Now().Add(timeout)
+	for {
+		if processed, err := s.contract.IsProcessedBatch(ctx, hash); err == nil && processed {
+			return true
+		}
+		if time.Now().After(deadline) || ctx.Err() != nil {
+			return false
+		}
+		select {
+		case <-ctx.Done():
+			return false
+		case <-time.After(s.pendingLandPoll()):
+		}
+	}
+}
+
+// pendingLandTimeout bounds the wait for a pre-restart tx to mine: a few Filecoin
+// epochs. Tests shorten both values.
+func (s *Settler) pendingLandTimeout() time.Duration {
+	if s.landTimeout > 0 {
+		return s.landTimeout
+	}
+	return 5 * time.Minute
+}
+
+func (s *Settler) pendingLandPoll() time.Duration {
+	if s.landPoll > 0 {
+		return s.landPoll
+	}
+	return 15 * time.Second
 }
 
 // TriggerNow signals the settler to run a settlement cycle immediately.
@@ -393,6 +433,22 @@ func (s *Settler) resumePending(ctx context.Context) error {
 		}
 
 		tx, err := s.contract.SubmitSettlement(ctx, batch)
+		if err != nil && strings.Contains(err.Error(), "batch already processed") {
+			// A submission from before a restart is still in the mempool. Lotus estimates
+			// gas on top of the sender's pending messages, so this duplicate reverts
+			// "already processed" while processedBatches at the head still reads false.
+			// Wait for that earlier tx to land and confirm against the chain — the
+			// outcome the dedup check above reaches once it is mined.
+			if s.waitProcessed(ctx, hashBytes, s.pendingLandTimeout()) {
+				s.logger.Info("earlier submission of this batch landed (it was pending across the restart), marking confirmed",
+					"hash", b.DetailsHash)
+				b.Confirmed = true
+				if err := s.writePending(*pending); err != nil {
+					return fmt.Errorf("persist confirm progress: %w", err)
+				}
+				continue
+			}
+		}
 		if err != nil {
 			metrics.SettlementTxTotal.WithLabelValues("error").Inc()
 			return fmt.Errorf("submit batch %d: %w", i, err)
@@ -602,7 +658,7 @@ func (s *Settler) buildPending(items []SettlementItem, cursor Cursor, settledUSD
 		// properties preserved) while binding every request and its worker-signed
 		// receipt to the on-chain batch (A1).
 		legacy := BatchHash(batch)
-		rids, leaves := batchLeaves(batch, recordsByID)
+		rids, leaves := batchLeaves(batch, recordsByID, s.cfg.UnitFor)
 		root := MerkleRoot(leaves)
 		combined := CombinedDetailsHash(legacy, root)
 		pb := pendingBatch{
@@ -624,14 +680,25 @@ func (s *Settler) buildPending(items []SettlementItem, cursor Cursor, settledUSD
 			if rec, ok := recordsByID[rid]; ok {
 				r := rec // copy — snapshot the billing row (with receipt) into the ledger
 				leaf.Record = &r
+				// Record the unit for a non-token leaf so the proof is self-sufficient:
+				// the verifier rebuilds the leaf bytes from {record, sp, price_unit} and
+				// must not have to consult a catalog it cannot see.
+				if u := s.cfg.UnitFor(rec.Model); !u.IsToken() {
+					leaf.PriceUnit = string(u)
+				}
 			}
 			pb.Leaves = append(pb.Leaves, leaf)
 		}
-		// Per-item stats for the schema-3 submit. Mirrors batchLeaves exactly: a rid
-		// is attributed to the FIRST item that carries it (a token-split rid must not
-		// count twice), tokens come from the request record (prompt + completion —
-		// recomputable by anyone holding the published leaf set), and a debt rid
-		// without a record counts as 1 request with 0 tokens.
+		// Per-item stats for the on-chain submit. Mirrors batchLeaves exactly: a rid is
+		// attributed to the FIRST item that carries it (a token-split rid must not count
+		// twice), and a debt rid without a record counts as 1 request with 0 volume.
+		//
+		// Volume is accumulated INTO THE UNIT THE MODEL'S CATALOG ENTRY declares, never
+		// the unit a receipt claims — the same direction the price comes from. The
+		// quantity is the request's measured volume (prompt+completion tokens for a token
+		// model, the attested count for an asset model); an unrecognised unit is a
+		// configuration error and is counted in NO column rather than silently filed
+		// under tokens.
 		seenRid := make(map[string]bool)
 		for _, it := range batch {
 			amountUSD := ""
@@ -639,15 +706,31 @@ func (s *Settler) buildPending(items []SettlementItem, cursor Cursor, settledUSD
 				amountUSD = it.AmountUSD.Text('f', 18)
 			}
 			reqCount := 0
-			var tokCount int64
+			volume := make([]*big.Int, UnitCount)
+			for u := range volume {
+				volume[u] = big.NewInt(0)
+			}
 			for _, rid := range it.RequestIDs {
 				if seenRid[rid] {
 					continue
 				}
 				seenRid[rid] = true
 				reqCount++
-				if rec, ok := recordsByID[rid]; ok {
-					tokCount += int64(rec.PromptTokens) + int64(rec.CompletionTokens)
+				rec, ok := recordsByID[rid]
+				if !ok {
+					continue
+				}
+				unit := s.cfg.UnitFor(rec.Model)
+				idx := UnitIndex(unit)
+				if idx < 0 {
+					s.logger.Error("model has no recognised billing unit; its volume is omitted from the batch stats",
+						"request_id", rid, "model", rec.Model, "unit", string(unit))
+					continue
+				}
+				if unit.IsToken() {
+					volume[idx].Add(volume[idx], big.NewInt(int64(rec.PromptTokens)+int64(rec.CompletionTokens)))
+				} else if q := quantityOf(rec); q > 0 {
+					volume[idx].Add(volume[idx], big.NewInt(int64(q)))
 				}
 			}
 			pb.Items = append(pb.Items, pendingItem{
@@ -658,7 +741,12 @@ func (s *Settler) buildPending(items []SettlementItem, cursor Cursor, settledUSD
 				AmountUSD:    amountUSD,
 				RequestIDs:   it.RequestIDs,
 				RequestCount: reqCount,
-				TokenCount:   tokCount,
+				Volume:       volume,
+				// The schema-3 column is the TOKEN volume only. A v1.3 contract has
+				// one token-shaped counter; filing images there would corrupt it, and
+				// leaving it unset would report every deployment still on schema 3
+				// as having served zero tokens.
+				TokenCount: volume[UnitToken].Int64(),
 			})
 		}
 		p.Batches = append(p.Batches, pb)
@@ -1029,6 +1117,12 @@ type merkleLeaf struct {
 	// entry lacks them and BuildReceiptProof falls back to the legacy scans for those rids.
 	Record *RequestRecord `json:"record,omitempty"`
 	SP     string         `json:"sp,omitempty"`
+	// PriceUnit is the unit this leaf committed under, for non-token records only
+	// ("image", "audio_second"). The leaf itself already binds it; it is stored here so
+	// BuildReceiptProof can serve it and an external verifier can rebuild the leaf bytes
+	// without consulting a catalog it has no access to. Empty for a token record, whose
+	// shape implies the unit — that keeps pre-existing proofs byte-identical.
+	PriceUnit string `json:"price_unit,omitempty"`
 }
 
 type pendingItem struct {
@@ -1045,16 +1139,21 @@ type pendingItem struct {
 	// settlement ledger (settlement-items.jsonl) for SP per-request earnings queries.
 	// Optional/omitempty: an older WAL (pre-feature) lacks it and degrades gracefully.
 	RequestIDs []string `json:"request_ids,omitempty"`
-	// Batch stats submitted on-chain with schema 3 (v1.3 contracts): how many
-	// requests this item settles and their prompt+completion token sum. A rid split
-	// across two items (token spillover) is counted in the FIRST item that carries
-	// it, matching the batch's Merkle leaf set; a debt rid without a record counts 1
-	// request / 0 tokens. Persisted in the WAL so a crash-replay re-submits the
-	// EXACT same stats (the on-chain dedup keys off detailsHash, which does not
-	// cover them). Optional/omitempty: an older WAL lacks them → zeros go on-chain,
-	// money math unaffected.
-	RequestCount int   `json:"request_count,omitempty"`
-	TokenCount   int64 `json:"token_count,omitempty"`
+	// Batch stats submitted on-chain with schema 3+ (v1.3 contracts and later): how many
+	// requests this item settles, and their volume broken out by unit. A rid split across
+	// two items (token spillover) is counted in the FIRST item that carries it, matching
+	// the batch's Merkle leaf set; a debt rid without a record counts 1 request / 0
+	// volume. Persisted in the WAL so a crash-replay re-submits the EXACT same stats (the
+	// on-chain dedup keys off detailsHash, which does not cover them). Optional/omitempty:
+	// an older WAL lacks them → zeros go on-chain, money math unaffected.
+	RequestCount int `json:"request_count,omitempty"`
+	// Volume is the per-unit volume, indexed by UNIT_* (length UNIT_COUNT). Schema 4
+	// submits this; a nil/short slice is zero-filled at submit time.
+	Volume []*big.Int `json:"volume,omitempty"`
+	// TokenCount is the schema-3 token-shaped column. A WAL written by a schema-3 build
+	// carries it; a schema-4 submit IGNORES it (Volume carries the data), so replaying
+	// such a WAL does not file every quantity under tokens.
+	TokenCount int64 `json:"token_count,omitempty"`
 }
 
 func (pb pendingBatch) toBatch(hash [32]byte) (SettlementBatch, error) {
@@ -1065,6 +1164,7 @@ func (pb pendingBatch) toBatch(hash [32]byte) (SettlementBatch, error) {
 		Tokens:        make([]common.Address, len(pb.Items)),
 		RequestCounts: make([]*big.Int, len(pb.Items)),
 		TokenCounts:   make([]*big.Int, len(pb.Items)),
+		ItemVolume:    make([][UnitCount]*big.Int, len(pb.Items)),
 		DetailsHash:   hash,
 	}
 	for i, it := range pb.Items {
@@ -1079,6 +1179,12 @@ func (pb pendingBatch) toBatch(hash [32]byte) (SettlementBatch, error) {
 		// Older WAL entries carry no stats — they submit as 0, never nil.
 		b.RequestCounts[i] = big.NewInt(int64(it.RequestCount))
 		b.TokenCounts[i] = big.NewInt(it.TokenCount)
+		for u := 0; u < UnitCount; u++ {
+			b.ItemVolume[i][u] = big.NewInt(0)
+			if u < len(it.Volume) && it.Volume[u] != nil {
+				b.ItemVolume[i][u] = it.Volume[u]
+			}
+		}
 	}
 	return b, nil
 }
@@ -1275,7 +1381,10 @@ func (s *Settler) appendMerkleLedger(b *pendingBatch, txHash string, block uint6
 	rids := make([]string, len(b.Leaves))
 	thin := make([]merkleLeaf, len(b.Leaves))
 	for i, l := range b.Leaves {
-		thin[i] = merkleLeaf{Rid: l.Rid, Leaf: l.Leaf, SP: l.SP} // no embedded Record
+		// no embedded Record (R4), but price_unit MUST survive: a non-token leaf's unit
+		// is part of what the proof serves, and dropping it here would leave an asset
+		// proof unrebuildable.
+		thin[i] = merkleLeaf{Rid: l.Rid, Leaf: l.Leaf, SP: l.SP, PriceUnit: l.PriceUnit}
 		rids[i] = l.Rid
 		if l.Record != nil {
 			if loc, ok := s.appendReceiptRecord(l.Rid, l.Record); ok {

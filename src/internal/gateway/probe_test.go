@@ -436,3 +436,41 @@ func TestProbe_RequestLooksLikeUserTraffic(t *testing.T) {
 		t.Fatal("probe must send the same Content-Type as forwarded traffic")
 	}
 }
+
+// Admission-probing a model that is not resident makes the worker switch to it. The
+// worker must be marked switching like for a user request, so other requests for that
+// pool wait instead of landing on the reloading engine. A resident model is not marked.
+func TestProbe_AdmissionOfANonResidentModelMarksTheSwitch(t *testing.T) {
+	tok := "wtok-sw"
+	inner := fakeWorkerServer(t, true, tok)
+	defer inner.Close()
+	g := newProbeTestGateway(t)
+	var seen []string
+	// Observed while the probe's questions are with the worker, i.e. during the switch.
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if cur, ok := g.registry.Get("sp-sw"); ok {
+			seen = append(seen, cur.SwitchingTo)
+		}
+		proxyTo(t, inner.URL, w, r)
+	}))
+	defer srv.Close()
+	registerFakeSP(t, g, "sp-sw", "big-model", srv.URL, tok)
+	a := newAuditor(ProbeConfig{NumQuestions: 4, MinScore: 0.5, BanSeconds: 60}, g,
+		slog.New(slog.NewTextHandler(io.Discard, nil)))
+
+	w, _ := g.registry.Get("sp-sw")
+	a.verifyModel(t.Context(), *w, "big-model")
+	for _, s := range seen {
+		if s != "" {
+			t.Fatalf("probing the resident model is not a switch, saw switching_to=%q", s)
+		}
+	}
+	seen = nil
+	a.verifyModel(t.Context(), *w, "other-model")
+	if len(seen) == 0 || seen[0] != "other-model" {
+		t.Fatalf("probing a non-resident model must mark the switch while it runs, saw %q", seen)
+	}
+	if got, _ := g.registry.Get("sp-sw"); got.SwitchingTo != "" {
+		t.Fatalf("the mark must be cleared when the admission run ends, got %q", got.SwitchingTo)
+	}
+}

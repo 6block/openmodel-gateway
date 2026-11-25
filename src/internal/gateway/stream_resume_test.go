@@ -4,12 +4,14 @@ import (
 	"bufio"
 	"encoding/json"
 	"fmt"
+	"io"
 	"math/big"
 	"net/http"
 	"net/http/httptest"
 	"strings"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"openmodel/sp-state-agent/internal/config"
 	"openmodel/sp-state-agent/internal/settlement"
@@ -175,13 +177,27 @@ func TestStreamResume_UpstreamAbortMidStream(t *testing.T) {
 	var gotMax atomic.Int64
 	up := interruptThenContinueServer(t, &calls, &gotCont, &gotMax, true)
 	defer up.Close()
-	gw, _, cleanup := newResumeGateway(t, up.URL, true, []string{worker.FeatureContinuation})
+	gw, reg, cleanup := newResumeGateway(t, up.URL, true, []string{worker.FeatureContinuation})
 	defer cleanup()
 
 	contents, errFrames, done := readStream(t, gw.URL, resumeBody)
 
 	if got := strings.Join(contents, ""); got != "ABCDE" {
 		t.Errorf("client must see the spliced stream ABCDE after a hard abort, got %q", got)
+	}
+	// The worker whose connection died is out of routing as UNREACHABLE (offline), not
+	// "mining": its process is gone, and the next poll decides when it is back.
+	offline := 0
+	for _, w := range reg.List() {
+		if w.State == worker.StateOffline {
+			offline++
+		}
+		if w.State == worker.StateMining {
+			t.Errorf("a crashed worker must not be recorded as mining (%s)", w.ID)
+		}
+	}
+	if offline != 1 {
+		t.Errorf("exactly the crashed worker must be marked unreachable, got %d offline", offline)
 	}
 	if errFrames != 0 || done != 1 {
 		t.Errorf("want 0 error frames and 1 [DONE], got %d/%d", errFrames, done)
@@ -341,5 +357,100 @@ func TestStreamResume_TeardownErrorAfterDoneIsClean(t *testing.T) {
 	}
 	if errFrames != 0 || done != 1 {
 		t.Errorf("teardown-after-DONE must end cleanly: err=%d done=%d", errFrames, done)
+	}
+}
+
+// The only worker for a model yields mid-stream (VL / 32B live on one machine). The
+// continuation must wait for it to come back, not bounce off it: on the test gateway
+// both resume attempts hit the still-yielding worker within one second and the stream
+// was cut ("stream interrupted after partial delivery"), although the worker resumed a
+// minute later. After the interruption the worker answers 503 until its next poll says
+// it is available again; the stream must then finish on it.
+func TestStreamResume_SingleWorkerWaitsOutTheYield(t *testing.T) {
+	var calls atomic.Int32
+	var back atomic.Bool
+	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		n := calls.Add(1)
+		if n == 1 {
+			w.Header().Set("Content-Type", "text/event-stream")
+			w.WriteHeader(200)
+			for _, c := range []string{"A", "B", "C"} {
+				fmt.Fprintf(w, "data: {\"choices\": [{\"delta\": {\"content\": %q}}]}\n\n", c)
+			}
+			fmt.Fprint(w, "data: {\"error\":{\"message\":\"Engine paused during generation — request aborted\",\"type\":\"server_error\"}}\n\ndata: [DONE]\n\n")
+			return
+		}
+		if !back.Load() {
+			w.WriteHeader(http.StatusServiceUnavailable) // still mining
+			return
+		}
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(200)
+		fmt.Fprint(w, "data: {\"choices\": [{\"delta\": {\"content\": \"D\"}}]}\n\n")
+		fmt.Fprint(w, "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":9,\"completion_tokens\":1,\"total_tokens\":10}}\n\ndata: [DONE]\n\n")
+	}))
+	defer up.Close()
+
+	logger := testLogger()
+	registry := worker.NewRegistry(logger, "")
+	registry.Register(worker.WorkerRegistration{ID: "only", Endpoint: up.URL, SchedulerURL: up.URL, GPUCount: 1})
+	registry.UpdateState("only", "GPU_STATE_AVAILABLE", "running", 0, "test-model", 1)
+	registry.SetFeatures("only", []string{worker.FeatureContinuation}, "")
+	gw := New(registry, config.GatewayConfig{
+		RequestTimeoutSec: 20, StreamResume: true,
+		APIKeys: []config.APIKey{{Key: "test", Name: "user1"}},
+	}, logger)
+	gw.queueTimeout = 10 * time.Second
+	srv := httptest.NewServer(gw.Handler())
+	defer func() { srv.Close(); _ = gw.Close() }()
+
+	go func() {
+		time.Sleep(3 * time.Second)
+		back.Store(true)
+		registry.UpdateState("only", "GPU_STATE_AVAILABLE", "running", 0, "test-model", 1) // next poll
+	}()
+	contents, errFrames, done := readStream(t, srv.URL, resumeBody)
+	if got := strings.Join(contents, ""); got != "ABCD" || errFrames != 0 || done != 1 {
+		t.Fatalf("stream must wait out the yield and finish seamlessly: got %q, %d error frames, %d [DONE]", got, errFrames, done)
+	}
+	if n := calls.Load(); n > 3 {
+		t.Fatalf("the yielding worker was hit %d times; it must be left alone until its next poll", n)
+	}
+}
+
+// A stream whose worker fails before sending ANY content (engine core died on the first
+// step) is retried from the original request on another worker — the client must not
+// receive a 200 whose only frame is the error event. The retry sends the original body
+// (no om_continuation) and is billed from the serving worker's own usage.
+func TestStreamFailingBeforeAnyContentRestartsElsewhere(t *testing.T) {
+	var calls atomic.Int32
+	var secondBody atomic.Value
+	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		n := calls.Add(1)
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(200)
+		if n == 1 {
+			fmt.Fprint(w, "data: {\"error\":{\"message\":\"engine core died — request failed, retry on another worker\",\"type\":\"server_error\"}}\n\n")
+			fmt.Fprint(w, "data: [DONE]\n\n")
+			return
+		}
+		b, _ := io.ReadAll(r.Body)
+		secondBody.Store(string(b))
+		for _, c := range []string{"X", "Y"} {
+			fmt.Fprintf(w, "data: {\"choices\": [{\"delta\": {\"content\": %q}}]}\n\n", c)
+		}
+		fmt.Fprint(w, "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":9,\"completion_tokens\":2,\"total_tokens\":11}}\n\n")
+		fmt.Fprint(w, "data: [DONE]\n\n")
+	}))
+	defer up.Close()
+	gw, _, cleanup := newResumeGateway(t, up.URL, true, []string{worker.FeatureContinuation})
+	defer cleanup()
+
+	contents, errFrames, done := readStream(t, gw.URL, resumeBody)
+	if got := strings.Join(contents, ""); got != "XY" || errFrames != 0 || done != 1 {
+		t.Fatalf("client must see the retried stream only: content=%q errors=%d done=%d", got, errFrames, done)
+	}
+	if b, _ := secondBody.Load().(string); strings.Contains(b, "om_continuation") {
+		t.Fatalf("a restart sends the original body, got %s", b)
 	}
 }

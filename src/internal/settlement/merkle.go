@@ -27,15 +27,38 @@ import (
 // so the operator cannot settle a batch that misrepresents their usage without it
 // being detectable.
 
-// ReceiptLeaf is the canonical leaf for a billable record. Fixed-template JSON
+// ReceiptLeaf is the canonical leaf for a token-billed record. Fixed-template JSON
 // (field order hardcoded) — documented for external verifiers; sig is the worker's
 // receipt signature (empty when the worker presented none: the leaf then only binds
 // the gateway-asserted values).
+//
+// Byte format is frozen: external verifiers rebuild this exactly, so this shape must
+// never change. Non-token models get their own leaf (AssetLeaf) rather than extra
+// fields here, so a token model's commitment is identical before and after unit
+// generalisation.
 func ReceiptLeaf(rid, wallet, spEVM, model string, promptTokens, completionTokens, cachedTokens int, sig string) [32]byte {
 	js := func(s string) string { b, _ := json.Marshal(s); return string(b) }
 	payload := fmt.Sprintf(
 		`{"cached_tokens":%d,"completion_tokens":%d,"model":%s,"prompt_tokens":%d,"request_id":%s,"sig":%s,"sp":%s,"wallet":%s}`,
 		cachedTokens, completionTokens, js(model), promptTokens, js(rid), js(sig), js(spEVM), js(wallet))
+	return sha256.Sum256([]byte(payload))
+}
+
+// AssetLeaf is the canonical leaf for a record billed in a NON-token unit (image,
+// audio_second). Fixed-template JSON, keys in ASCII order — a separate shape, not
+// ReceiptLeaf plus appended fields.
+//
+// Why a separate shape: a non-token record has no token counts, and writing zeros for
+// them would commit a fictitious measurement to the on-chain record. The leaf instead
+// binds what the unit is and how much of it was produced, plus asset_hash — the digest
+// of the produced bytes, which is what a verifier can recompute from the asset itself.
+//
+//	{"asset_hash":…,"model":…,"price_unit":…,"quantity":N,"request_id":…,"sig":…,"sp":…,"wallet":…}
+func AssetLeaf(rid, wallet, spEVM, model string, unit PriceUnit, quantity int, assetHash, sig string) [32]byte {
+	js := func(s string) string { b, _ := json.Marshal(s); return string(b) }
+	payload := fmt.Sprintf(
+		`{"asset_hash":%s,"model":%s,"price_unit":%s,"quantity":%d,"request_id":%s,"sig":%s,"sp":%s,"wallet":%s}`,
+		js(assetHash), js(model), js(string(EffectiveUnit(unit))), quantity, js(rid), js(sig), js(spEVM), js(wallet))
 	return sha256.Sum256([]byte(payload))
 }
 
@@ -131,7 +154,17 @@ func hashPair(a, b [32]byte) [32]byte {
 // batchLeaves builds the deterministic (request-id-sorted, deduplicated) leaf set for
 // one batch of settlement items. Records supply full leaf data; a rid without a record
 // (carried debt from an earlier cycle) degrades to an identity-only DebtLeaf.
-func batchLeaves(batch []SettlementItem, recordsByID map[string]RequestRecord) (rids []string, leaves [][32]byte) {
+// unitOf reports the billing unit a model is priced in, from the settlement config.
+// It is passed in rather than looked up inside batchLeaves so the leaf builder stays a
+// pure function of its inputs — the unit comes from CONFIGURATION, never from the
+// record or the receipt.
+type unitOf func(model string) PriceUnit
+
+// batchLeaves builds the deterministic (request-id-sorted, deduplicated) leaf set for
+// a batch. Each record's leaf shape follows its model's catalog unit: a token model
+// commits the frozen ReceiptLeaf, an asset-billed model (image, audio_second) commits
+// an AssetLeaf carrying the unit, the quantity and the asset digest.
+func batchLeaves(batch []SettlementItem, recordsByID map[string]RequestRecord, unitFor unitOf) (rids []string, leaves [][32]byte) {
 	seen := make(map[string]bool)
 	type ent struct {
 		rid  string
@@ -150,8 +183,28 @@ func batchLeaves(batch []SettlementItem, recordsByID map[string]RequestRecord) (
 				if rec.Receipt != nil {
 					sig = rec.Receipt.Sig
 				}
-				leaf = ReceiptLeaf(rid, rec.Wallet, it.SPEVM.Hex(), rec.Model,
-					rec.PromptTokens, rec.CompletionTokens, rec.CachedTokens, sig)
+				// A signed asset receipt is committed exactly as attested, so an
+				// external verifier rebuilds the leaf from the receipt alone. Without
+				// one, the gateway's own count and digest are committed — a delivered
+				// image must not drop out of the tree because the worker sent no
+				// receipt.
+				quantity := quantityOf(rec)
+				assetHash := assetHashOf(rec)
+				if rec.Receipt != nil && rec.Receipt.Quantity > 0 {
+					quantity = rec.Receipt.Quantity
+					assetHash = rec.Receipt.AssetHash
+				}
+				unit := PriceUnitToken
+				if unitFor != nil {
+					unit = EffectiveUnit(unitFor(rec.Model))
+				}
+				if unit.IsToken() {
+					leaf = ReceiptLeaf(rid, rec.Wallet, it.SPEVM.Hex(), rec.Model,
+						rec.PromptTokens, rec.CompletionTokens, rec.CachedTokens, sig)
+				} else {
+					leaf = AssetLeaf(rid, rec.Wallet, it.SPEVM.Hex(), rec.Model,
+						unit, quantity, assetHash, sig)
+				}
 			} else {
 				leaf = DebtLeaf(rid, it.UserWallet, it.SPEVM.Hex())
 			}
@@ -169,10 +222,14 @@ func batchLeaves(batch []SettlementItem, recordsByID map[string]RequestRecord) (
 // ReceiptProof is everything an external verifier needs to check that one request was
 // settled inside an on-chain batch (served by the public receipt endpoint).
 type ReceiptProof struct {
-	RequestID   string   `json:"request_id"`
-	SP          string   `json:"sp"`               // SP EVM payout address (leaf component)
-	Record      any      `json:"record,omitempty"` // the billing-ledger row (incl. worker receipt)
-	Leaf        string   `json:"leaf"`             // hex leaf hash
+	RequestID string `json:"request_id"`
+	SP        string `json:"sp"`               // SP EVM payout address (leaf component)
+	Record    any    `json:"record,omitempty"` // the billing-ledger row (incl. worker receipt)
+	Leaf      string `json:"leaf"`             // hex leaf hash
+	// PriceUnit is set for a non-token record (image, audio_second): the leaf commits
+	// the unit, so a verifier needs it to rebuild the leaf bytes. Absent for a token
+	// record, whose shape implies the unit.
+	PriceUnit   string   `json:"price_unit,omitempty"`
 	LeafIndex   int      `json:"leaf_index"`
 	Proof       []string `json:"proof"` // hex sibling path
 	MerkleRoot  string   `json:"merkle_root"`
@@ -237,6 +294,7 @@ func (s *Settler) BuildReceiptProof(rid string) (*ReceiptProof, error) {
 		SP:          sp,
 		Record:      record,
 		Leaf:        batch.Leaves[idx].Leaf,
+		PriceUnit:   leaf.PriceUnit,
 		LeafIndex:   idx,
 		Proof:       hexProof,
 		MerkleRoot:  batch.MerkleRoot,

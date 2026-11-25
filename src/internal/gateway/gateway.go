@@ -35,6 +35,12 @@ import (
 // maxRequestBody caps the request body we'll read to rewrite stream flag (10 MiB).
 const maxRequestBody = 10 << 20
 
+// Defaults for the audio upload cap and the buffered-response cap (see config).
+const (
+	defaultMaxAudioUploadBytes = 25 << 20
+	defaultMaxResponseBytes    = 64 << 20
+)
+
 const (
 	queuePollInterval = 1 * time.Second // How often to re-check for available workers
 )
@@ -49,6 +55,10 @@ type apiKeyEntry struct {
 
 // Gateway is the OpenAI-compatible reverse proxy.
 type Gateway struct {
+	images                *imageStore   // response_format "url" image hosting (imagehost.go)
+	keepaliveAfter        time.Duration // streaming: first keepalive comment after this wait; 0 = default
+	keepaliveEvery        time.Duration // streaming: keepalive interval; 0 = default
+	publicBase            string        // external base URL for hosted image links; "" = from the request
 	registry              *worker.Registry
 	apiKeys               map[string]apiKeyEntry // sha256(key) hex → metadata (empty map = auth disabled)
 	keysMu                sync.RWMutex           // guards apiKeys (self-registration adds keys at runtime)
@@ -64,31 +74,33 @@ type Gateway struct {
 	requestLogger         *RequestLogger
 	balanceChecker        *settlement.BalanceCache
 	settlementCfg         *settlement.Config
-	modelPrices           map[string]*math_big.Float // precomputed USD-per-token output/base price
-	catalogInput          map[string]*math_big.Float // per-token input price (catalog split), for adjustBalance
-	catalogCacheRead      map[string]*math_big.Float // per-token cache-read price (catalog split)
-	httpClient            *http.Client               // shared client for non-streaming forwards (connection pooling)
-	streamTransport       *http.Transport            // shared transport for streaming reverse proxy
-	nonStreamTransport    *http.Transport            // base for per-worker mTLS clones (pooling tuning)
-	workerMTLS            *workermtls.Factory        // nil/disabled → plaintext clients unchanged
-	certIssuer            *certIssuer                // nil → no certificate-at-registration
-	sessions              *sessionAffinity           // session→worker stickiness for prefix-cache reuse
-	rateLimiter           *RateLimiter               // per-key rate + concurrency abuse controls (B5); nil = disabled
-	maxRequestBytes       int64                      // max request body size; 0 falls back to maxRequestBody
-	draining              atomic.Bool                // true once graceful shutdown begins; new requests get 503 (B7)
-	inFlight              atomic.Int64               // proxied requests currently being served (for drain accounting, B7)
-	sampler               *verificationSampler       // retains a fraction of req/resp pairs for SP fraud detection (A7); nil = off
-	streamResume          bool                       // B2: transparently continue server-interrupted streams on another worker
-	webUI                 config.WebUIConfig         // embedded chat app (M4.1); zero value = disabled
-	regIPLimiter          *ipLimiter                 // per-IP limit on register/key-management (no API key exists yet on these calls)
-	maxKeysPerWallet      int                        // key-store v2 cap; 0 = default 10
-	usage                 *usageRing                 // recent-usage ring for /v1/me (in-memory, dashboard only)
-	auditor               *auditor                   // probe auditor; nil until StartAuditor (worker self-view reads it)
-	muxOnce               sync.Once
-	muxCached             *http.ServeMux
-	streamMaxResumes      int          // B2: per-request continuation budget
-	spReg                 *spRegistrar // SP self-registration (miner-signed admission); nil = disabled, routes 404
-	logger                *slog.Logger
+	// prices holds every price table, built by settlement.NewPrices so the gateway and
+	// the settler can never disagree on what a request costs.
+	prices             settlement.Prices
+	httpClient         *http.Client         // shared client for non-streaming forwards (connection pooling)
+	streamTransport    *http.Transport      // shared transport for streaming reverse proxy
+	nonStreamTransport *http.Transport      // base for per-worker mTLS clones (pooling tuning)
+	workerMTLS         *workermtls.Factory  // nil/disabled → plaintext clients unchanged
+	certIssuer         *certIssuer          // nil → no certificate-at-registration
+	sessions           *sessionAffinity     // session→worker stickiness for prefix-cache reuse
+	rateLimiter        *RateLimiter         // per-key rate + concurrency abuse controls (B5); nil = disabled
+	maxRequestBytes    int64                // max request body size; 0 falls back to maxRequestBody
+	maxAudioUpload     int64                // max transcription upload; 0 = defaultMaxAudioUploadBytes
+	maxResponseBytes   int64                // max buffered worker reply; 0 = defaultMaxResponseBytes
+	draining           atomic.Bool          // true once graceful shutdown begins; new requests get 503 (B7)
+	inFlight           atomic.Int64         // proxied requests currently being served (for drain accounting, B7)
+	sampler            *verificationSampler // retains a fraction of req/resp pairs for SP fraud detection (A7); nil = off
+	streamResume       bool                 // B2: transparently continue server-interrupted streams on another worker
+	webUI              config.WebUIConfig   // embedded chat app (M4.1); zero value = disabled
+	regIPLimiter       *ipLimiter           // per-IP limit on register/key-management (no API key exists yet on these calls)
+	maxKeysPerWallet   int                  // key-store v2 cap; 0 = default 10
+	usage              *usageRing           // recent-usage ring for /v1/me (in-memory, dashboard only)
+	auditor            *auditor             // probe auditor; nil until StartAuditor (worker self-view reads it)
+	muxOnce            sync.Once
+	muxCached          *http.ServeMux
+	streamMaxResumes   int          // B2: per-request continuation budget
+	spReg              *spRegistrar // SP self-registration (miner-signed admission); nil = disabled, routes 404
+	logger             *slog.Logger
 }
 
 // SetVerificationSampler enables sampling+retention of request/response pairs for offline
@@ -131,19 +143,15 @@ func (g *Gateway) KnownWallets() []string {
 func (g *Gateway) SetBalanceChecker(bc *settlement.BalanceCache, cfg *settlement.Config) {
 	g.balanceChecker = bc
 	g.settlementCfg = cfg
-	g.modelPrices = make(map[string]*math_big.Float)
-	if cfg != nil {
-		for model, priceStr := range cfg.ModelPricesUSD {
-			price, _, err := math_big.ParseFloat(priceStr, 10, 128, math_big.ToNearestEven)
-			if err != nil {
-				g.logger.Warn("invalid model price in settlement config", "model", model, "price", priceStr)
-				continue
-			}
-			price.Quo(price, math_big.NewFloat(1_000_000)) // USD per 1M tokens → per token
-			g.modelPrices[model] = price
-		}
-		g.catalogInput, g.catalogCacheRead = settlement.ParseCatalogPrices(cfg.ModelCatalog)
+	if cfg == nil {
+		g.prices = settlement.Prices{}
+		return
 	}
+	// Built by the SAME constructor settlement uses. This used to be a second, hand-rolled
+	// copy of the price tables, which is exactly how the two sides drift apart — the
+	// cause of audit finding #47 (see the note above). One constructor, one set of unit
+	// semantics.
+	g.prices = settlement.NewPrices(cfg)
 }
 
 // New creates a new Gateway.
@@ -226,6 +234,8 @@ func New(registry *worker.Registry, cfg config.GatewayConfig, logger *slog.Logge
 	}
 
 	return &Gateway{
+		images:                newImageStore(),
+		publicBase:            cfg.PublicBaseURL,
 		registry:              registry,
 		apiKeys:               keys,
 		registrationsPath:     registrationsPath,
@@ -246,6 +256,8 @@ func New(registry *worker.Registry, cfg config.GatewayConfig, logger *slog.Logge
 			MaxInFlight: cfg.MaxConcurrentPerKey,
 		}),
 		maxRequestBytes:  cfg.MaxRequestBytes,
+		maxAudioUpload:   cfg.MaxAudioUploadBytes,
+		maxResponseBytes: cfg.MaxResponseBytes,
 		streamResume:     cfg.StreamResume,
 		webUI:            cfg.WebUI,
 		regIPLimiter:     newIPLimiter(float64(orDefault(cfg.RegisterRatePerMin, 10))),
@@ -313,6 +325,13 @@ func (g *Gateway) buildMux() *http.ServeMux {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/v1/chat/completions", g.handleProxy)
 	mux.HandleFunc("/v1/completions", g.handleProxy)
+	// Image generation: a separate handler from the chat proxy (no streaming, no token
+	// metering — the billable amount is a count of images).
+	mux.HandleFunc("/v1/images/generations", g.handleImageGenerations)
+	mux.HandleFunc("/v1/audio/transcriptions", g.handleAudioTranscriptions)
+	mux.HandleFunc("/v1/audio/translations", g.handleAudioTranscriptions)
+	mux.HandleFunc(imageURLPrefix, g.handleImageFile)
+	mux.HandleFunc("/v1/audio/speech", g.handleAudioSpeech)
 	mux.HandleFunc("/v1/models", g.handleModels)
 	mux.HandleFunc("/v1/catalog", g.handleCatalog)
 	mux.HandleFunc("/v1/register", g.handleRegister)
@@ -342,18 +361,23 @@ func (g *Gateway) buildMux() *http.ServeMux {
 // loaded; otherwise it selects normally and records the mapping. Affinity is a
 // preference — a gone / busy-elsewhere / model-switched sticky worker transparently
 // falls back to normal weighted routing, so stickiness never blocks a request.
-func (g *Gateway) selectWithAffinity(sessKey, requestModel string) (*worker.Worker, error) {
+func (g *Gateway) selectWithAffinity(sessKey, requestModel string, body ...[]byte) (*worker.Worker, error) {
+	var needs requestNeeds
+	if len(body) > 0 {
+		needs = needsOf(body[0])
+	}
 	if sessKey != "" {
 		if wid, ok := g.sessions.get(sessKey); ok {
 			if w, found := g.registry.Get(wid); found &&
 				(w.State == worker.StateIdle || w.State == worker.StateBusy) &&
 				!w.IsBanned() && // stickiness must not tunnel around a routing ban
-				(requestModel == "" || requestModel == "default" || modelMatches(w.LoadedModel, requestModel)) {
+				(requestModel == "" || requestModel == "default" || workerHasLoaded(w, requestModel)) &&
+				fits(w, requestModel, needs) {
 				return w, nil
 			}
 		}
 	}
-	target, err := selectWorkerForModel(g.registry, requestModel, nil, g.modelSwitchLoadFactor)
+	target, err := selectWorkerFor(g.registry, requestModel, needs, nil, g.modelSwitchLoadFactor)
 	if err != nil {
 		return nil, err
 	}
@@ -390,6 +414,7 @@ func (g *Gateway) handleProxy(w http.ResponseWriter, r *http.Request) {
 	// Generate unique request ID
 	requestID := generateRequestID()
 	w.Header().Set("X-Request-ID", requestID)
+	defer g.registry.EndSwitchBy(requestID)
 
 	// Per-key abuse controls (B5). Rate limit first (cheap, no slot held), then a
 	// concurrency slot held for the whole request via defer. A noisy key is bounded
@@ -443,6 +468,11 @@ func (g *Gateway) handleProxy(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// max_completion_tokens is the newer OpenAI spelling of max_tokens. Folded onto
+	// max_tokens here, before anything sizes the request: the balance reservation, the
+	// router's capacity estimate, stream resume and the worker all read max_tokens.
+	body = foldMaxCompletionTokens(body)
+
 	requestModel := extractModel(body)
 	// A specific model id is required: the "default" alias (and an empty/missing
 	// model) is no longer accepted for external requests, so a client always knows
@@ -453,6 +483,13 @@ func (g *Gateway) handleProxy(w http.ResponseWriter, r *http.Request) {
 	if requestModel == "" || requestModel == "default" || requestModel == "unknown" {
 		metrics.GatewayRequestsTotal.WithLabelValues("400", "none").Inc()
 		jsonError(w, "a specific model id is required (the \"default\" alias is no longer accepted); call GET /v1/models to list available models", http.StatusBadRequest)
+		return
+	}
+	// One catalog key for pricing, caps and the ledger, whatever spelling the client
+	// used; and only text/vision models on this endpoint (modelkind.go).
+	requestModel = g.canonicalCatalogModel(requestModel)
+	if !g.checkEndpointKind(w, endpointChat, requestModel) {
+		metrics.GatewayRequestsTotal.WithLabelValues("400", "none").Inc()
 		return
 	}
 	isStreaming := extractBool(body, "stream")
@@ -509,7 +546,23 @@ func (g *Gateway) handleProxy(w http.ResponseWriter, r *http.Request) {
 		// safe here: adjustBalance() reconciles to the actual usage on completion, so the
 		// only effect is erring toward rejecting an under-funded request.
 		estimatedTokens := maxTokens + estimatePromptTokens(body)
-		estimatedCostUSD = settlement.EstimateCostUSD(requestModel, estimatedTokens, g.modelPrices)
+		estimatedCostUSD = settlement.EstimateCostUSD(requestModel, estimatedTokens, g.prices.Output)
+		if !g.balanceChecker.Warm() {
+			// Balances are still loading after a restart; "insufficient" would be a lie.
+			metrics.GatewayRequestsTotal.WithLabelValues("503", "none").Inc()
+			w.Header().Set("Retry-After", "5")
+			jsonError(w, "gateway is starting (loading balances), please retry", http.StatusServiceUnavailable)
+			return
+		}
+		if !g.requestLogger.Writable() {
+			// A record that cannot be written is never billed: refuse rather than
+			// serve for free until the ledger disk has room again.
+			metrics.GatewayRequestsTotal.WithLabelValues("503", "none").Inc()
+			g.logger.Error("request refused: request ledger is not writable (disk full?)", "request_id", requestID)
+			w.Header().Set("Retry-After", "30")
+			jsonError(w, "gateway cannot record usage right now, please retry later", http.StatusServiceUnavailable)
+			return
+		}
 		if !g.balanceChecker.Reserve(keyInfo.Wallet, estimatedCostUSD) {
 			metrics.GatewayRequestsTotal.WithLabelValues("402", "none").Inc()
 			jsonError(w, "insufficient balance", http.StatusPaymentRequired)
@@ -518,14 +571,22 @@ func (g *Gateway) handleProxy(w http.ResponseWriter, r *http.Request) {
 		defer func() {
 			// settledUsage/settledModel are set by the handlers on a billable
 			// outcome; they stay zero on any failure → full reservation reversal.
-			g.adjustBalance(keyInfo.Wallet, estimatedCostUSD, settledModel, settledUsage)
+			g.adjustBalance(keyInfo.Wallet, estimatedCostUSD, settledModel, settledUsage, settledUsage.AssetQty)
 		}()
 	}
 
 	// Select a worker with model-aware routing, preferring this session's sticky
 	// worker (prefix-cache reuse) when it is still routable for the model.
 	// Priority: loaded model > supported model > any (for "default")
-	target, err := g.selectWithAffinity(sessKey, requestModel)
+	r = withNeeds(r, body)
+	// A streaming request may wait long before its first byte (queue window, model
+	// switch); keep its connection alive meanwhile (keepalive.go).
+	if isStreaming {
+		ka := newWaitKeepalive(w, g.keepaliveAfter, g.keepaliveEvery)
+		defer ka.stop()
+		w = ka
+	}
+	target, err := g.selectWithAffinity(sessKey, requestModel, body)
 	if err != nil {
 		// Only queue if workers exist but are mining/offline.
 		// If no worker supports the model at all, reject immediately.
@@ -544,7 +605,12 @@ func (g *Gateway) handleProxy(w http.ResponseWriter, r *http.Request) {
 		// yields (~35s < 60s window, request rides through transparently) while a
 		// long yield now fails fast with an honest Retry-After instead of hanging.
 		// requestTimeout remains the budget for requests that HAVE a worker.
-		target, err = g.blockForWorker(r.Context(), requestModel, time.Now().Add(g.queueTimeout))
+		// A worker that is switching to (or from, back to) this model right now will
+		// serve it once its reload finishes; that is a known, bounded wait, not an
+		// open-ended mining outage, so it gets the request budget instead of the
+		// queue window. Measured on a test worker: interleaved 32B/VL requests each waited one
+		// ~60 s reload and were turned away at exactly 60 s.
+		target, err = g.blockForWorker(r.Context(), requestModel, time.Now().Add(g.queueWindowFor(requestModel)))
 		if err != nil {
 			msg := "no available worker — all workers are mining or offline"
 			reason := "queue_timeout"
@@ -569,40 +635,11 @@ func (g *Gateway) handleProxy(w http.ResponseWriter, r *http.Request) {
 	// switches due to path format differences (e.g., "Qwen/X" vs "/models/Qwen--X").
 	// If the model is NOT loaded (intentional switch to a supported model),
 	// keep the original name so M1 performs the switch.
-	if target.LoadedModel != "" && modelMatches(target.LoadedModel, requestModel) {
-		body = rewriteModelField(body, target.LoadedModel)
+	if m, ok := loadedMatch(target, requestModel); ok {
+		body = rewriteModelField(body, m)
 	}
 
-	// Log if this routing will trigger a model switch on the worker
-	if requestModel != "" && requestModel != "default" &&
-		!modelMatches(target.LoadedModel, requestModel) {
-		reason := "no_worker_has_model_loaded"
-		if g.modelSwitchLoadFactor > 0 {
-			// Check if this was triggered by overload
-			for _, w := range g.registry.List() {
-				if modelMatches(w.LoadedModel, requestModel) &&
-					(w.State == worker.StateIdle || w.State == worker.StateBusy) {
-					reason = fmt.Sprintf("overload (active=%d, threshold=%d)",
-						w.ActiveRequests, int(float64(w.GPUCount)*g.modelSwitchLoadFactor))
-					break
-				}
-			}
-		}
-		g.logger.Info("routing will trigger model switch",
-			"request_id", requestID,
-			"worker", target.ID,
-			"requested_model", requestModel,
-			"current_model", target.LoadedModel,
-			"reason", reason,
-		)
-		// Exclude this worker from routing OTHER requests for the duration of the
-		// switch. The triggering request below still goes to it (it asked for the
-		// new model); subsequent requests skip it until it reports the target model
-		// loaded. Without this, requests routed to the reloading engine hang until
-		// they time out (the worker keeps reporting "running" during the switch, so
-		// polling alone never excludes it).
-		g.registry.MarkSwitching(target.ID, requestModel)
-	}
+	g.noteSwitch(target, requestModel, requestID)
 
 	t0 := time.Now()
 
@@ -653,11 +690,22 @@ func (g *Gateway) handleNonStreaming(w http.ResponseWriter, r *http.Request, bod
 			g.logger.Error("gateway proxy error",
 				"request_id", requestID, "worker", workerID,
 				"attempt", attempt+1, "error", err)
+			if r.Context().Err() == nil {
+				g.registry.MarkUnreachable(workerID)
+			}
 			tried[workerID] = true
-		} else if status == 503 {
-			// Worker returned 503 (mining mid-generation) — retry on another worker
-			g.logger.Warn("worker returned 503, retrying on another",
-				"request_id", requestID, "worker", workerID, "attempt", attempt+1)
+		} else if status == 503 || status == 502 || status == 504 {
+			// 503: the worker yielded to mining mid-generation. 502/504: the worker's
+			// own TLS front could not reach its inference process (it crashed or was
+			// restarted mid-request) — the worker produced nothing, so nothing is billed
+			// and the request is retried on another worker like a transport error.
+			g.logger.Warn("worker could not serve the request, retrying on another",
+				"request_id", requestID, "worker", workerID, "status", status, "attempt", attempt+1)
+			if status != 503 {
+				g.registry.MarkUnreachable(workerID) // engine down: out of routing until it polls healthy
+			} else {
+				g.registry.MarkYielding(workerID)
+			}
 			tried[workerID] = true
 		} else {
 			// Success or non-retryable error — send to client
@@ -699,6 +747,7 @@ func (g *Gateway) handleNonStreaming(w http.ResponseWriter, r *http.Request, bod
 				w.Header().Set("Content-Type", "application/json")
 			}
 			w.Header().Set("X-Request-ID", requestID)
+			respBody = normalizeErrorBody(status, respBody, w.Header())
 			w.WriteHeader(status)
 			w.Write(respBody)
 			// Retain a sampled fraction (prompt + response + claimed model + tokens) for
@@ -717,8 +766,9 @@ func (g *Gateway) handleNonStreaming(w http.ResponseWriter, r *http.Request, bod
 		}
 
 		// Try another worker that is servable right now (excluding ones we tried).
-		if next, nerr := selectWorkerForModel(g.registry, requestModel, tried, g.modelSwitchLoadFactor); nerr == nil {
+		if next, nerr := selectWorkerFor(g.registry, requestModel, needsOf(body), tried, g.modelSwitchLoadFactor); nerr == nil {
 			target = next
+			g.noteSwitch(target, requestModel, requestID)
 			continue
 		}
 		// Nothing servable at this instant. Rather than fail, wait in the queue for
@@ -737,6 +787,7 @@ func (g *Gateway) handleNonStreaming(w http.ResponseWriter, r *http.Request, bod
 		}
 		tried = make(map[string]bool) // a recovered worker is a fresh candidate
 		target = w2
+		g.noteSwitch(target, requestModel, requestID)
 	}
 
 	// Deadline reached with no servable worker
@@ -793,6 +844,20 @@ func (g *Gateway) workerStreamTransport(workerID string) http.RoundTripper {
 // g.httpClient pools connections across requests.
 func (g *Gateway) forwardRequest(ctx context.Context, path string, body []byte, target *worker.Worker, requestID string) (
 	respBody []byte, status int, header http.Header, workerID string, err error) {
+	return g.forwardRequestAs(ctx, path, body, "application/json", target, requestID)
+}
+
+// errResponseTooLarge means the worker's reply exceeded the response cap. It is an error,
+// never a truncation: a cut-off body would be billed (and hashed) as if it were the whole
+// reply, and the client would receive a corrupt file.
+var errResponseTooLarge = errors.New("worker response exceeds the gateway's response size limit")
+
+// forwardRequestAs forwards `body` VERBATIM with the given Content-Type. The bytes must
+// not be re-encoded: the worker's receipt attests sha256 of exactly what it received,
+// and the gateway checks it against what it sent. A multipart upload therefore keeps the
+// client's own Content-Type, boundary included.
+func (g *Gateway) forwardRequestAs(ctx context.Context, path string, body []byte, contentType string,
+	target *worker.Worker, requestID string) (respBody []byte, status int, header http.Header, workerID string, err error) {
 
 	workerID = target.ID
 	reqURL := strings.TrimRight(target.Endpoint, "/") + path
@@ -801,7 +866,7 @@ func (g *Gateway) forwardRequest(ctx context.Context, path string, body []byte, 
 	if err != nil {
 		return nil, 0, nil, workerID, err
 	}
-	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Content-Type", contentType)
 	req.Header.Set("X-Request-ID", requestID)
 	if target.HasFeature(worker.FeatureReceipt) {
 		req.Header.Set("X-OM-Receipt-Req", "1") // A1: ask the worker to sign a receipt
@@ -818,9 +883,16 @@ func (g *Gateway) forwardRequest(ctx context.Context, path string, body []byte, 
 	}
 	defer resp.Body.Close()
 
-	respBody, err = io.ReadAll(io.LimitReader(resp.Body, maxRequestBody))
+	limit := g.maxResponseBytes
+	if limit <= 0 {
+		limit = defaultMaxResponseBytes
+	}
+	respBody, err = io.ReadAll(io.LimitReader(resp.Body, limit+1))
 	if err != nil {
 		return nil, resp.StatusCode, resp.Header, workerID, err
+	}
+	if int64(len(respBody)) > limit {
+		return nil, resp.StatusCode, resp.Header, workerID, fmt.Errorf("%w (%d bytes)", errResponseTooLarge, limit)
 	}
 	return respBody, resp.StatusCode, resp.Header, workerID, nil
 }
@@ -830,6 +902,10 @@ func (g *Gateway) forwardRequest(ctx context.Context, path string, body []byte, 
 // ErrorHandler so the stream can be retried on another worker BEFORE any bytes reach
 // the client.
 var errWorkerMining = errors.New("worker returned 503 (mining)")
+
+// errWorkerEngineDown: the worker's TLS front answered 502/504 — its inference process
+// is not running. Retried like a transport error.
+var errWorkerEngineDown = errors.New("worker front returned 502/504 (engine down)")
 
 // handleStreaming forwards a streaming request via reverse proxy with SSE passthrough.
 // Returns (settledModel, settledTokens): the actual usage on a clean completion, or
@@ -916,8 +992,25 @@ func (g *Gateway) handleStreaming(w http.ResponseWriter, r *http.Request, body [
 				if resp.StatusCode == http.StatusServiceUnavailable {
 					return errWorkerMining // retry on another worker (nothing sent yet)
 				}
+				if resp.StatusCode == http.StatusBadGateway || resp.StatusCode == http.StatusGatewayTimeout {
+					// The worker's front could not reach its engine: nothing was sent
+					// yet, so retry on another worker (and take this one out of routing).
+					return errWorkerEngineDown
+				}
 				resp.Header.Set("X-Request-ID", requestID)
 				resp.Header.Del("Content-Length")
+				if resp.StatusCode >= 400 {
+					// A refusal (e.g. image input to a text model) is a plain JSON error,
+					// not a stream: give it the same {"error":{"message"}} shape the
+					// non-streaming path returns. Passed through raw it reached clients as
+					// the worker's {"detail": …} with an SSE [DONE] glued on — unparseable,
+					// so the web page showed only "400: {}".
+					raw, _ := io.ReadAll(io.LimitReader(resp.Body, 64<<10))
+					resp.Body.Close()
+					raw = normalizeErrorBody(resp.StatusCode, raw, resp.Header)
+					resp.Body = io.NopCloser(bytes.NewReader(raw))
+					resp.Header.Set("Content-Type", "application/json")
+				}
 				return nil
 			},
 			FlushInterval: -1,
@@ -967,9 +1060,21 @@ func (g *Gateway) handleStreaming(w http.ResponseWriter, r *http.Request, body [
 			// generation) is a SERVER-side interruption: with resume enabled the event is
 			// being held back — try to continue on another capable worker so the client
 			// never sees the break.
+			if sseCap.streamError != "" && resumeContent.Len() == 0 && totalDelivered == 0 {
+				// Interrupted before any content (the engine core died, or a yield landed,
+				// on the first step): nothing to continue, so it is a plain retry — send the
+				// ORIGINAL body to another worker. The client already has the 200 header;
+				// the next segment's frames follow it. Not a resume: the new worker's usage
+				// is exact and its receipt hashes the original body. Without this the client
+				// got a 200 whose only frame was the error event (a test worker, a 4B pool kill).
+				if next, ok := g.restartElsewhere(r, requestID, requestModel, body, tried, target, deadline, sseCap.streamError); ok {
+					target, curBody = next, body
+					continue
+				}
+			}
 			if sseCap.streamError != "" {
 				if next, nb, ok := g.tryResume(r, requestID, body, requestModel, tried, target,
-					&resumeContent, sseCap, origMaxTokens-totalDelivered, resumes, deadline); ok {
+					&resumeContent, sseCap, origMaxTokens-totalDelivered, resumes, deadline, nil); ok {
 					target, curBody = next, nb
 					resumes++
 					continue
@@ -982,13 +1087,19 @@ func (g *Gateway) handleStreaming(w http.ResponseWriter, r *http.Request, body [
 		// An error occurred. If nothing has been sent to the client yet, we can retry
 		// on a different worker; otherwise the stream is already partially delivered.
 		if !clientStarted {
+			if errors.Is(proxyErr, errWorkerMining) {
+				g.registry.MarkYielding(target.ID)
+			} else if r.Context().Err() == nil {
+				g.registry.MarkUnreachable(target.ID) // transport failure: out of routing until it polls healthy
+			}
 			tried[target.ID] = true
-			next, nerr := selectWorkerForModel(g.registry, requestModel, tried, g.modelSwitchLoadFactor)
+			next, nerr := selectWorkerFor(g.registry, requestModel, needsOf(body), tried, g.modelSwitchLoadFactor)
 			if nerr == nil {
 				g.logger.Warn("streaming worker failed before any output, retrying on another",
 					"request_id", requestID, "worker", target.ID,
 					"attempt", attempt+1, "error", proxyErr)
 				target = next
+				g.noteSwitch(target, requestModel, requestID)
 				continue
 			}
 			// None servable right now — wait in the queue for recovery (still before
@@ -999,6 +1110,7 @@ func (g *Gateway) handleStreaming(w http.ResponseWriter, r *http.Request, body [
 					"request_id", requestID, "attempt", attempt+1)
 				tried = make(map[string]bool)
 				target = w2
+				g.noteSwitch(target, requestModel, requestID)
 				continue
 			}
 			// No worker recovered before the deadline — surface a terminal error.
@@ -1059,7 +1171,7 @@ func (g *Gateway) handleStreaming(w http.ResponseWriter, r *http.Request, body [
 		// network drop) with the client still connected: same interruption class as an
 		// SSE error event, so try a transparent continuation first.
 		if next, nb, ok := g.tryResume(r, requestID, body, requestModel, tried, target,
-			&resumeContent, sseCap, origMaxTokens-totalDelivered, resumes, deadline); ok {
+			&resumeContent, sseCap, origMaxTokens-totalDelivered, resumes, deadline, proxyErr); ok {
 			target, curBody = next, nb
 			resumes++
 			continue
@@ -1094,7 +1206,7 @@ func (g *Gateway) handleStreaming(w http.ResponseWriter, r *http.Request, body [
 	// Filter mode held back the worker's [DONE] — terminate the client stream now
 	// (only when the stream ended without an unresolved interruption; the flushHeld
 	// paths above already terminated it otherwise).
-	if sseCap.streamError == "" {
+	if sseCap.streamError == "" && sseCap.statusCode < 400 {
 		sseCap.finishClean()
 	}
 
@@ -1199,10 +1311,38 @@ func (g *Gateway) handleStreaming(w http.ResponseWriter, r *http.Request, body [
 // continued on another worker (B2), and if so returns that worker plus the continuation
 // body (original request + om_continuation = delivered text + remaining max_tokens).
 // ok=false → the caller degrades to the legacy behavior (error event + [DONE]).
+// restartElsewhere picks another worker for a stream that failed before delivering any
+// content: out of routing goes the failed one (unreachable for an engine death, mining
+// for a yield), then any servable worker, waiting in the queue within the deadline.
+func (g *Gateway) restartElsewhere(r *http.Request, requestID, requestModel string, body []byte,
+	tried map[string]bool, cur *worker.Worker, deadline time.Time, streamErr string) (*worker.Worker, bool) {
+	if r.Context().Err() != nil || !time.Now().Before(deadline) {
+		return nil, false
+	}
+	tried[cur.ID] = true
+	if e := strings.ToLower(streamErr); strings.Contains(e, "paused") || strings.Contains(e, "mining") {
+		g.registry.MarkYielding(cur.ID)
+	} else {
+		g.registry.MarkUnreachable(cur.ID)
+	}
+	next, err := selectWorkerFor(g.registry, requestModel, needsOf(body), tried, g.modelSwitchLoadFactor)
+	if err != nil {
+		w2, werr := g.blockForWorker(r.Context(), requestModel, deadline)
+		if werr != nil {
+			return nil, false
+		}
+		next = w2
+	}
+	g.noteSwitch(next, requestModel, requestID)
+	g.logger.Warn("stream failed before any content, restarting on another worker",
+		"request_id", requestID, "from", cur.ID, "to", next.ID)
+	return next, true
+}
+
 func (g *Gateway) tryResume(r *http.Request, requestID string, origBody []byte,
 	requestModel string, tried map[string]bool, cur *worker.Worker,
 	content *bytes.Buffer, sseCap *sseCaptureWriter, remainingTokens, resumes int,
-	deadline time.Time) (*worker.Worker, []byte, bool) {
+	deadline time.Time, cause error) (*worker.Worker, []byte, bool) {
 
 	if !g.streamResume || resumes >= g.streamMaxResumes {
 		if g.streamResume {
@@ -1219,9 +1359,18 @@ func (g *Gateway) tryResume(r *http.Request, requestID string, origBody []byte,
 	}
 
 	tried[cur.ID] = true
+	// Take the interrupted worker out of routing now, so the continuation waits for a
+	// worker that can actually serve instead of bouncing off this one until the budget
+	// is gone: as mining after a yield (SSE "engine paused" event / 503), as unreachable
+	// after a transport failure (its process died mid-stream).
+	if cause != nil && !errors.Is(cause, errWorkerMining) {
+		g.registry.MarkUnreachable(cur.ID)
+	} else {
+		g.registry.MarkYielding(cur.ID)
+	}
 	var next *worker.Worker
 	for {
-		cand, err := selectWorkerForModel(g.registry, requestModel, tried, g.modelSwitchLoadFactor)
+		cand, err := selectWorkerFor(g.registry, requestModel, needsOf(origBody), tried, g.modelSwitchLoadFactor)
 		if err != nil {
 			// Nothing servable this instant — wait in the queue (mining is brief),
 			// bounded by the request deadline. A recovered worker without the
@@ -1243,6 +1392,7 @@ func (g *Gateway) tryResume(r *http.Request, requestID string, origBody []byte,
 		break
 	}
 
+	g.noteSwitch(next, requestModel, requestID)
 	nb := withContinuation(origBody, content.String(), remainingTokens)
 	if nb == nil {
 		metrics.GatewayStreamResumes.WithLabelValues("gave_up").Inc()
@@ -1288,6 +1438,23 @@ func (g *Gateway) retryAfterEstimate() string {
 	return strconv.FormatInt(best, 10)
 }
 
+// retryAfterFor is retryAfterEstimate narrowed to the workers that could serve model:
+// the soonest recovery among mining workers holding or supporting it, clamped to
+// [5, 120] s. Without such an estimate it falls back to the fleet-wide one.
+func (g *Gateway) retryAfterFor(model string) string {
+	if est := g.minMiningRecovery(model); est > 0 {
+		sec := int64(est.Seconds())
+		if sec < 5 {
+			sec = 5
+		}
+		if sec > 120 {
+			sec = 120
+		}
+		return strconv.FormatInt(sec, 10)
+	}
+	return g.retryAfterEstimate()
+}
+
 // ErrQueueFull is returned when the request queue has reached max_queue_size.
 var ErrQueueFull = errors.New("queue full")
 
@@ -1298,7 +1465,7 @@ func anyWorkerSupportsModel(registry *worker.Registry, model string) bool {
 		return true
 	}
 	for _, w := range registry.List() {
-		if modelMatches(w.LoadedModel, model) || workerSupportsModel(&w, model) {
+		if workerHasLoaded(&w, model) || workerSupportsModel(&w, model) {
 			return true
 		}
 	}
@@ -1336,6 +1503,31 @@ func (g *Gateway) blockForWorker(ctx context.Context, model string, deadline tim
 	return nil, ErrNoWorkerAvailable
 }
 
+// queueWindowFor is how long a request for model may wait for a worker: the queue
+// window, or the request budget while a worker serving the model is mid-switch.
+func (g *Gateway) queueWindowFor(model string) time.Duration {
+	if g.switchingTowards(model) && g.requestTimeout > g.queueTimeout {
+		return g.requestTimeout
+	}
+	return g.queueTimeout
+}
+
+// switchingTowards reports whether some worker that serves model (loaded, or listed in
+// supported_models) is in the middle of a gateway-initiated model switch — it will be
+// routable again within one reload.
+func (g *Gateway) switchingTowards(model string) bool {
+	for _, w := range g.registry.List() {
+		if w.SwitchingTo == "" {
+			continue
+		}
+		if modelMatches(w.SwitchingTo, model) || modelMatches(model, w.SwitchingTo) ||
+			workerSupportsModel(&w, model) {
+			return true
+		}
+	}
+	return false
+}
+
 // minMiningRecovery returns the smallest decayed B1 recovery estimate among
 // mining workers that could serve the model (loaded, supported, or any for "").
 // 0 means "no usable estimate" — callers must then wait rather than assume.
@@ -1347,7 +1539,7 @@ func (g *Gateway) minMiningRecovery(model string) time.Duration {
 			continue
 		}
 		if model != "" && model != "default" &&
-			!modelMatches(w.LoadedModel, model) && !workerSupportsModel(&w, model) {
+			!workerHasLoaded(&w, model) && !workerSupportsModel(&w, model) {
 			continue
 		}
 		rem := time.Duration(w.SecondsUntilChange)*time.Second - now.Sub(w.UntilChangeAt)
@@ -1397,7 +1589,7 @@ func (g *Gateway) waitForWorkerInternal(ctx context.Context, model string) (*wor
 		case <-deadline:
 			return nil, ErrNoWorkerAvailable
 		case <-ticker.C:
-			if target, err := selectWorkerForModel(g.registry, model, nil, g.modelSwitchLoadFactor); err == nil {
+			if target, err := selectWorkerFor(g.registry, model, needsFrom(ctx), nil, g.modelSwitchLoadFactor); err == nil {
 				g.logger.Info("queued request released, worker available", "worker", target.ID)
 				return target, nil
 			}
@@ -1445,10 +1637,18 @@ func (g *Gateway) handleModels(w http.ResponseWriter, r *http.Request) {
 				continue
 			}
 			seen[key] = true
+			// modality / price_unit / endpoint are additions to the OpenAI shape (clients
+			// that do not know them ignore them): they tell a client which endpoint the
+			// model is used on and what it is billed per, without a second call.
+			ck := g.canonicalCatalogModel(m)
+			mod := g.modalityOf(ck)
 			models = append(models, map[string]interface{}{
-				"id":       id,
-				"object":   "model",
-				"owned_by": "openmodel",
+				"id":         id,
+				"object":     "model",
+				"owned_by":   "openmodel",
+				"modality":   mod,
+				"price_unit": string(g.settlementCfg.UnitFor(ck)),
+				"endpoint":   endpointFor[mod],
 			})
 		}
 	}
@@ -1477,6 +1677,22 @@ type resolvedModel struct {
 	ContextWindow int
 	MaxOutput     int
 	Available     bool
+	// Modality / PriceUnit from the catalog entry with defaults applied
+	// ("text" / "token"); see settlement.ModelInfo.
+	Modality  string
+	PriceUnit settlement.PriceUnit
+	// MaxImages is the catalog's per-request image cap for vision models (0 = unset).
+	MaxImages int
+	// MaxGenImages is the catalog's per-request image cap for image-generation
+	// models (0 = unset). Separate from MaxImages: that one bounds image INPUT to
+	// a vision model, this bounds image OUTPUT from a generative one.
+	MaxGenImages int
+	// UnitUSD is the per-unit price (USD per ONE image / audio second) for models
+	// whose PriceUnit is not token; empty for token models. Shown as configured.
+	UnitUSD string
+	// MaxAudioSec / MaxChars: per-request caps for speech models (0 = unset).
+	MaxAudioSec int
+	MaxChars    int
 }
 
 // resolveModels merges the configured price/catalog keys with the models actually
@@ -1525,8 +1741,8 @@ func (g *Gateway) resolveModels() []resolvedModel {
 			// ids: everything claimed (so pricing shows even for pending models);
 			// avail: only what a request can actually route to — same caliber as
 			// the router and /v1/models (verified-gated for self-registered).
-			if wk.LoadedModel != "" {
-				ids[wk.LoadedModel] = true
+			for _, m := range loadedModels(&wk) {
+				ids[m] = true
 			}
 			for _, sm := range wk.SupportedModels {
 				ids[sm] = true
@@ -1566,9 +1782,16 @@ func (g *Gateway) resolveModels() []resolvedModel {
 		if input == "" {
 			input = priceOf(prices, id) // no explicit input price → fall back to output/base
 		}
+		unitUSD := ""
+		if !info.EffectivePriceUnit().IsToken() {
+			unitUSD = info.UnitUSD
+		}
 		out = append(out, resolvedModel{
 			ID: id, Input: input, Output: priceOf(prices, id), CacheRead: info.CacheReadUSD,
 			ContextWindow: info.ContextWindow, MaxOutput: info.MaxOutput, Available: avail[id],
+			Modality: info.EffectiveModality(), PriceUnit: info.EffectivePriceUnit(),
+			MaxImages: info.MaxImagesPerRequest, MaxGenImages: info.MaxImagesPerGeneration,
+			UnitUSD: unitUSD, MaxAudioSec: info.MaxAudioSec, MaxChars: info.MaxChars,
 		})
 	}
 	return out
@@ -1591,7 +1814,7 @@ func (g *Gateway) handleCatalog(w http.ResponseWriter, r *http.Request) {
 
 	out := []map[string]interface{}{}
 	for _, m := range g.resolveModels() {
-		out = append(out, map[string]interface{}{
+		entry := map[string]interface{}{
 			"id":                          m.ID,
 			"input_price_usd_per_1m":      m.Input,
 			"output_price_usd_per_1m":     m.Output,
@@ -1599,7 +1822,33 @@ func (g *Gateway) handleCatalog(w http.ResponseWriter, r *http.Request) {
 			"context_window":              m.ContextWindow,
 			"max_output":                  m.MaxOutput,
 			"available":                   m.Available,
-		})
+			// What the model does and what its prices are per. Text models and
+			// image-understanding (vision) models are both priced per token; vision
+			// models additionally accept image parts in chat messages.
+			"modality":   m.Modality,
+			"price_unit": m.PriceUnit,
+		}
+		if m.MaxImages > 0 {
+			entry["max_images_per_request"] = m.MaxImages
+		}
+		if m.MaxGenImages > 0 {
+			entry["max_images_per_generation"] = m.MaxGenImages
+		}
+		if m.UnitUSD != "" {
+			entry["unit_price_usd"] = m.UnitUSD
+		}
+		if m.MaxAudioSec > 0 {
+			entry["max_audio_sec"] = m.MaxAudioSec
+		}
+		if m.MaxChars > 0 {
+			entry["max_chars"] = m.MaxChars
+		}
+		if !m.PriceUnit.IsToken() {
+			// A per-unit model is never billed by tokens; showing the catalog default
+			// token price beside its unit price reads as a second, wrong price.
+			entry["input_price_usd_per_1m"], entry["output_price_usd_per_1m"], entry["cache_read_price_usd_per_1m"] = "", "", ""
+		}
+		out = append(out, entry)
 	}
 	resp := map[string]interface{}{"object": "list", "data": out}
 	// The FIL/USD rate billing currently uses — the same number settlement converts
@@ -1674,15 +1923,20 @@ func (g *Gateway) retainSample(sampled bool, requestID string, t0 time.Time, key
 // Any other formula here leaves a per-request residue that can never be drained:
 // with the flat total×output price, prompt×(output−input) accumulated per request
 // until the wallet hit its unsettled-spend cap and got 402'd (audit finding #47).
-func (g *Gateway) adjustBalance(wallet string, estimatedCostUSD *math_big.Float, model string, u tokenUsage) {
+func (g *Gateway) adjustBalance(wallet string, estimatedCostUSD *math_big.Float, model string, u tokenUsage, assetQty int) {
 	if g.balanceChecker == nil || estimatedCostUSD == nil || wallet == "" {
 		return
 	}
 	actualCostUSD := new(math_big.Float)
-	if u.TotalTokens > 0 {
+	// Price the request when it produced usage in EITHER unit family. The token test
+	// alone would read an image generation (no tokens) as "nothing to bill" and hand
+	// back the whole reservation — but the settler, which reads the record's attested
+	// quantity, would still charge for it, and the two sides would then disagree.
+	if u.TotalTokens > 0 || assetQty > 0 {
 		actualCostUSD = settlement.CostBreakdownUSD(model,
 			u.PromptTokens, u.CompletionTokens, u.CachedTokens, u.TotalTokens,
-			g.modelPrices, g.catalogInput, g.catalogCacheRead)
+			g.prices.Output, g.prices.CatalogIn, g.prices.CacheRead,
+			g.prices.UnitPrice(model), assetQty)
 	}
 	g.balanceChecker.Adjust(wallet, estimatedCostUSD, actualCostUSD)
 }
@@ -1718,6 +1972,28 @@ func hasTopLevelKey(body []byte, key string) bool {
 	}
 	_, ok := m[key]
 	return ok
+}
+
+// foldMaxCompletionTokens copies max_completion_tokens into max_tokens when the client
+// sent only the former. An explicit max_tokens always wins.
+func foldMaxCompletionTokens(body []byte) []byte {
+	if !hasTopLevelKey(body, "max_completion_tokens") || hasTopLevelKey(body, "max_tokens") {
+		return body
+	}
+	var m map[string]json.RawMessage
+	if json.Unmarshal(body, &m) != nil {
+		return body
+	}
+	v := m["max_completion_tokens"]
+	if len(v) == 0 || string(v) == "null" {
+		return body
+	}
+	m["max_tokens"] = v
+	out, err := json.Marshal(m)
+	if err != nil {
+		return body
+	}
+	return out
 }
 
 // withDefaultMaxTokens writes the gateway's default max_tokens into the upstream
@@ -1793,12 +2069,21 @@ func scanModelField(b []byte) string {
 	return string(b[start:j])
 }
 
-// tokenUsage holds parsed token counts from the response.
+// tokenUsage holds parsed usage from a response.
+//
+// It covers both unit families: token counts for a token-billed model, and AssetQty
+// for an asset-billed one (images generated, audio seconds). A given response fills one
+// or the other, never both. Keeping the asset amount here — rather than as a separate
+// return value threaded through every handler — means every existing path that already
+// carries usage carries the billable amount too.
 type tokenUsage struct {
 	PromptTokens     int
 	CompletionTokens int
 	CachedTokens     int // prompt tokens served from the prefix cache (usage.prompt_tokens_details.cached_tokens)
 	TotalTokens      int
+	// AssetQty is how many units of an asset-billed model the response reports
+	// (usage.images for image generation). Zero for a token model.
+	AssetQty int
 }
 
 // extractUsage parses usage fields from a JSON response body.
@@ -1820,16 +2105,18 @@ func extractUsage(body []byte) tokenUsage {
 		CompletionTokens: intFromJSON(usage["completion_tokens"]),
 		CachedTokens:     cached,
 		TotalTokens:      intFromJSON(usage["total_tokens"]),
+		AssetQty:         intFromJSON(usage["images"]),
 	}
 }
 
-// clampUsage bounds worker-reported token counts to the model's physical limits from
-// the catalog (context_window for input, max_output for output). A legitimate request
-// can never exceed these — the model rejects an over-length prompt and stops at
-// max_output — so clamping never under-bills real usage; it only caps a
-// misreporting/byzantine worker's ability to over-bill the client (and over-earn as
-// SP), and logs it for detection. Models with no catalog entry (and no "default") are
-// returned unchanged.
+// clampUsage bounds worker-reported usage to the model's physical limits from the
+// catalog. For a token model those limits are context_window (input) and max_output
+// (output); for an asset-billed model (image) it is the per-request image cap. A
+// legitimate request can never exceed the applicable limit — the engine rejects an
+// over-long prompt and stops at max_output, and it will not render more images than
+// asked — so clamping never under-bills real usage; it only caps a misreporting or
+// byzantine worker's ability to over-bill the client (and over-earn as SP), and logs it
+// for detection. Models with no catalog entry (and no "default") are returned unchanged.
 func (g *Gateway) clampUsage(u tokenUsage, model, requestID, workerID string) tokenUsage {
 	if g.settlementCfg == nil || g.settlementCfg.ModelCatalog == nil {
 		return u
@@ -1838,7 +2125,34 @@ func (g *Gateway) clampUsage(u tokenUsage, model, requestID, workerID string) to
 	if !ok {
 		info, ok = g.settlementCfg.ModelCatalog["default"]
 	}
-	if !ok || info.ContextWindow <= 0 {
+	if !ok {
+		return u
+	}
+
+	// Asset-billed model: each unit has its OWN cap. One shared cap (the image count)
+	// used to clamp seconds and characters too, which is either no bound at all or the
+	// wrong one. The token limits do not apply (no context_window on these models).
+	if unit := info.EffectivePriceUnit(); !unit.IsToken() {
+		var limit int
+		var key string
+		switch unit {
+		case settlement.PriceUnitImage:
+			limit, key = info.MaxImagesPerGeneration, "max_images_per_generation"
+		case settlement.PriceUnitAudioSecond:
+			limit, key = info.MaxAudioSec, "max_audio_sec"
+		case settlement.PriceUnitCharacter:
+			limit, key = info.MaxChars, "max_chars"
+		}
+		if limit > 0 && u.AssetQty > limit {
+			g.logger.Warn("worker-reported quantity exceeded the model's configured cap — clamped (possible misreporting worker)",
+				"request_id", requestID, "worker", workerID, "model", model,
+				"unit", string(unit), "reported", u.AssetQty, key, limit)
+			u.AssetQty = limit
+		}
+		return u
+	}
+
+	if info.ContextWindow <= 0 {
 		return u
 	}
 	ctxWin := info.ContextWindow
@@ -1920,10 +2234,50 @@ func extractInt(body []byte, field string) int {
 	return 0
 }
 
+// imagePromptTokenEstimate is the reservation charged per image part in a chat
+// message when estimating prompt tokens. Vision-language models tokenize an image
+// into visual tokens that ARE billed as prompt tokens (they occupy the prompt
+// budget exactly like text); measured on Qwen3-VL, visual tokens run ≈ pixels/1000
+// (512×512 ≈ 260, 1024×1024 ≈ 1030, 1 MP ≈ 1050). This is a deliberately
+// conservative reservation (over-counting is safe — the reservation reconciles
+// to the worker-reported usage after the request); the worker's real count is
+// what gets billed.
+const imagePromptTokenEstimate = 256
+
+// messageContentChars counts the text characters of one chat message `content`
+// and the number of image parts. `content` is either a plain string or the
+// OpenAI multimodal array `[{"type":"text","text":…},{"type":"image_url",…}]`
+// (vision requests). Any other shape counts as nothing.
+func messageContentChars(content interface{}) (chars, images int) {
+	switch c := content.(type) {
+	case string:
+		return len(c), 0
+	case []interface{}:
+		for _, part := range c {
+			pm, ok := part.(map[string]interface{})
+			if !ok {
+				continue
+			}
+			switch pm["type"] {
+			case "text":
+				if t, ok := pm["text"].(string); ok {
+					chars += len(t)
+				}
+			case "image_url", "image":
+				images++
+			}
+		}
+	}
+	return chars, images
+}
+
 // estimatePromptTokens makes a rough, conservative estimate of the input (prompt) token
 // count from the request body, used only to size the up-front balance reservation so a
 // large prompt with a tiny max_tokens can't slip past the gate under-reserved. It uses a
-// ~4-chars-per-token heuristic over the chat `messages[].content` (or `prompt`) text.
+// ~4-chars-per-token heuristic over the chat `messages[].content` (or `prompt`) text,
+// plus imagePromptTokenEstimate per image part (vision requests carry their image as
+// billable visual prompt tokens; the text-only heuristic would otherwise reserve
+// nothing for it and, in the stream-abort billing fallback, bill the image at zero).
 // Over-counting is safe: the reservation is reconciled to the real usage after the
 // request completes. Returns 0 on unparseable bodies (the max_tokens estimate still applies).
 func estimatePromptTokens(body []byte) int {
@@ -1931,16 +2285,16 @@ func estimatePromptTokens(body []byte) int {
 	if err := json.Unmarshal(body, &parsed); err != nil {
 		return 0
 	}
-	chars := 0
+	chars, images := 0, 0
 	if msgs, ok := parsed["messages"].([]interface{}); ok {
 		for _, m := range msgs {
 			mm, ok := m.(map[string]interface{})
 			if !ok {
 				continue
 			}
-			if c, ok := mm["content"].(string); ok {
-				chars += len(c)
-			}
+			c, i := messageContentChars(mm["content"])
+			chars += c
+			images += i
 		}
 	}
 	switch p := parsed["prompt"].(type) {
@@ -1953,7 +2307,7 @@ func estimatePromptTokens(body []byte) int {
 			}
 		}
 	}
-	return chars / 4
+	return chars/4 + images*imagePromptTokenEstimate
 }
 
 // sseCaptureWriter wraps http.ResponseWriter to pass through SSE chunks
@@ -2302,4 +2656,60 @@ func orDefault(v, def int) int {
 		return def
 	}
 	return v
+}
+
+// needsKey carries a request's requestNeeds through the queue wait (the waiting code
+// path only sees a context), so a released request is handed to a worker it fits.
+type needsKey struct{}
+
+func withNeeds(r *http.Request, body []byte) *http.Request {
+	n := needsOf(body)
+	if n.images == 0 && n.tokens == 0 {
+		return r
+	}
+	return r.WithContext(context.WithValue(r.Context(), needsKey{}, n))
+}
+
+func needsFrom(ctx context.Context) requestNeeds {
+	n, _ := ctx.Value(needsKey{}).(requestNeeds)
+	return n
+}
+
+// noteSwitch logs and marks a worker that a request is about to make switch models
+// (the requested model is supported there but not resident). Every entry point —
+// chat, image generation, speech — must call it before forwarding: without the mark
+// the worker keeps reporting "running" while it reloads, and the next requests for
+// that pool are routed onto the reloading engine and hang until they time out. The
+// image and speech entry points lacked it until model switching in those pools was
+// tested.
+func (g *Gateway) noteSwitch(target *worker.Worker, requestModel, requestID string) {
+	if requestModel != "" && requestModel != "default" &&
+		!workerHasLoaded(target, requestModel) {
+		reason := "no_worker_has_model_loaded"
+		if g.modelSwitchLoadFactor > 0 {
+			// Check if this was triggered by overload
+			for _, w := range g.registry.List() {
+				if workerHasLoaded(&w, requestModel) &&
+					(w.State == worker.StateIdle || w.State == worker.StateBusy) {
+					reason = fmt.Sprintf("overload (active=%d, threshold=%d)",
+						w.ActiveRequests, int(float64(w.GPUCount)*g.modelSwitchLoadFactor))
+					break
+				}
+			}
+		}
+		g.logger.Info("routing will trigger model switch",
+			"request_id", requestID,
+			"worker", target.ID,
+			"requested_model", requestModel,
+			"current_model", target.LoadedModel,
+			"reason", reason,
+		)
+		// Exclude this worker from routing OTHER requests for the duration of the
+		// switch. The triggering request below still goes to it (it asked for the
+		// new model); subsequent requests skip it until it reports the target model
+		// loaded. Without this, requests routed to the reloading engine hang until
+		// they time out (the worker keeps reporting "running" during the switch, so
+		// polling alone never excludes it).
+		g.registry.MarkSwitching(target.ID, requestModel, requestID)
+	}
 }

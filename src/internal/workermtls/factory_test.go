@@ -14,6 +14,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 )
@@ -185,5 +186,32 @@ func TestTransportCachedPerWorker(t *testing.T) {
 	}
 	if a1 == b {
 		t.Fatal("different workers must not share a transport (different pinned identities)")
+	}
+}
+
+// A pooled connection must not outlive the worker's certificate. TLS validates
+// only at the handshake, and polling keeps the connection busy forever, so a
+// worker refused renewal (banned) would otherwise keep serving on an expired
+// certificate — expiry is the only revocation there is.
+func TestExpiredPeerCertificateOnPooledConnectionIsRefused(t *testing.T) {
+	pki := newTestPKI(t)
+	srv := pki.workerServer(t, "sp-worker-a")
+	f, err := New(pki.caFile, pki.gatewayCertFile, pki.gatewayKeyFile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	clock := time.Now()
+	f.now = func() time.Time { return clock }
+	c := f.ClientFor("sp-worker-a", 5*time.Second, nil)
+	resp, err := c.Get(srv.URL)
+	if err != nil {
+		t.Fatalf("valid certificate must work: %v", err)
+	}
+	io.Copy(io.Discard, resp.Body)
+	resp.Body.Close() // connection returns to the pool
+
+	clock = clock.Add(2 * time.Hour) // the worker certificate (1 h) has now expired
+	if _, err := c.Get(srv.URL); err == nil || !strings.Contains(err.Error(), "expired") {
+		t.Fatalf("request over a pooled connection with an expired peer cert must fail, got %v", err)
 	}
 }

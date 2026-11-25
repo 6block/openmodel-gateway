@@ -585,13 +585,24 @@ func (sa *SettlementAPI) handleSettlementByID(w http.ResponseWriter, r *http.Req
 		"timestamp":     uint64OrZero(rec.Timestamp),
 		"processed":     processed,
 	}
-	// Batch inference stats exist on schema-3 (v1.3) contracts only; omit the keys
+	// Batch inference stats exist on schema-3 (v1.3) contracts and later; omit the keys
 	// entirely against older contracts instead of reporting a misleading 0.
 	if rec.RequestCount != nil {
 		onChain["request_count"] = uint64OrZero(rec.RequestCount)
 	}
 	if rec.TokenCount != nil {
+		// Schema 3: one token-shaped volume column.
 		onChain["token_count"] = uint64OrZero(rec.TokenCount)
+	}
+	if hasVolume(rec.VolumeByUnit) {
+		// Schema 4: volume broken out per unit, named so a reader does not have to know
+		// the index convention.
+		onChain["volume_by_unit"] = map[string]interface{}{
+			"token":        uint64OrZero(rec.VolumeByUnit[settlement.UnitToken]),
+			"image":        uint64OrZero(rec.VolumeByUnit[settlement.UnitImage]),
+			"audio_second": uint64OrZero(rec.VolumeByUnit[settlement.UnitAudioSecond]),
+			"character":    uint64OrZero(rec.VolumeByUnit[settlement.UnitCharacter]),
+		}
 	}
 	resp := map[string]interface{}{
 		"batch_id": id,
@@ -765,4 +776,15 @@ func pow10(n int) *big.Int {
 		result.Mul(result, ten)
 	}
 	return result
+}
+
+// hasVolume reports whether a getSettlement read carried the per-unit volume column
+// (schema 4). Any non-nil entry means the field was decoded.
+func hasVolume(v [settlement.UnitCount]*big.Int) bool {
+	for _, x := range v {
+		if x != nil {
+			return true
+		}
+	}
+	return false
 }

@@ -32,6 +32,10 @@ gateway:
   # rate limiting. REQUIRED when fronting the gateway with a domain proxy —
   # without it every user arriving through the proxy shares one rate bucket.
   # trusted_proxies: ["<your-proxy-ip>"]
+  # Base of the links returned for image generations with response_format "url"
+  # (served at <base>/v1/files/images/...). Unset = the Host the client called,
+  # with X-Forwarded-Proto believed from a trusted proxy.
+  # public_base_url: "https://<public-host>"
   request_timeout_sec: 300        # covers an 8-GPU model switch (~150s)
   stream_resume: true             # streamed requests carry worker-signed receipts and can resume on another worker; without it the gateway never asks the worker to sign
   queue_timeout_sec: 60
@@ -45,6 +49,7 @@ gateway:
   rate_burst_per_key: 40
   max_concurrent_per_key: 16
   max_request_bytes: 10485760      # 10 MiB
+  # max_audio_upload_bytes: 26214400 # /v1/audio/transcriptions upload cap; default 25 MiB
 
 # --- SP self-registration + certificate issuance ---
 sp_registration:
@@ -116,8 +121,8 @@ settlement:
   rpc_urls:                                                   # failover list
     - https://api.node.glif.io/rpc/v1
   chain_id: 314                                               # 314 = Filecoin mainnet
-  contract_address: "0x60D41baEaBe1ABE061AE82c44425debc35bA524A"  # OpenModelSettlement v1.3 (mainnet; batch stats, earnings freeze)
-  contract_schema: 3               # v1.3 ABI: submitSettlement carries per-item request/token stats. Use 2 only for v1.2-era contracts.
+  contract_address: "0x29b994f63D91e447945a1cDeA2776167B7415c26"   # OpenModelSettlement v1.4 (Filecoin mainnet; per-unit volume)
+  contract_schema: 4               # v1.4 ABI: submitSettlement carries per-item request count + per-unit volume. 3 = v1.3, 2 = v1.2-era contracts.
   operator_private_key: ${OPERATOR_PRIVATE_KEY}               # HOT operator key via env/KMS — NEVER inline
   confirmation_depth: 5                                       # mainnet finality / reorg safety
   # ---- cadence + timing ----
@@ -142,6 +147,19 @@ settlement:
     # model card maximum.
     "/models/Qwen--Qwen3-32B-AWQ": {input: "0.60", cache_read: "0.15", context_window: 8192, max_output: 4096}
     "/models/Qwen--Qwen3.8-27B-FP8": {input: "0.60", cache_read: "0.15", context_window: 8192, max_output: 4096}
+    # Non-text models. Every model is billed in ONE unit (price_unit, default token):
+    #   modality      text (default) | vision | image | asr | tts — also decides the endpoint
+    #   price_unit    token | image | audio_second | character
+    #   unit_usd      USD per ONE unit (one image / one second / one character);
+    #                 required for image, audio_second and character, refused for token
+    #   max_images_per_request (vision), max_images_per_generation (image),
+    #   max_audio_sec (asr, billed seconds), max_chars (tts, characters): per-request caps
+    # Pairings: image -> modality image; character -> modality tts; audio_second -> asr.
+    # Replace each <...> with your model id / price before enabling:
+    # "<vision-model-id>": {modality: vision, input: "<usd per 1M>", cache_read: "<usd per 1M>", context_window: 8192, max_output: 4096, max_images_per_request: 1}
+    # "<image-model-id>":  {modality: image, price_unit: image, unit_usd: "<usd per image>", max_images_per_generation: 2}
+    # "<asr-model-id>":    {modality: asr, price_unit: audio_second, unit_usd: "<usd per second>", max_audio_sec: 300}
+    # "<tts-model-id>":    {modality: tts, price_unit: character, unit_usd: "<usd per character>", max_chars: 4000}
   # ---- tokens ----
   supported_tokens:
     - {symbol: FIL, address: "0x0000000000000000000000000000000000000000", decimals: 18}

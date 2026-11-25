@@ -20,6 +20,7 @@ gateway:
   # rate_burst_per_key: 40        # max instantaneous burst; default = ceil(rate)
   # max_concurrent_per_key: 16    # max simultaneous in-flight requests per API key
   # max_request_bytes: 10485760   # max request body size in bytes (default 10 MiB)
+  # max_audio_upload_bytes: 26214400  # max /v1/audio/transcriptions upload in bytes (default 25 MiB)
   # stream_resume: true    # streamed requests carry signed receipts and can resume on another worker
 
 # REQUIRED when any worker registers with an https:// endpoint (self-registered
@@ -64,7 +65,7 @@ public_query:
 # sample_rate=0 disables it entirely (zero overhead).
 # Note: retained samples contain user content — assess privacy and retention
 # before enabling in production.
-# On-chain settlement (M3+). Off by default: without it the gateway is a pure
+# On-chain settlement. Off by default: without it the gateway is a pure
 # router. With it, usage is billed per request against prepaid balances in the
 # settlement contract and batched on-chain every interval_minutes.
 # settlement:
@@ -73,7 +74,7 @@ public_query:
 #     - https://rpc.ankr.com/filecoin
 #   chain_id: 314
 #   contract_address: "0x…your deployment…"    # see the openmodel-contracts repo
-#   contract_schema: 3                         # v1.3 contract (per-batch stats); 2 = v1.2
+#   contract_schema: 4                         # v1.4 contract (per-unit volume); 3 = v1.3, 2 = v1.2
 #   operator_private_key: ${OPERATOR_PRIVATE_KEY}   # hot key, submitSettlement only — via env, never inline
 #   confirmation_depth: 5
 #   interval_minutes: 20
@@ -83,12 +84,28 @@ public_query:
 #   model_catalog:                             # per-model client-facing pricing/limits
 #     default: {input: "0.20", cache_read: "0.05", context_window: 32768, max_output: 4096}
 #     "/models/Qwen--Qwen3.8-27B-FP8": {input: "0.60", cache_read: "0.15", context_window: 8192, max_output: 4096}
+#     # Every model is billed in ONE unit, set by price_unit (default token). Fields:
+#     #   modality      text (default) | vision | image | asr | tts — also decides the endpoint
+#     #   price_unit    token (default; input/cache_read/model_prices_usd are USD per 1M tokens)
+#     #                 | image | audio_second | character
+#     #   unit_usd      USD per ONE unit (one image / one second / one character);
+#     #                 required for image, audio_second and character, refused for token
+#     #   max_images_per_request     vision: image parts allowed in one chat request
+#     #   max_images_per_generation  image:  largest n per /v1/images/generations request
+#     #   max_audio_sec              asr:    longest audio per transcription, in billed seconds
+#     #   max_chars                  tts:    longest input per speech request, in characters
+#     # Pairings: image -> modality image; character -> modality tts; audio_second -> asr.
+#     # Replace each <...> with your model id / price before enabling:
+#     "<vision-model-id>": {modality: vision, input: "<usd per 1M>", cache_read: "<usd per 1M>", context_window: 8192, max_output: 4096, max_images_per_request: 1}
+#     "<image-model-id>":  {modality: image, price_unit: image, unit_usd: "<usd per image>", max_images_per_generation: 2}
+#     "<asr-model-id>":    {modality: asr, price_unit: audio_second, unit_usd: "<usd per second>", max_audio_sec: 300}
+#     "<tts-model-id>":    {modality: tts, price_unit: character, unit_usd: "<usd per character>", max_chars: 4000}
 #   supported_tokens:
 #     - {symbol: FIL, address: "0x0000000000000000000000000000000000000000", decimals: 18}
 #   sp_address_map:                            # minerID → payout EVM address (self-registered
 #     "t01234": "0x…"                          # workers override this with their signed payout)
 
-# SP self-registration (M4). Lets a miner join with one signed challenge instead
+# SP self-registration. Lets a miner join with one signed challenge instead
 # of operator-side registration; issues the worker its token and 7-day TLS cert.
 # sp_registration:
 #   enabled: true

@@ -7,7 +7,7 @@ package metrics
 import "github.com/prometheus/client_golang/prometheus"
 
 // Version labels the openmodel_agent_info metric. Overridden at build time:
-//   go build -ldflags "-X openmodel/sp-state-agent/internal/metrics.Version=v2.1.0"
+//   go build -ldflags "-X openmodel/sp-state-agent/internal/metrics.Version=v2.2.0"
 var Version = "dev"
 
 var (

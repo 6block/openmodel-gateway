@@ -371,7 +371,11 @@ func (g *Gateway) handleSPRegister(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Audit line: every admission decision must be reconstructible.
+	// Audit line: every admission decision must be reconstructible. host and
+	// client record HOW the worker reached us — the Host header distinguishes a
+	// domain front from a direct address, and client is the resolved caller
+	// (through trusted proxies) — so the inbound path is visible here instead of
+	// only in a fronting proxy's own logs.
 	g.logger.Info("sp self-registered",
 		"worker_id", req.WorkerID,
 		"miner", req.MinerID,
@@ -379,6 +383,8 @@ func (g *Gateway) handleSPRegister(w http.ResponseWriter, r *http.Request) {
 		"signer", req.Signer,
 		"endpoint", req.Endpoint,
 		"rotated", rotated,
+		"host", r.Host,
+		"client", clientIP(r),
 	)
 
 	resp := spRegisterResponse{

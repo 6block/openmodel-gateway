@@ -16,10 +16,11 @@ Endpoints used throughout (alpha):
 | | |
 |---|---|
 | API + web UI (publicly-trusted certificate) | `https://openmodel.filfox.info` |
-| Settlement contract (Filecoin mainnet) | `0x60D41baEaBe1ABE061AE82c44425debc35bA524A` |
+| Settlement contract (Filecoin mainnet) | `0x29b994f63D91e447945a1cDeA2776167B7415c26` |
 
 The web UI at the same address can do steps 1-2 interactively (connect wallet,
-register, deposit); the steps below are the API path.
+register, deposit) and offers a chat with every model kind — text, image
+understanding, image generation and speech; the steps below are the API path.
 
 ---
 
@@ -57,7 +58,7 @@ Usage is prepaid against the settlement contract. Deposit **from the same wallet
 the key is bound to**:
 
 - **From MetaMask / any EVM tool:** send FIL directly to the contract
-  (`0x60D41baEaBe1ABE061AE82c44425debc35bA524A`) — a plain transfer credits your
+  (`0x29b994f63D91e447945a1cDeA2776167B7415c26`) — a plain transfer credits your
   balance. For USDFC (`0x80B98d3aa09ffff255c3ba4A241111Ff1262F045`, 18
   decimals): `approve()` then `depositToken()`.
 - **From an exchange or Lotus wallet:** those need the f410 form of your
@@ -67,10 +68,8 @@ the key is bound to**:
 curl "https://openmodel.filfox.info/v1/f4addr?wallet=0xYOURWALLET"
 ```
 
-Deposit to **your own** f410 address first, then move funds to the contract from
-there — never deposit exchange withdrawals straight into the contract, since the
-contract credits `msg.sender`, which for an exchange withdrawal is the
-exchange's wallet, not yours.
+Deposit to your own f410 address first, then move funds to the contract from
+there.
 
 Check that the gateway sees the balance (refreshes within seconds):
 
@@ -117,10 +116,69 @@ Streaming (`"stream": true`), model routing, mining-window failover and session
 affinity all behave as documented in inference-api.md — a request that lands
 while every provider is mining queues briefly instead of failing.
 
+## Step 3b — images and speech
+
+Each entry of `/v1/models` names its `modality`, the `endpoint` that serves it
+and its billing unit (`price_unit`):
+
+| `modality` | Endpoint | Billed per (`price_unit`) |
+|---|---|---|
+| `text` | `/v1/chat/completions` | `token` |
+| `vision` | `/v1/chat/completions` with an `image_url` part in the message | `token` (images count as prompt tokens) |
+| `image` | `/v1/images/generations` | `image` delivered |
+| `asr` | `/v1/audio/transcriptions` | `audio_second` of input, rounded up |
+| `tts` | `/v1/audio/speech` | `character` of input (Unicode code points) |
+
+Pick a model by kind, then call its endpoint. A round trip through speech
+synthesis and recognition:
+
+```bash
+BASE=https://openmodel.filfox.info
+KEY=sk-om-YOURKEY
+TTS=$(curl -s "$BASE/v1/models" -H "Authorization: Bearer $KEY" \
+  | jq -r '.data[] | select(.modality=="tts") | .id' | head -1)
+ASR=$(curl -s "$BASE/v1/models" -H "Authorization: Bearer $KEY" \
+  | jq -r '.data[] | select(.modality=="asr") | .id' | head -1)
+curl -s "$BASE/v1/audio/speech" -H "Authorization: Bearer $KEY" -H "Content-Type: application/json" \
+  -d "{\"model\":\"$TTS\",\"input\":\"Hello, this is a speech test.\"}" -o hello.wav
+curl -s "$BASE/v1/audio/transcriptions" -H "Authorization: Bearer $KEY" \
+  -F model="$ASR" -F file=@hello.wav
+```
+
+And an image:
+
+```bash
+IMG=$(curl -s "$BASE/v1/models" -H "Authorization: Bearer $KEY" \
+  | jq -r '.data[] | select(.modality=="image") | .id' | head -1)
+curl -s "$BASE/v1/images/generations" -H "Authorization: Bearer $KEY" -H "Content-Type: application/json" \
+  -d "{\"model\":\"$IMG\",\"prompt\":\"a lighthouse on a cliff at dusk, watercolor\",\"size\":\"1024x1024\"}" \
+  | jq -r '.data[0].b64_json' | base64 --decode > image.png
+```
+
+Request fields, limits (image size, audio formats, text length) and an
+image-understanding example are in inference-api.md. The OpenAI SDKs work
+unchanged on every endpoint, and complete multimodal programs are in
+[`examples/`](../examples/README.md).
+
+**What it costs.** Prices are per unit and live in `GET /v1/catalog`: token
+models carry `input_price_usd_per_1m` / `output_price_usd_per_1m`, the others
+`unit_price_usd` (USD per image, per second of audio, or per character), next
+to the FIL/USD rate in `fil_price_usd`:
+
+```bash
+curl -s "$BASE/v1/catalog" -H "Authorization: Bearer $KEY" \
+  | jq '.data[] | {id, modality, price_unit, unit_price_usd, input_price_usd_per_1m, output_price_usd_per_1m}'
+```
+
+A transcription bills its audio duration rounded up to whole seconds (4.05 s
+→ 5); speech bills the characters of `input`; image generation bills the
+images actually delivered.
+
 ## Step 4 — watch usage, verify your bill
 
 `GET /v1/me` returns your balance, pending spend and the last 20 requests on the
-key. Each response also carries an `X-Request-ID`; once that request has been
+key, each with its billed amount (tokens, or `quantity` + `unit`) and
+`cost_usd`. Each response also carries an `X-Request-ID`; once that request has been
 settled on-chain, anyone can fetch its inclusion proof:
 
 ```bash
@@ -131,8 +189,9 @@ and verify it offline (worker signature → Merkle inclusion → on-chain batch)
 with `verify-receipt.py` from
 [openmodel-contracts](https://github.com/6block/openmodel-contracts). You do not
 have to trust the gateway's numbers: the contract's
-`cumulativeRequests()`/`cumulativeTokens()` and each batch's `detailsHash` are
-public, and settlement-api.md §2.2 walks the whole chain of custody.
+`cumulativeRequests()` / `cumulativeVolume(i)` (per unit: 0 token, 1 image,
+2 audio_second, 3 character) and each batch's `detailsHash` are public, and
+settlement-api.md §2.2 walks the whole chain of custody.
 
 ---
 
@@ -152,6 +211,7 @@ Integration Examples".
 |---|---|---|
 | 401 | missing/invalid key, or signature did not recover to the wallet | check the Bearer header / re-sign |
 | 400 | missing `model`, or the retired `"default"` alias | name a model from `/v1/models` |
+| 400 | model sent to the wrong endpoint, bad image `size`, audio format not accepted, unknown voice | the message says what to change; `/v1/models` lists each model's `endpoint` |
 | 402 | balance below the estimated request cost, or account suspended for debt | deposit (Step 2); check `/v1/me` |
 | 404 | named model not currently served | pick from `/v1/models` |
 | 409 | wallet already registered / key limit / signature replay | use `/v1/keys`; fetch a fresh message |
@@ -165,10 +225,10 @@ Full semantics: settlement-api.md §2.1 (limits, suspension) and inference-api.m
 
 ## Going deeper
 
-- **inference-api.md** — every endpoint, parameter, streaming, routing, failover.
+- **inference-api.md** — every endpoint (chat, vision, images, audio), parameter, streaming, routing, failover.
 - **settlement-api.md** — registration & keys, payment model, balance gate,
   receipts, settlement internals.
 - **[openmodel](https://github.com/6block/openmodel)** — run a provider yourself
-  (ONBOARDING-ALPHA.md).
+  (GETTING-STARTED-SP.md).
 - **[openmodel-contracts](https://github.com/6block/openmodel-contracts)** — the
   settlement contract, deployment records, offline bill verification.

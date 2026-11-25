@@ -28,13 +28,42 @@ type Worker struct {
 	// py-inference (INFERENCE_API_TOKEN) and go-scheduler (http_auth_token). Empty =
 	// no auth (only safe on a trusted LAN); required once worker and gateway are on
 	// different public IPs so the worker's GPU cannot be used bypassing the gateway.
-	AuthToken       string      `json:"auth_token,omitempty"`
-	State           WorkerState `json:"state"`
-	GPUState        string      `json:"gpu_state"`    // Raw GPU state from go-scheduler
-	EngineState     string      `json:"engine_state"` // Raw engine state from py-inference
-	ActiveRequests  int         `json:"active_requests"`
-	LoadedModel     string      `json:"loaded_model"`
-	SupportedModels []string    `json:"supported_models,omitempty"` // Models this worker can load
+	AuthToken      string      `json:"auth_token,omitempty"`
+	State          WorkerState `json:"state"`
+	GPUState       string      `json:"gpu_state"`    // Raw GPU state from go-scheduler
+	EngineState    string      `json:"engine_state"` // Raw engine state from py-inference
+	ActiveRequests int         `json:"active_requests"`
+	LoadedModel    string      `json:"loaded_model"`
+	// LoadedModels is every model the worker has resident RIGHT NOW. A multi-pool
+	// worker (one process, disjoint GPU sets per modality) serves several at once —
+	// text, image generation, speech — and routing must treat each as loaded.
+	// LoadedModel stays the primary one for display and older code paths; this list
+	// always contains it. Transient: refreshed from /health every poll.
+	LoadedModels    []string `json:"loaded_models,omitempty"`
+	// PoolCapacity / PoolActive: for a multi-pool worker, the GPU count and active
+	// requests of the pool serving each resident model (keyed by model path). Routing
+	// weighs a request by the pool that will serve it: a worker with 4 cards on a 32B
+	// and 1 card on a 4B is a 1-card worker for 4B traffic, not a 5-card one.
+	PoolCapacity map[string]int `json:"pool_capacity,omitempty"`
+	PoolActive   map[string]int `json:"pool_active,omitempty"`
+	// PoolNotReady lists models whose pool on this multi-pool worker is not running
+	// (still reloading after a yield, or switching). The worker as a whole reports
+	// "running" as soon as ANY pool is up — fast pools come back in seconds while a
+	// vLLM pool reloads for ~40 s — so without this a request for the reloading
+	// model was routed to it, answered 503, and (for a stream) cut off.
+	PoolNotReady map[string]bool `json:"pool_not_ready,omitempty"`
+	// ModelLimits are per-model request limits the worker reports (images per
+	// prompt, context tokens). Two workers can serve one model with different limits
+	// (a 10 GB card vs a 4-card pool); the gateway sends a request only where it fits.
+	ModelLimits map[string]ModelLimit `json:"model_limits,omitempty"`
+	// PoolGroups: per pool of a multi-pool worker, the models it holds or may switch
+	// to. A gateway-initiated switch marks only the switching pool's group
+	// unavailable (SwitchingModels) instead of the whole worker — the other pools keep
+	// serving. Seen under load on a test worker: every 32B↔VL switch (~45 s, 17 in 10 minutes)
+	// took image, speech and 4B offline too, and requests for them queued for minutes.
+	PoolGroups      [][]string `json:"pool_groups,omitempty"`
+	SwitchingModels []string   `json:"switching_models,omitempty"`
+	SupportedModels []string `json:"supported_models,omitempty"` // Models this worker can load
 	// VerifiedModels is the EVIDENCE-BACKED model list: every entry passed an
 	// admission probe on THIS worker (per-model score floor). With the probe
 	// admission gate on, routing for self-registered workers trusts only this
@@ -104,6 +133,10 @@ type Worker struct {
 	// hung/failed switch). Transient runtime state — never persisted to disk.
 	SwitchingTo    string    `json:"switching_to,omitempty"`
 	SwitchingSince time.Time `json:"switching_since,omitempty"`
+	// SwitchingBy is the request that set the mark. The worker switches inside that
+	// request, so when it completes the switch is over — succeeded, failed and rolled
+	// back, or already replaced by another one — and EndSwitchBy clears the mark.
+	SwitchingBy string `json:"-"`
 
 	// ConsecutiveFailures tracks poll failures in a row.
 	// Worker is marked offline only after >= OfflineFailureThreshold.
@@ -117,6 +150,24 @@ const FeatureContinuation = "continuation"
 // FeatureReceipt is the /health capability flag meaning the worker signs inference
 // receipts (A1) and understands the X-OM-Receipt-Req request header.
 const FeatureReceipt = "receipt"
+
+// FeatureVision is the /health capability flag meaning the LOADED model accepts image
+// parts in chat messages (image understanding). It says nothing about generating images.
+const FeatureVision = "vision"
+
+// FeatureImageGen is the /health capability flag meaning the LOADED model GENERATES
+// images. Deliberately distinct from FeatureVision: reading and producing images are
+// different capabilities, and a generator must never be routed chat-with-image traffic
+// (nor a reader routed image-generation requests).
+const FeatureImageGen = "image_gen"
+
+// FeatureASR / FeatureTTS mean the worker serves /v1/audio/transcriptions and
+// /v1/audio/speech respectively. Separate flags because a speech pool may carry only
+// one of the two models.
+const (
+	FeatureASR = "asr"
+	FeatureTTS = "tts"
+)
 
 // HasFeature reports whether the worker advertises the given capability flag.
 func (w *Worker) HasFeature(name string) bool {
@@ -250,4 +301,10 @@ func modelBasename(m string) string {
 		m = m[i+2:]
 	}
 	return m
+}
+
+// ModelLimit is one model's request limits on a worker; 0 = not reported / no limit.
+type ModelLimit struct {
+	MaxImages    int `json:"max_images_per_prompt,omitempty"`
+	ContextLimit int `json:"context_limit,omitempty"`
 }

@@ -181,3 +181,58 @@ func TestScannerResumesFromCursor(t *testing.T) {
 		t.Fatalf("expected only the new 20-token record, got %+v", records)
 	}
 }
+
+// A copied/restored data directory gives the same log a new inode. That is a
+// relocation, not a rotation: the scanner must resume from the cursor, not
+// re-read (and re-bill) the whole history.
+func TestRelocatedLogIsNotReadAsRotation(t *testing.T) {
+	sc, logPath := testScanner(t)
+	writeRecords(t, logPath, []RequestRecord{billRec("a"), billRec("b"), billRec("c")})
+	_, _, c1, _ := sc.Peek()
+	if err := sc.CommitCursor(c1); err != nil {
+		t.Fatal(err)
+	}
+	// Relocate: copy to a new file (new inode), replace the original.
+	data, _ := os.ReadFile(logPath)
+	os.Remove(logPath)
+	if err := os.WriteFile(logPath, data, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	writeRecords(t, logPath, []RequestRecord{billRec("d")})
+	recs, _, _, err := sc.Peek()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(recs) != 1 || recs[0].RequestID != "d" {
+		ids := []string{}
+		for _, r := range recs {
+			ids = append(ids, r.RequestID)
+		}
+		t.Fatalf("relocated log must resume at the cursor (only d), got %v", ids)
+	}
+}
+
+// A real rotation whose new main file happens to be longer than the old offset
+// must still be read as a rotation (different bytes → different fingerprint).
+func TestRealRotationStillDetectedWithFingerprint(t *testing.T) {
+	sc, logPath := testScanner(t)
+	writeRecords(t, logPath, []RequestRecord{billRec("a")})
+	_, _, c1, _ := sc.Peek()
+	if err := sc.CommitCursor(c1); err != nil {
+		t.Fatal(err)
+	}
+	writeRecords(t, logPath, []RequestRecord{billRec("b")}) // unsettled tail
+	rotateN(logPath, 3)
+	writeRecords(t, logPath, []RequestRecord{billRec("c"), billRec("d"), billRec("e")})
+	recs, _, _, err := sc.Peek()
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := map[string]bool{}
+	for _, r := range recs {
+		got[r.RequestID] = true
+	}
+	if len(recs) != 4 || got["a"] || !got["b"] || !got["e"] {
+		t.Fatalf("rotation must drain the .1 tail (b) and the new main (c,d,e) only, got %v", got)
+	}
+}

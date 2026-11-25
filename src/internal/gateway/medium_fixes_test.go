@@ -74,6 +74,56 @@ func TestStreaming503RetrySwitchesWorker(t *testing.T) {
 	}
 }
 
+func TestStreaming502RetrySwitchesWorker(t *testing.T) {
+	// A worker front answering 502 before any byte (its engine died) is retried too.
+	logger := discardGwLogger()
+	registry := worker.NewRegistry(logger, "")
+
+	backend503 := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusBadGateway)
+	}))
+	defer backend503.Close()
+
+	backendOK := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		fl, _ := w.(http.Flusher)
+		w.WriteHeader(200)
+		io.WriteString(w, "data: {\"choices\":[{\"delta\":{\"content\":\"from-w2\"}}]}\n\n")
+		fl.Flush()
+		io.WriteString(w, "data: {\"usage\":{\"prompt_tokens\":1,\"completion_tokens\":2,\"total_tokens\":3}}\n\n")
+		fl.Flush()
+		io.WriteString(w, "data: [DONE]\n\n")
+		fl.Flush()
+	}))
+	defer backendOK.Close()
+
+	registry.Register(worker.WorkerRegistration{ID: "w1", Endpoint: backend503.URL, SchedulerURL: "http://x:1", GPUCount: 1})
+	registry.Register(worker.WorkerRegistration{ID: "w2", Endpoint: backendOK.URL, SchedulerURL: "http://x:2", GPUCount: 1, SupportedModels: []string{"test-model"}})
+	// w1 has test-model loaded (Priority 1); w2 has a different model loaded but supports test-model (Priority 2).
+	registry.UpdateState("w1", "GPU_STATE_AVAILABLE", "running", 0, "test-model", 1)
+	registry.UpdateState("w2", "GPU_STATE_AVAILABLE", "running", 0, "other-model", 1)
+
+	gw := New(registry, config.GatewayConfig{RequestTimeoutSec: 10}, logger)
+	srv := httptest.NewServer(gw.Handler())
+	defer srv.Close()
+
+	resp, err := http.Post(srv.URL+"/v1/chat/completions", "application/json",
+		strings.NewReader(`{"model":"test-model","stream":true,"messages":[{"role":"user","content":"hi"}]}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	bodyBytes, _ := io.ReadAll(resp.Body)
+	body := string(bodyBytes)
+
+	if resp.StatusCode != 200 {
+		t.Fatalf("expected 200 after streaming retry, got %d (body=%s)", resp.StatusCode, body)
+	}
+	if !strings.Contains(body, "from-w2") {
+		t.Errorf("expected the stream to be served by w2 after w1's 503, body=%s", body)
+	}
+}
+
 // TestQueueCapIsAtomic covers the audit MEDIUM fix: max_queue_size is enforced with an
 // atomic Add-then-check, so once the queue is at capacity an additional caller is
 // rejected immediately rather than slipping past a check-then-Add race.
@@ -235,5 +285,196 @@ func TestSharedClientsInitialized(t *testing.T) {
 	}
 	if gw.streamTransport == nil {
 		t.Error("shared streamTransport must be initialized")
+	}
+}
+
+// A worker refusing a streaming request (4xx, e.g. image input to a text model)
+// must reach the client as the same JSON error the non-streaming path returns —
+// {"error":{"message":…}} — with no SSE [DONE] appended. Raw, it arrived as the
+// worker's {"detail":…} followed by "data: [DONE]", which no client could parse
+// (the web page showed "400: {}").
+func TestStreaming4xxIsAPlainJSONError(t *testing.T) {
+	for _, resume := range []bool{false, true} {
+		logger := discardGwLogger()
+		registry := worker.NewRegistry(logger, "")
+		backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusBadRequest)
+			io.WriteString(w, `{"detail":"model 'm' does not accept image input"}`)
+		}))
+		registry.Register(worker.WorkerRegistration{ID: "w1", Endpoint: backend.URL, SchedulerURL: "http://x:1", GPUCount: 1})
+		registry.UpdateState("w1", "GPU_STATE_AVAILABLE", "running", 0, "test-model", 1)
+		gw := New(registry, config.GatewayConfig{RequestTimeoutSec: 10, StreamResume: resume}, logger)
+		srv := httptest.NewServer(gw.Handler())
+
+		resp, err := http.Post(srv.URL+"/v1/chat/completions", "application/json",
+			strings.NewReader(`{"model":"test-model","stream":true,"messages":[{"role":"user","content":"hi"}]}`))
+		if err != nil {
+			t.Fatal(err)
+		}
+		raw, _ := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		srv.Close()
+		backend.Close()
+		var e struct {
+			Error struct {
+				Message string `json:"message"`
+			} `json:"error"`
+		}
+		if resp.StatusCode != 400 || json.Unmarshal(raw, &e) != nil || !strings.Contains(e.Error.Message, "does not accept image input") {
+			t.Fatalf("resume=%v: want 400 {\"error\":{\"message\":…}}, got %d %q", resume, resp.StatusCode, raw)
+		}
+	}
+}
+
+// A retry that lands on a worker which only SUPPORTS the model makes that worker switch
+// models — it must be marked switching exactly as a first attempt would be, or the next
+// requests for its pool are routed onto the reloading engine. Covered for the three
+// chat retry paths: non-streaming, streaming before any byte, and stream resume.
+func TestChatRetryOntoASwitchingWorkerMarksIt(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		stream bool
+		resume bool
+	}{{"non-streaming", false, false}, {"streaming", true, false}, {"stream resume", true, true}} {
+		t.Run(tc.name, func(t *testing.T) {
+			logger := discardGwLogger()
+			registry := worker.NewRegistry(logger, "")
+			first := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if !tc.resume {
+					w.WriteHeader(http.StatusServiceUnavailable)
+					return
+				}
+				w.Header().Set("Content-Type", "text/event-stream")
+				w.WriteHeader(200)
+				io.WriteString(w, "data: {\"choices\":[{\"delta\":{\"content\":\"part one\"}}]}\n\n")
+				io.WriteString(w, "data: {\"error\":{\"message\":\"Engine paused during generation — request aborted\",\"type\":\"server_error\"}}\n\n")
+				io.WriteString(w, "data: [DONE]\n\n")
+			}))
+			defer first.Close()
+			var duringTo string
+			second := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if w2, ok := registry.Get("w2"); ok { // observed during the switch
+					duringTo = w2.SwitchingTo
+				}
+				if !tc.stream {
+					w.Header().Set("Content-Type", "application/json")
+					io.WriteString(w, `{"choices":[{"message":{"content":"ok"}}],"usage":{"prompt_tokens":1,"completion_tokens":1,"total_tokens":2}}`)
+					return
+				}
+				w.Header().Set("Content-Type", "text/event-stream")
+				w.WriteHeader(200)
+				io.WriteString(w, "data: {\"choices\":[{\"delta\":{\"content\":\" two\"}}]}\n\n")
+				io.WriteString(w, "data: {\"usage\":{\"prompt_tokens\":1,\"completion_tokens\":2,\"total_tokens\":3}}\n\n")
+				io.WriteString(w, "data: [DONE]\n\n")
+			}))
+			defer second.Close()
+			registry.Register(worker.WorkerRegistration{ID: "w1", Endpoint: first.URL, SchedulerURL: "http://x:1", GPUCount: 1})
+			registry.Register(worker.WorkerRegistration{ID: "w2", Endpoint: second.URL, SchedulerURL: "http://x:2", GPUCount: 1,
+				SupportedModels: []string{"test-model", "other-model"}})
+			registry.UpdateState("w1", "GPU_STATE_AVAILABLE", "running", 0, "test-model", 1)
+			registry.UpdateState("w2", "GPU_STATE_AVAILABLE", "running", 0, "other-model", 1)
+			registry.SetFeatures("w1", []string{worker.FeatureContinuation}, "")
+			registry.SetFeatures("w2", []string{worker.FeatureContinuation}, "")
+
+			gw := New(registry, config.GatewayConfig{RequestTimeoutSec: 10, StreamResume: true}, logger)
+			srv := httptest.NewServer(gw.Handler())
+			defer srv.Close()
+			body := `{"model":"test-model","messages":[{"role":"user","content":"hi"}],"max_tokens":30`
+			if tc.stream {
+				body += `,"stream":true`
+			}
+			resp, err := http.Post(srv.URL+"/v1/chat/completions", "application/json", strings.NewReader(body+"}"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			out, _ := io.ReadAll(resp.Body)
+			resp.Body.Close()
+			if resp.StatusCode != 200 {
+				t.Fatalf("status %d: %s", resp.StatusCode, out)
+			}
+			if tc.resume && !strings.Contains(string(out), "two") {
+				t.Fatalf("the stream was not resumed on w2: %s", out)
+			}
+			if duringTo == "" {
+				t.Fatalf("w2 served test-model by switching to it but was not marked switching (body=%s)", out)
+			}
+			if w2, _ := registry.Get("w2"); w2.SwitchingTo != "" {
+				t.Fatalf("the mark must be cleared once the request completed, got %q", w2.SwitchingTo)
+			}
+		})
+	}
+}
+
+// The first attempt of a chat request, and a retry that had to wait in the queue for a
+// worker to come back, mark a switching worker just like an immediate retry does.
+func TestChatSwitchMarkOnFirstAttemptAndAfterQueueWait(t *testing.T) {
+	var duringTo string
+	var reg *worker.Registry
+	ok := func(stream bool) http.HandlerFunc {
+		return func(w http.ResponseWriter, r *http.Request) {
+			if w2, found := reg.Get("w2"); found { // observed during the switch
+				duringTo = w2.SwitchingTo
+			}
+			if !stream {
+				w.Header().Set("Content-Type", "application/json")
+				io.WriteString(w, `{"choices":[{"message":{"content":"ok"}}],"usage":{"prompt_tokens":1,"completion_tokens":1,"total_tokens":2}}`)
+				return
+			}
+			w.Header().Set("Content-Type", "text/event-stream")
+			io.WriteString(w, "data: {\"choices\":[{\"delta\":{\"content\":\"ok\"}}]}\n\n")
+			io.WriteString(w, "data: {\"usage\":{\"prompt_tokens\":1,\"completion_tokens\":1,\"total_tokens\":2}}\n\n")
+			io.WriteString(w, "data: [DONE]\n\n")
+		}
+	}
+	for _, tc := range []struct {
+		name         string
+		stream, wait bool
+	}{{"first attempt", false, false}, {"non-streaming after queue wait", false, true}, {"streaming after queue wait", true, true}} {
+		t.Run(tc.name, func(t *testing.T) {
+			logger := discardGwLogger()
+			registry := worker.NewRegistry(logger, "")
+			reg, duringTo = registry, ""
+			busy := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				w.WriteHeader(http.StatusServiceUnavailable)
+			}))
+			defer busy.Close()
+			second := httptest.NewServer(ok(tc.stream))
+			defer second.Close()
+			registry.Register(worker.WorkerRegistration{ID: "w2", Endpoint: second.URL, SchedulerURL: "http://x:2", GPUCount: 1,
+				SupportedModels: []string{"test-model", "other-model"}})
+			if tc.wait {
+				// w1 holds the model and yields; w2 is mining when w1 fails and comes back
+				// shortly after, so the retry reaches it only through the queue.
+				registry.Register(worker.WorkerRegistration{ID: "w1", Endpoint: busy.URL, SchedulerURL: "http://x:1", GPUCount: 1})
+				registry.UpdateState("w1", "GPU_STATE_AVAILABLE", "running", 0, "test-model", 1)
+				registry.UpdateState("w2", "GPU_STATE_WINNING_POST", "paused", 0, "other-model", 1)
+				go func() {
+					time.Sleep(300 * time.Millisecond)
+					registry.UpdateState("w2", "GPU_STATE_AVAILABLE", "running", 0, "other-model", 1)
+				}()
+			} else {
+				registry.UpdateState("w2", "GPU_STATE_AVAILABLE", "running", 0, "other-model", 1)
+			}
+			gw := New(registry, config.GatewayConfig{RequestTimeoutSec: 10, QueueTimeoutSec: 5}, logger)
+			srv := httptest.NewServer(gw.Handler())
+			defer srv.Close()
+			body := `{"model":"test-model","messages":[{"role":"user","content":"hi"}]`
+			if tc.stream {
+				body += `,"stream":true`
+			}
+			resp, err := http.Post(srv.URL+"/v1/chat/completions", "application/json", strings.NewReader(body+"}"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			out, _ := io.ReadAll(resp.Body)
+			resp.Body.Close()
+			if resp.StatusCode != 200 {
+				t.Fatalf("status %d: %s", resp.StatusCode, out)
+			}
+			if duringTo == "" {
+				t.Fatalf("w2 served test-model by switching to it but was not marked switching (body=%s)", out)
+			}
+		})
 	}
 }

@@ -22,17 +22,28 @@ import (
 
 // ReceiptInfo is a worker-signed receipt as stored in the billing ledger.
 type ReceiptInfo struct {
-	V                int    `json:"v"`
-	RequestID        string `json:"request_id"`
-	Model            string `json:"model"`
-	RequestSHA256    string `json:"request_sha256"`
-	ResponseSHA256   string `json:"response_sha256"`
-	PromptTokens     int    `json:"prompt_tokens"`
-	CompletionTokens int    `json:"completion_tokens"`
-	CachedTokens     int    `json:"cached_tokens"`
-	TS               int64  `json:"ts"`
-	Pubkey           string `json:"pubkey"`
-	Sig              string `json:"sig"`
+	V              int    `json:"v"`
+	RequestID      string `json:"request_id"`
+	Model          string `json:"model"`
+	RequestSHA256  string `json:"request_sha256"`
+	ResponseSHA256 string `json:"response_sha256"`
+	// Token-billed models (the default) fill the three token counts. Asset-billed
+	// models (image, audio_second — see settlement.PriceUnit) leave them zero and
+	// fill Quantity + AssetHash instead. Which shape applies is decided by the model's
+	// catalog unit, not by the receipt: a receipt only attests what the worker
+	// PRODUCED.
+	PromptTokens     int `json:"prompt_tokens"`
+	CompletionTokens int `json:"completion_tokens"`
+	CachedTokens     int `json:"cached_tokens"`
+	// Quantity is how much of the model's billing unit this request produced, and
+	// AssetHash is the digest of the produced bytes. Both are attested by the worker
+	// and independently re-derived by the gateway before they are billed (see
+	// verifyAssetReceipt): the signature proves the worker said it, not that it is true.
+	Quantity  int    `json:"quantity,omitempty"`
+	AssetHash string `json:"asset_hash,omitempty"`
+	TS        int64  `json:"ts"`
+	Pubkey    string `json:"pubkey"`
+	Sig       string `json:"sig"`
 	// Verified is the gateway's verdict at capture time; VerifyError says why not.
 	Verified    bool   `json:"verified"`
 	VerifyError string `json:"verify_error,omitempty"`
@@ -41,8 +52,19 @@ type ReceiptInfo struct {
 // canonicalReceiptPayload rebuilds the EXACT bytes the worker signed. Fixed field
 // order, string values individually JSON-encoded — byte-identical with py-inference
 // src/inference/receipt.py canonical_payload. Any drift breaks every receipt.
+//
+// A token model keeps the original ten-field shape. An asset-billed model (Quantity
+// set) uses the asset shape instead: it has no token counts to attest, and committing
+// zeros for them would be a fictitious measurement. Which shape applies is the
+// model's catalog unit, so the model name is enough for either side to pick it.
 func canonicalReceiptPayload(r *ReceiptInfo) []byte {
 	js := func(s string) string { b, _ := json.Marshal(s); return string(b) }
+	if r.Quantity > 0 {
+		return []byte(fmt.Sprintf(
+			`{"asset_hash":%s,"model":%s,"quantity":%d,"request_id":%s,"request_sha256":%s,"response_sha256":%s,"ts":%d,"v":1}`,
+			js(r.AssetHash), js(r.Model), r.Quantity,
+			js(r.RequestID), js(r.RequestSHA256), js(r.ResponseSHA256), r.TS))
+	}
 	return []byte(fmt.Sprintf(
 		`{"cached_tokens":%d,"completion_tokens":%d,"model":%s,"prompt_tokens":%d,"pubkey":%s,"request_id":%s,"request_sha256":%s,"response_sha256":%s,"ts":%d,"v":1}`,
 		r.CachedTokens, r.CompletionTokens, js(r.Model), r.PromptTokens, js(r.Pubkey),
@@ -66,7 +88,14 @@ func parseReceiptHeader(v string) (*ReceiptInfo, error) {
 //   - signature over the canonical payload, using the /health-advertised pubkey
 //     (NOT the receipt's embedded pubkey — a byzantine worker could self-sign);
 //   - request hash == sha256 of the body the gateway actually sent upstream;
-//   - reported tokens == the usage the gateway parsed from the response (when known).
+//   - reported tokens == the usage the gateway parsed from the response (when known);
+//   - reported quantity == the usage the gateway parsed from the response (when known).
+//
+// The last two are what stop a receipt from being taken on its word. A signature proves
+// the WORKER SAID IT; only this comparison ties the claim to the response the client
+// actually received. Fields the gateway cannot check first-hand (Model, TS) are outside
+// that boundary — the same distinction the receipt doc draws between attested and
+// verified.
 //
 // Sets Verified / VerifyError on the receipt and bumps the metric.
 func verifyReceipt(r *ReceiptInfo, expectPubkeyHex string, sentBody []byte, u tokenUsage, checkUsage bool) {
@@ -104,11 +133,20 @@ func verifyReceipt(r *ReceiptInfo, expectPubkeyHex string, sentBody []byte, u to
 			return
 		}
 	}
-	if checkUsage &&
-		(r.PromptTokens != u.PromptTokens || r.CompletionTokens != u.CompletionTokens ||
-			r.CachedTokens != u.CachedTokens) {
-		fail("receipt token counts differ from response usage")
-		return
+	if checkUsage {
+		// An asset-billed receipt (quantity present) attests a quantity; a token one
+		// attests token counts. Comparing the wrong pair would either skip the check or
+		// fail every valid receipt, so the shape decides.
+		if r.Quantity > 0 {
+			if r.Quantity != u.AssetQty {
+				fail("receipt quantity differs from response usage")
+				return
+			}
+		} else if r.PromptTokens != u.PromptTokens || r.CompletionTokens != u.CompletionTokens ||
+			r.CachedTokens != u.CachedTokens {
+			fail("receipt token counts differ from response usage")
+			return
+		}
 	}
 	r.Verified = true
 	metrics.ReceiptsTotal.WithLabelValues("verified").Inc()

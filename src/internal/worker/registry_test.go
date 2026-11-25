@@ -246,3 +246,29 @@ func TestList(t *testing.T) {
 		t.Errorf("expected 2 workers, got %d", len(workers))
 	}
 }
+
+// EndSwitchBy clears only the mark its own request set: a later request that re-marked
+// the worker (towards the same or another model) owns the mark from then on.
+func TestEndSwitchByClearsOnlyItsOwnMark(t *testing.T) {
+	r := newTestRegistry(t)
+	r.Register(WorkerRegistration{ID: "w", Endpoint: "http://x", SchedulerURL: "http://x", GPUCount: 1})
+	r.UpdateState("w", "GPU_STATE_AVAILABLE", "running", 0, "a", 1)
+	r.SetPoolGroups("w", [][]string{{"a", "b"}, {"c"}})
+
+	r.MarkSwitching("w", "b", "req-1")
+	r.MarkSwitching("w", "b", "req-2") // a second request for the same target
+	r.EndSwitchBy("req-1")
+	if w, _ := r.Get("w"); w.SwitchingTo != "b" {
+		t.Fatalf("req-1 completing must not clear the mark req-2 now holds, got %q", w.SwitchingTo)
+	}
+	r.EndSwitchBy("req-2")
+	if w, _ := r.Get("w"); w.SwitchingTo != "" || len(w.SwitchingModels) != 0 {
+		t.Fatalf("the owner completing clears the mark, got %q %v", w.SwitchingTo, w.SwitchingModels)
+	}
+
+	r.MarkSwitching("w", "b") // no owner (older callers): only the poll or the timeout clears it
+	r.EndSwitchBy("")
+	if w, _ := r.Get("w"); w.SwitchingTo != "b" {
+		t.Fatalf("an unowned mark is left for the poll, got %q", w.SwitchingTo)
+	}
+}

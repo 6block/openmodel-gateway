@@ -8,11 +8,12 @@ can be run against:
 | | |
 |---|---|
 | API + registration + web UI + public queries | `https://openmodel.filfox.info` |
-| Settlement contract (Filecoin mainnet) | `0x60D41baEaBe1ABE061AE82c44425debc35bA524A` |
+| Settlement contract v1.4 (Filecoin mainnet) | `0x29b994f63D91e447945a1cDeA2776167B7415c26` |
+| Settlement contract v1.4 (Filecoin Calibration testnet) | `0x8Fd8478dfdb3B86F8536AAEd2448A94cb04fC992` |
 
 One origin behind a publicly-trusted certificate.
 
-For the inference API (`/v1/chat/completions`, streaming, model routing) see **inference-api.md**. The settlement layer adds new client-facing behaviors on that same endpoint — per-key rate/concurrency limits (**429**), a request-body cap (**413**), a debt-suspension path (**402 "account suspended"**), and a graceful-drain rejection (**503** on shutdown) — documented in §2.1 below. Beyond those, this document covers: **self-service registration (getting an API key)**, the **balance gate**, the **settlement Admin API**, and the **`settlement-cli`** tool.
+For the inference API (`/v1/chat/completions`, `/v1/images/generations`, `/v1/audio/transcriptions`, `/v1/audio/speech`, streaming, model routing) see **inference-api.md**. The settlement layer adds new client-facing behaviors on those endpoints — per-key rate/concurrency limits (**429**), a request-body cap (**413**), a debt-suspension path (**402 "account suspended"**), and a graceful-drain rejection (**503** on shutdown) — documented in §2.1 below. Beyond those, this document covers: **self-service registration (getting an API key)**, the **balance gate**, the **settlement Admin API**, and the **`settlement-cli`** tool.
 
 ---
 
@@ -149,6 +150,26 @@ Authorization: Bearer sk-om-…
 valuation the 402 gate uses — if it is positive, a request will pass the balance
 gate.
 
+Each `recent_usage` entry has `ts`, `model`, `status`, `request_id`, and the
+billed amount in the model's unit: `prompt_tokens` / `completion_tokens` for a
+token-billed request, or `quantity` + `unit` (`image`, `audio_second`,
+`character`) for the others; `cost_usd` is the charge computed with the same
+formula settlement uses (omitted for requests that cost nothing, such as
+rejected ones):
+
+```json
+[
+  {"ts": "2026-11-17T03:43:46.61858282Z", "model": "/models/Systran--faster-whisper-small",
+   "status": 200, "prompt_tokens": 0, "completion_tokens": 0,
+   "quantity": 5, "unit": "audio_second", "cost_usd": "0.00015000", "request_id": "req-259befba9f07cd6a"},
+  {"ts": "2026-11-17T03:43:39.713578594Z", "model": "/models/Qwen--Qwen3-VL-8B-Instruct",
+   "status": 200, "prompt_tokens": 83, "completion_tokens": 2,
+   "cost_usd": "0.00002610", "request_id": "req-697076aca990c1b2"}
+]
+```
+
+Image-generation entries additionally carry `images` (equal to `quantity`).
+
 ### Helper: GET /v1/f4addr
 
 Deposits from exchanges or Lotus wallets need the **f410** form of your EVM
@@ -177,13 +198,22 @@ deposit (on-chain)  →  balance gate (per request)  →  batched settlement (on
   (`0x80B98d3aa09ffff255c3ba4A241111Ff1262F045`, **18 decimals** — not 6).
   Sending from an exchange or a Lotus wallet? Use the **f410** form of your
   address as the target (`GET /v1/f4addr`, see above).
-- **Balance gate** — on every billable request the gateway reserves the estimated cost (`max_tokens × model price`) against `available = on-chain balance − pendingSpend`. Insufficient funds → **HTTP 402**. After the request, the reservation is reconciled to the actual token usage (failed / interrupted requests are not billed).
+- **Balance gate** — on every billable request the gateway reserves the estimated cost against `available = on-chain balance − pendingSpend` (token models: from `max_tokens` × model price; image generation: `n × unit price`; transcription and speech: the exact quantity, which the gateway measures from the request before serving it). Insufficient funds → **HTTP 402**. After the request, the reservation is reconciled to the actual usage (failed / interrupted requests are not billed).
 - **Deduction priority** — when a wallet holds both tokens, settlement draws
   **USDFC first, then FIL** (`deduction_priority`): a user who deposited a
   stablecoin bought price stability on purpose, and the FIL balance is kept as
   the buffer against FIL/USD movement.
-- **Settlement** — every `interval_minutes`, the engine groups billable requests per `(wallet, SP, token)`, converts USD → token amount (stablecoin at par, FIL at the current FIL/USD rate), and submits batches to the contract. Each batch is written to a WAL before submission and recognized on-chain by its `detailsHash` — so if the process crashes and retries, the same batch can never be charged twice. Since contract v1.3 each batch also records how many requests and prompt+completion tokens it covers; the contract's `cumulativeRequests()` / `cumulativeTokens()` expose all-time network volume in one call (see the [openmodel-contracts](https://github.com/6block/openmodel-contracts) README).
-- **Pricing** — `model_prices_usd` is **USD per 1,000,000 tokens** per model (with a `default`). The FIL/USD rate is `manual` or `auto` (CoinGecko → Binance fallback).
+- **Settlement** — every `interval_minutes`, the engine groups billable requests per `(wallet, SP, token)`, converts USD → token amount (stablecoin at par, FIL at the current FIL/USD rate), and submits batches to the contract. Each batch is written to a WAL before submission and recognized on-chain by its `detailsHash` — so if the process crashes and retries, the same batch can never be charged twice. Each item of a batch carries its request count and a four-entry **volume vector** (`uint256[4]`: token / image / audio_second / character); the contract records per-batch `volumeByUnit` (emitted in `SettlementExecuted`) and keeps all-time totals in `cumulativeRequests()` and `cumulativeVolume(i)` for `i` = 0 token, 1 image, 2 audio_second, 3 character (see the [openmodel-contracts](https://github.com/6block/openmodel-contracts) README).
+- **Pricing** — every model is billed in exactly one unit, set by its `price_unit` in `model_catalog`:
+
+  | `price_unit` | Price field | Quantity |
+  |---|---|---|
+  | `token` (default) | `model_prices_usd` (output/base) + `model_catalog` `input` / `cache_read`, **USD per 1,000,000 tokens** | prompt + completion tokens (vision images are visual prompt tokens) |
+  | `image` | `model_catalog` `unit_usd`, USD per image | images delivered |
+  | `audio_second` | `unit_usd`, USD per second | input audio duration rounded up to whole seconds, minimum 1 |
+  | `character` | `unit_usd`, USD per character | Unicode code points of the speech input |
+
+  Cost = quantity × unit price for the non-token units. The FIL/USD rate is `manual` or `auto` (CoinGecko → Binance fallback). Clients read the live prices from `GET /v1/catalog` (§2.3).
 
 Settlement is off by default (`settlement.enabled: false`); when off, the gateway behaves as a pure routing gateway.
 
@@ -191,7 +221,7 @@ Settlement is off by default (`settlement.enabled: false`); when off, the gatewa
 
 ## 2. Balance gate (on the inference endpoint)
 
-When settlement is enabled and the API key is bound to a `wallet`, `POST /v1/chat/completions` (and `/v1/completions`) enforce a balance check **before** routing:
+When settlement is enabled and the API key is bound to a `wallet`, `POST /v1/chat/completions` (and `/v1/completions`), `/v1/images/generations`, `/v1/audio/transcriptions` and `/v1/audio/speech` enforce a balance check **before** routing:
 
 ```json
 {
@@ -208,7 +238,10 @@ Billing rules:
 
 | Outcome | Billed |
 |---|---|
-| Success (200) | actual `usage.total_tokens` |
+| Success (200), token model | actual `usage.total_tokens` |
+| Success (200), image generation | images delivered (`usage.images`) — fewer than `n` delivered means fewer billed |
+| Success (200), transcription | `ceil(duration)` seconds of the uploaded audio, minimum 1 (`usage.seconds`) |
+| Success (200), speech | characters (Unicode code points) of `input` |
 | Retried then succeeded | actual usage, once |
 | All retries failed (503) | **not billed** (reservation reversed) |
 | Stream interrupted by mining → **transparently resumed** | billed by the **gateway's own count of delivered tokens** (the re-fed prefix of a continuation segment is never double-billed) |
@@ -227,7 +260,7 @@ A request without a valid Bearer token returns **401**; an API key with no `wall
 
 ### 2.1 Error codes & request limits (inference endpoint)
 
-The settlement layer adds the following client-facing responses on `/v1/chat/completions` and `/v1/completions`, on top of the base inference error surface (see inference-api.md). All are config-gated and (except the suspension 402) only occur when the operator has enabled the corresponding control.
+The settlement layer adds the following client-facing responses on `/v1/chat/completions` and `/v1/completions` — and the same ones on the image and audio endpoints — on top of the base inference error surface (see inference-api.md). All are config-gated and (except the suspension 402) only occur when the operator has enabled the corresponding control.
 
 | Status | Condition | Body `error.message` contains | Headers |
 |---|---|---|---|
@@ -235,12 +268,13 @@ The settlement layer adds the following client-facing responses on `/v1/chat/com
 | 400 | Body carries the reserved internal field `om_continuation` (gateway-internal) | `om_continuation is a reserved internal field` | — |
 | 402 | Insufficient prepaid balance | `insufficient balance` | — |
 | 402 | **Account suspended for unpaid debt** | `account suspended` | — |
-| 413 | Request body exceeds `max_request_bytes` | `request body exceeds limit of N bytes` | — |
+| 413 | Request body exceeds `max_request_bytes` (transcription uploads: `max_audio_upload_bytes`, default 25 MiB) | `request body exceeds limit of N bytes` | — |
 | Missing `model`, or the retired `"default"` alias | 400 — name a model from `GET /v1/models` |
 | 429 | Per-key request rate exceeded | `rate limit exceeded for this API key` | `Retry-After: 1` |
 | 429 | Per-key concurrency limit reached | `too many concurrent requests for this API key` | `Retry-After: 1` |
 | 503 | Gateway draining (graceful shutdown) | `server is shutting down, please retry` | `Retry-After: 5` |
 | 503 | All workers mining and queue timed out / full | `all workers are mining/offline` | `Retry-After: <honest resume estimate>` (smallest mining worker's estimate, clamped [5,120]; fixed 30 when no estimate) |
+| 503 | Image / audio endpoint: no worker serving the model available in the queue window | `no worker available for this model` | `Retry-After`: soonest recovery estimate among the workers holding or supporting that model, clamped [5,120] |
 
 Notes:
 - **Two distinct 402s.** The original `insufficient balance` means the prepaid balance can't cover this request's estimate. `account suspended` is the debt-suspension path: a wallet whose carried (under-funded) debt has reached `debt_suspend_usd` is refused all requests until the next settlement collects the debt after a top-up. A client should treat the latter as "top up, then wait one settlement cycle", not "retry now".
@@ -252,13 +286,30 @@ Notes:
 ### 2.2 Verifiable billing: signed receipts (client-facing)
 
 Every successful inference response carries an **ed25519 receipt signed by the worker
-(SP)** binding the request hash / response hash / token triple / model under the SP's own
+(SP)** binding the request hash / response hash / billed amount / model under the SP's own
 signature — the SP cannot later deny the usage it reported. How clients obtain it:
 
 | Request type | Receipt location |
 |---|---|
-| Non-streaming | Response header `X-Om-Receipt` (base64 JSON with `v`, `request_id`, `model`, `request_sha256`, `response_sha256`, `prompt_tokens`, `completion_tokens`, `cached_tokens`, `ts`, `pubkey`, `sig`) |
+| Non-streaming chat, image generation, transcription, speech | Response header `X-Om-Receipt` (base64 JSON with `v`, `request_id`, `model`, `request_sha256`, `response_sha256`, `prompt_tokens`, `completion_tokens`, `cached_tokens`, `ts`, `pubkey`, `sig`; asset-billed requests add `quantity` and `asset_hash`) |
 | Streaming | **Not delivered by default** (strict SSE parsers are unaffected); send **`X-OM-Receipt-Req: 1`** and the gateway forwards one `data: {"om_receipt": {...}}` event before `[DONE]` |
+
+A receipt has one of two shapes, decided by the model's billing unit:
+
+- **Token shape** (`text`, `vision` models). The signature covers the canonical JSON
+  `{"cached_tokens","completion_tokens","model","prompt_tokens","pubkey","request_id","request_sha256","response_sha256","ts","v"}`.
+- **Asset shape** (`image`, `audio_second`, `character` models). `quantity` is the billed
+  quantity in the model's unit; `asset_hash` is the sha256 of the asset — the delivered PNG
+  bytes (several images concatenated in response order), the delivered WAV for speech, or
+  the uploaded audio file for a transcription; `response_sha256` carries the same digest
+  and the token counts are 0. The signature covers
+  `{"asset_hash","model","quantity","request_id","request_sha256","response_sha256","ts","v"}`.
+
+For asset-billed requests the gateway measures the quantity and the asset digest itself
+(image count and PNG bytes from the response, audio duration and digest from the upload,
+character count from the request, WAV digest from the response) and marks a receipt that
+disagrees as invalid. A client can recompute `asset_hash` from the file it received
+(inference-api.md, "Receipts").
 
 With the `request_id` from the receipt, the charge can be **audited offline,
 independently of the gateway**:
@@ -274,7 +325,13 @@ python3 verify-receipt.py http://<host>:3001 <request_id> \
 ```
 
 How it works: each settlement batch commits `detailsHash = sha256(legacy batch hash ‖
-MerkleRoot(per-request leaves))` on-chain; every request is one leaf. `receipt-proof`
+MerkleRoot(per-request leaves))` on-chain; every request is one leaf. A token-billed
+request's leaf is
+`{"cached_tokens","completion_tokens","model","prompt_tokens","request_id","sig","sp","wallet"}`;
+an asset-billed request's leaf is
+`{"asset_hash","model","price_unit","quantity","request_id","sig","sp","wallet"}` (keys in
+this order, compact JSON), and its `receipt-proof` response carries `price_unit` at the top
+level so a verifier can rebuild the leaf bytes. `verify-receipt.py` handles both shapes. `receipt-proof`
 returns the leaf, the inclusion proof and the batch's on-chain identity, so anyone can
 verify "this request entered that on-chain settlement at exactly the usage the SP
 signed". Note: **the proof only becomes available once the request has settled on-chain
@@ -296,12 +353,20 @@ curl http://<host>:3000/v1/catalog -H "Authorization: Bearer $KEY"
 ```
 
 Returns `{"object":"list","data":[...]}` with per model: `id`, `available` (loaded /
-supported by a currently routable worker), `input_price_usd_per_1m` (falls back to the
-output price when no explicit input price), `output_price_usd_per_1m` (from
-`model_prices_usd`), `cache_read_price_usd_per_1m`, `context_window`, `max_output` (the
-latter three from `model_catalog`). Models with a catalog entry are billed with the
-**input / output / cache-hit three-way split**; others bill flat `total_tokens × output
-price`.
+supported by a currently routable worker), `modality` (`text`, `vision`, `image`, `asr`,
+`tts`), `price_unit` (`token`, `image`, `audio_second`, `character`),
+`input_price_usd_per_1m` (falls back to the output price when no explicit input price),
+`output_price_usd_per_1m` (from `model_prices_usd`), `cache_read_price_usd_per_1m`,
+`context_window`, `max_output` (the latter three from `model_catalog`). Token models with a
+catalog entry are billed with the **input / output / cache-hit three-way split**; others
+bill flat `total_tokens × output price`.
+
+Models billed in another unit carry `unit_price_usd` (USD per image, per second of audio,
+or per character) and their per-request limit — `max_images_per_generation` (`image`),
+`max_audio_sec` (`asr`), `max_chars` (`tts`); their three token-price fields are empty
+strings and `context_window` / `max_output` are 0. A `vision` model may carry
+`max_images_per_request`. Field-by-field reference and examples: inference-api.md, "Prices
+and limits: GET /v1/catalog".
 
 The response also carries a top-level **`fil_price_usd`** — the FIL/USD rate billing
 currently uses (the same number settlement converts with), so you can translate the USD
@@ -354,7 +419,9 @@ curl http://<host>:9091/api/v1/settlements/3 \
     "settled_count": 3,
     "failed_count": 0,
     "timestamp": 1717329600,
-    "processed": true
+    "processed": true,
+    "request_count": 42,
+    "volume_by_unit": {"token": 18250, "image": 3, "audio_second": 65, "character": 412}
   },
   "local_audit": {
     "found": true,
@@ -366,6 +433,10 @@ curl http://<host>:9091/api/v1/settlements/3 \
 }
 ```
 
+- `request_count` and `volume_by_unit` are the batch's on-chain inference stats: how many
+  requests it settled and how much of each unit they consumed (`token`, `image`,
+  `audio_second`, `character`). Against a `contract_schema: 3` contract the response has
+  `request_count` and a single `token_count` instead; against older contracts neither.
 - `on_chain` is read directly from the contract (`getSettlement(batchId)` + `processedBatches(detailsHash)`). `total_amount` is in the token's smallest unit (string, to avoid precision loss); `settled_count` / `failed_count` reflect partial-settlement skips.
 - `local_audit` is the matching entry from the operator's local settlement log (`tx_hash`, `block_number`, `gas_used`, `item_count`). `found: false` means the on-chain batch has **no local audit record** — an audit-log gap worth investigating.
 - The `local_audit` object is omitted entirely if the settlement engine is not attached.
@@ -513,6 +584,9 @@ curl "http://<host>:9091/api/v1/sp-earnings-detail/0x3C44...?since=1782700000&li
 }
 ```
 
+- Items for image, transcription and speech requests show `0` in the token fields; their
+  `earning_usd` is computed from the request's quantity and unit price. The quantity
+  itself is in the request's `receipt-proof` record.
 - `total_earning_usd` = `settled_earning_usd` + `pending_earning_usd` (both page-scoped, see above). Per-item `earning_usd` stays consistent with the chain: **summing any page's settled items equals what those requests credited the SP on-chain** (within rounding) — that's the cross-check an SP uses to trust the numbers; for all-time reconciliation compare `/api/v1/revenue/:sp` against on-chain `spEarnings`.
 
 #### Public read-only query port (SP self-service)
@@ -541,13 +615,35 @@ identities): providers with settled revenue, models currently servable, active
 developers (distinct wallets with ≥ 10 successful billable requests in the
 trailing 90 days — the rule ships in the response as
 `active_developers_min_requests` / `active_developers_window_days`), plus a
-mirror of the contract's cumulative request/token counters (the contract stays
-authoritative). These routes are also mounted on the HTTPS web-UI listener, so
-`https://<host>:18020/api/v1/network-stats` serves the same data.
+mirror of the contract's cumulative counters (the contract stays
+authoritative). These routes are also mounted on the HTTPS web-UI listener
+(`sp_registration.https_port`), so the same path serves the same data there.
 
 ```bash
 curl "http://<host>:3001/api/v1/network-stats"
 ```
+
+Against a v1.4 contract the on-chain mirror reports volume per unit:
+
+```json
+{
+  "as_of": "2026-11-17T04:00:00Z",
+  "providers_with_revenue": 2,
+  "models_available": 8,
+  "active_developers": 12,
+  "active_developers_as_of": "2026-11-17T03:55:00Z",
+  "active_developers_window_days": 90,
+  "active_developers_min_requests": 10,
+  "onchain": {
+    "cumulative_requests": 51234,
+    "cumulative_volume": {"token": 20345678, "image": 412, "audio_second": 9310, "character": 77120},
+    "note": "mirrored from the settlement contract; read it directly to verify"
+  }
+}
+```
+
+Against a v1.3 contract `onchain` has `cumulative_tokens` instead of
+`cumulative_volume`.
 
 Config (`sp-state-agent.yaml`):
 
@@ -632,7 +728,7 @@ settlement:
                                      # endpoint is shown by GET /api/v1/operator-balance.
   chain_id: 314159
   contract_address: "0x..."
-  contract_schema: 3            # v1.3 contract (per-batch stats); 2 = v1.2
+  contract_schema: 4            # v1.4 contract (per-unit volume); 3 = v1.3, 2 = v1.2
   operator_private_key: ${OPERATOR_PRIVATE_KEY}
   interval_minutes: 20        # keep well below the contract's refundDelaySec (see contract-design.md)
   max_batch_size: 50
@@ -646,6 +742,11 @@ settlement:
   model_catalog:                    # optional: per-model input/cache-read split pricing + catalog metadata
     "Qwen/Qwen3-4B-Instruct-2507": { input: "0.20", cache_read: "0.05", context_window: 32768, max_output: 4096 }
     # models with a catalog entry bill input/output/cache-hit; others bill total×output (backward compatible)
+    # Non-text models — modality + price_unit + unit_usd (USD per ONE unit, required for non-token units):
+    # "<vision-model-id>": { modality: vision, input: "<usd/1M>", cache_read: "<usd/1M>", context_window: 8192, max_output: 4096, max_images_per_request: 1 }
+    # "<image-model-id>":  { modality: image, price_unit: image,        unit_usd: "<usd per image>",  max_images_per_generation: 2 }
+    # "<asr-model-id>":    { modality: asr,   price_unit: audio_second, unit_usd: "<usd per second>", max_audio_sec: 300 }
+    # "<tts-model-id>":    { modality: tts,   price_unit: character,    unit_usd: "<usd per char>",   max_chars: 4000 }
   # stablecoin depeg protection (optional; unset = stablecoin pinned at $1)
   stablecoin_symbol: USDFC
   stablecoin_price_sources: [coingecko, binance]   # empty = not monitored
@@ -676,6 +777,7 @@ gateway:
   rate_burst_per_key: 0         # token-bucket burst; 0 = ceil(rate) or 1
   max_concurrent_per_key: 0     # max in-flight requests per API key → 429
   max_request_bytes: 0          # max request body size in bytes; 0 = default 10 MiB → 413
+  max_audio_upload_bytes: 0     # max transcription upload in bytes; 0 = default 25 MiB → 413
   stream_resume: true           # transparently continue mining-interrupted streams on another worker (default false)
 
 # SP fraud-detection sampling (optional; unset = off, zero cost)

@@ -36,6 +36,10 @@ mkdir -p "$pre"
 for f in "$DATA_DIR"/settlement-cursor.json "$DATA_DIR"/settled-total.json \
          "$DATA_DIR"/settlement-debt.json "$DATA_DIR"/pending-settlement.json \
          "$DATA_DIR"/settlement-deadletter.jsonl "$DATA_DIR"/settlements.jsonl \
+         "$DATA_DIR"/settlement-items.jsonl "$DATA_DIR"/merkle-batches.jsonl \
+         "$DATA_DIR"/receipt-records.jsonl "$DATA_DIR"/receipt-index.jsonl \
+         "$DATA_DIR"/reconcile-cursor.json "$DATA_DIR"/reconcile-state.json \
+         "$DATA_DIR"/registrations.json \
          "$DATA_DIR"/workers.json "$DATA_DIR"/requests.jsonl*; do
   [ -e "$f" ] && cp -a "$f" "$pre/" || true
 done

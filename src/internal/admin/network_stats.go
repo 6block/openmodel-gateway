@@ -16,6 +16,14 @@ type cumulativeStatsReader interface {
 	CumulativeStats(ctx context.Context) (requests, tokens uint64, err error)
 }
 
+// unitVolumeReader is the OPTIONAL schema-4 addition: the per-unit volume breakdown.
+// A separate interface (not a method folded into cumulativeStatsReader) so a mock or a
+// schema-3 deployment that cannot answer it still reports the counters it does have,
+// instead of the whole block silently vanishing.
+type unitVolumeReader interface {
+	CumulativeVolumeByUnit(ctx context.Context) ([]uint64, error)
+}
+
 // NetworkStatsDeps supplies the two figures the settlement layer cannot derive on
 // its own. Both are optional: a nil function omits its field rather than
 // reporting zero, so "not wired up" never reads as "none".
@@ -93,7 +101,24 @@ func (sa *SettlementAPI) handleNetworkStats(w http.ResponseWriter, r *http.Reque
 	if csr, ok := sa.contract.(cumulativeStatsReader); ok {
 		if reqs, toks, err := csr.CumulativeStats(ctx); err == nil {
 			onchain["cumulative_requests"] = reqs
-			onchain["cumulative_tokens"] = toks
+			// On a v1.4 contract `toks` is the sum across every unit, so it is NOT a
+			// token count; publishing it under the token name would mislabel it. Ask
+			// for the per-unit breakdown when the deployment has one.
+			if uvr, ok := sa.contract.(unitVolumeReader); ok {
+				if byUnit, verr := uvr.CumulativeVolumeByUnit(ctx); verr == nil && len(byUnit) >= settlement.UnitCount {
+					onchain["cumulative_volume"] = map[string]interface{}{
+						"token":        byUnit[settlement.UnitToken],
+						"image":        byUnit[settlement.UnitImage],
+						"audio_second": byUnit[settlement.UnitAudioSecond],
+						"character":    byUnit[settlement.UnitCharacter],
+					}
+				} else {
+					onchain["cumulative_tokens"] = toks
+				}
+			} else {
+				// Pre-v1.4: a single token-shaped column, correctly named.
+				onchain["cumulative_tokens"] = toks
+			}
 		} else {
 			sa.logger.Warn("cumulative stats unavailable", "error", err)
 		}

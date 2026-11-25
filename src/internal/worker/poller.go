@@ -138,7 +138,7 @@ func (p *Poller) pollWorker(ctx context.Context, w Worker) {
 	}
 
 	t1 := time.Now()
-	engineState, activeRequests, loadedModel, engineCount, features, receiptPubkey, err := p.fetchInferenceHealth(ctx, w.ID, w.Endpoint, w.AuthToken)
+	engineState, activeRequests, loadedModel, engineCount, features, receiptPubkey, loadedModels, mgpu, err := p.fetchInferenceHealth(ctx, w.ID, w.Endpoint, w.AuthToken)
 	metrics.PollDuration.WithLabelValues("py-inference").Observe(time.Since(t1).Seconds())
 	if err != nil {
 		metrics.PollTotal.WithLabelValues("error").Inc()
@@ -157,6 +157,12 @@ func (p *Poller) pollWorker(ctx context.Context, w Worker) {
 	oldState, newState, changed := p.registry.UpdateState(
 		w.ID, gpuState, engineState, activeRequests, loadedModel, engineCount,
 	)
+	// After UpdateState so the primary model it just recorded is folded in.
+	p.registry.SetLoadedModels(w.ID, loadedModels)
+	capacity, active, notReady := poolMaps(mgpu)
+	p.registry.SetPools(w.ID, capacity, active, notReady)
+	p.registry.SetPoolGroups(w.ID, poolGroups(mgpu))
+	p.registry.SetModelLimits(w.ID, modelLimits(mgpu, loadedModel))
 	if changed {
 		p.logger.Info("worker state changed",
 			"worker", w.ID,
@@ -263,11 +269,17 @@ func (p *Poller) fetchGPUState(ctx context.Context, workerID, schedulerURL, toke
 
 // inferenceHealthResponse is the JSON response from py-inference /health.
 type inferenceHealthResponse struct {
-	Status         string        `json:"status"`
-	EngineState    string        `json:"engine_state"`
-	ActiveRequests int           `json:"active_requests"`
-	LoadedModel    string        `json:"loaded_model"`
-	MultiGPU       *multiGPUInfo `json:"multi_gpu,omitempty"`
+	Status         string `json:"status"`
+	EngineState    string `json:"engine_state"`
+	ActiveRequests int    `json:"active_requests"`
+	LoadedModel    string `json:"loaded_model"`
+	// LoadedModels: every resident model on a multi-pool worker. Absent on older
+	// workers, which then count as having exactly LoadedModel.
+	LoadedModels []string      `json:"loaded_models,omitempty"`
+	MultiGPU     *multiGPUInfo `json:"multi_gpu,omitempty"`
+	// Limits: request limits of a single-engine worker's model (a multi-pool worker
+	// reports them per pool). Absent on older workers → no limit known.
+	Limits ModelLimit `json:"limits"`
 	// Features are capability flags the worker advertises (e.g. "continuation" =
 	// understands om_continuation for B2 stream resume). Absent on older workers →
 	// the gateway simply never uses the newer behaviors against them.
@@ -277,16 +289,53 @@ type inferenceHealthResponse struct {
 }
 
 type multiGPUInfo struct {
-	Mode        string `json:"mode"`
-	EngineCount int    `json:"engine_count"`
+	// single carries a single-engine worker's top-level limits (set after decoding).
+	single      ModelLimit
+	Mode        string     `json:"mode"`
+	EngineCount int        `json:"engine_count"`
+	Pools       []poolInfo `json:"pools,omitempty"`
+}
+
+type poolInfo struct {
+	SupportedModels []string  `json:"supported_models"`
+	EngineState    string     `json:"engine_state"`
+	Limits         ModelLimit `json:"limits"`
+	Models         []string `json:"models"`
+	Devices        []int    `json:"devices"`
+	ActiveRequests int      `json:"active_requests"`
+}
+
+// poolMaps turns a multi-pool /health into per-model capacity (GPUs of the serving
+// pool) and active requests. nil for a single-engine worker.
+func poolMaps(m *multiGPUInfo) (capacity, active map[string]int, notReady map[string]bool) {
+	if m == nil || len(m.Pools) == 0 {
+		return nil, nil, nil
+	}
+	capacity, active, notReady = map[string]int{}, map[string]int{}, map[string]bool{}
+	for _, p := range m.Pools {
+		if p.EngineState != "" && p.EngineState != "running" {
+			for _, model := range p.Models {
+				notReady[model] = true
+			}
+		}
+		n := len(p.Devices)
+		if n < 1 {
+			n = 1
+		}
+		for _, model := range p.Models {
+			capacity[model] = n
+			active[model] = p.ActiveRequests
+		}
+	}
+	return capacity, active, notReady
 }
 
 // fetchInferenceHealth calls the py-inference /health endpoint.
-func (p *Poller) fetchInferenceHealth(ctx context.Context, workerID, endpoint, token string) (engineState string, activeRequests int, loadedModel string, engineCount int, features []string, receiptPubkey string, err error) {
+func (p *Poller) fetchInferenceHealth(ctx context.Context, workerID, endpoint, token string) (engineState string, activeRequests int, loadedModel string, engineCount int, features []string, receiptPubkey string, loadedModels []string, pools *multiGPUInfo, err error) {
 	url := strings.TrimRight(endpoint, "/") + "/health"
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
 	if err != nil {
-		return "", 0, "", 0, nil, "", err
+		return "", 0, "", 0, nil, "", nil, nil, err
 	}
 	if token != "" {
 		req.Header.Set("Authorization", "Bearer "+token)
@@ -294,17 +343,17 @@ func (p *Poller) fetchInferenceHealth(ctx context.Context, workerID, endpoint, t
 
 	resp, err := p.clientFor(workerID).Do(req)
 	if err != nil {
-		return "", 0, "", 0, nil, "", err
+		return "", 0, "", 0, nil, "", nil, nil, err
 	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
-		return "", 0, "", 0, nil, "", fmt.Errorf("unexpected status %d", resp.StatusCode)
+		return "", 0, "", 0, nil, "", nil, nil, fmt.Errorf("unexpected status %d", resp.StatusCode)
 	}
 
 	var health inferenceHealthResponse
 	if err := json.NewDecoder(resp.Body).Decode(&health); err != nil {
-		return "", 0, "", 0, nil, "", err
+		return "", 0, "", 0, nil, "", nil, nil, err
 	}
 
 	engineCount = 1 // default: single engine
@@ -312,5 +361,51 @@ func (p *Poller) fetchInferenceHealth(ctx context.Context, workerID, endpoint, t
 		engineCount = health.MultiGPU.EngineCount
 	}
 
-	return health.EngineState, health.ActiveRequests, health.LoadedModel, engineCount, health.Features, health.ReceiptPubkey, nil
+	if health.MultiGPU == nil {
+		health.MultiGPU = &multiGPUInfo{}
+	}
+	health.MultiGPU.single = health.Limits
+	return health.EngineState, health.ActiveRequests, health.LoadedModel, engineCount, health.Features, health.ReceiptPubkey, health.LoadedModels, health.MultiGPU, nil
+}
+
+// modelLimits maps each resident model to its reported request limits: per pool on a
+// multi-pool worker, the top-level limits for a single-engine worker's model. nil when
+// nothing was reported (older workers) — the gateway then assumes no limit.
+func modelLimits(m *multiGPUInfo, loadedModel string) map[string]ModelLimit {
+	if m == nil {
+		return nil
+	}
+	out := map[string]ModelLimit{}
+	for _, p := range m.Pools {
+		if p.Limits == (ModelLimit{}) {
+			continue
+		}
+		for _, model := range p.Models {
+			out[model] = p.Limits
+		}
+	}
+	if len(m.Pools) == 0 && m.single != (ModelLimit{}) && loadedModel != "" {
+		out[loadedModel] = m.single
+	}
+	if len(out) == 0 {
+		return nil
+	}
+	return out
+}
+
+// poolGroups lists, per pool of a multi-pool worker, every model that pool holds or
+// may switch to. A switch in one pool takes exactly that group offline on the worker;
+// nil for a single-engine worker (a switch there takes the whole worker).
+func poolGroups(m *multiGPUInfo) [][]string {
+	if m == nil || len(m.Pools) < 2 {
+		return nil
+	}
+	var out [][]string
+	for _, p := range m.Pools {
+		g := append(append([]string{}, p.Models...), p.SupportedModels...)
+		if len(g) > 0 {
+			out = append(out, g)
+		}
+	}
+	return out
 }

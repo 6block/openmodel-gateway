@@ -113,3 +113,23 @@ func TestWorkerReverify_ClearsAndRateLimits(t *testing.T) {
 		t.Fatalf("unclaimed model must 404, got %d", rec.Code)
 	}
 }
+
+// A reverify for a model that is already verified must not answer "scheduled":
+// the auditor only examines unverified claims, so nothing would happen. It says
+// "already_verified" and does not burn the rate-limit slot.
+func TestWorkerReverify_VerifiedModelSchedulesNothing(t *testing.T) {
+	g, _ := selfTestGateway(t)
+	post := func() *httptest.ResponseRecorder {
+		req := httptest.NewRequest(http.MethodPost, "/v1/worker/reverify", strings.NewReader(`{"model":"m-ok"}`))
+		req.Header.Set("Authorization", "Bearer wtok-self")
+		rec := httptest.NewRecorder()
+		g.handleWorkerReverify(rec, req)
+		return rec
+	}
+	for i := 0; i < 2; i++ {
+		rec := post()
+		if rec.Code != http.StatusOK || !strings.Contains(rec.Body.String(), `"already_verified"`) {
+			t.Fatalf("call %d: verified model must answer already_verified, got %d %s", i, rec.Code, rec.Body)
+		}
+	}
+}

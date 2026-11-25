@@ -35,7 +35,37 @@ type Factory struct {
 	base *tls.Config // nil = no material loaded
 
 	mu    sync.Mutex
-	cache map[string]*http.Transport // worker ID → armed transport
+	cache map[string]*expiryCheckingTransport // worker ID → armed transport
+
+	now func() time.Time // injectable for tests; nil = time.Now
+}
+
+// expiryCheckingTransport refuses to keep using a connection whose peer
+// certificate has expired. TLS checks validity only at the handshake, and the
+// gateway polls every worker every few seconds, so a pooled connection never
+// idles out: without this check a worker whose renewal was refused kept serving
+// on its expired certificate indefinitely (seen on the test gateway — the cert
+// expired at 03:41:42 and the worker still polled "idle" afterwards), and expiry
+// is the only revocation mechanism there is.
+type expiryCheckingTransport struct {
+	*http.Transport
+	now func() time.Time
+}
+
+func (t *expiryCheckingTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	resp, err := t.Transport.RoundTrip(req)
+	if err != nil || resp.TLS == nil || len(resp.TLS.PeerCertificates) == 0 {
+		return resp, err
+	}
+	if leaf := resp.TLS.PeerCertificates[0]; t.now().After(leaf.NotAfter) {
+		resp.Body.Close()
+		// Drop the pooled connections so the next attempt re-handshakes — and
+		// fails the handshake, as an expired certificate should.
+		t.Transport.CloseIdleConnections()
+		return nil, fmt.Errorf("worker certificate for %q expired at %s",
+			leaf.Subject.CommonName, leaf.NotAfter.UTC().Format(time.RFC3339))
+	}
+	return resp, nil
 }
 
 // New loads the CA bundle plus the gateway's client certificate. All three
@@ -100,10 +130,15 @@ func (f *Factory) TransportFor(workerID string, base *http.Transport) http.Round
 	cfg.ServerName = workerID
 	t.TLSClientConfig = cfg
 	if f.cache == nil {
-		f.cache = make(map[string]*http.Transport)
+		f.cache = make(map[string]*expiryCheckingTransport)
 	}
-	f.cache[workerID] = t
-	return t
+	now := f.now
+	if now == nil {
+		now = time.Now
+	}
+	ct := &expiryCheckingTransport{Transport: t, now: now}
+	f.cache[workerID] = ct
+	return ct
 }
 
 // ClientFor wraps TransportFor in an *http.Client with the given timeout.

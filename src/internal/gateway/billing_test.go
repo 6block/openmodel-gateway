@@ -2,15 +2,19 @@ package gateway
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"io"
 	"log/slog"
 	"math/big"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"testing"
 
 	"github.com/ethereum/go-ethereum/common"
@@ -323,5 +327,158 @@ func TestBilling_ConcurrentOverspendEndToEnd(t *testing.T) {
 	}
 	if ps := bc.GetPendingSpend(billWallet); ps.Cmp(big.NewFloat(5)) > 0 {
 		t.Errorf("pendingSpend %s exceeds the $5 balance (overspend)", ps.Text('f', 4))
+	}
+}
+
+// TestBilling_WorkerFront502IsRetriedNotForwarded: a worker whose engine died mid-request
+// answers through its TLS front with 502 (or 504). Found on real hardware: the client
+// received the 502. It must be retried on the other worker and billed once, there.
+func TestBilling_WorkerFront502IsRetriedNotForwarded(t *testing.T) {
+	for _, code := range []int{502, 504} {
+		var calls atomic.Int32
+		up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if calls.Add(1) == 1 {
+				w.WriteHeader(code)
+				return
+			}
+			w.Header().Set("Content-Type", "application/json")
+			fmt.Fprint(w, `{"usage":{"prompt_tokens":2,"completion_tokens":6,"total_tokens":8}}`)
+		}))
+		gw, bc, cleanup := newBillingGateway(t, usdcWei(1000), up.URL, up.URL)
+		if st := doChat(t, gw.URL, chatBody); st != 200 {
+			t.Errorf("%d from the first worker: client got %d, want 200 after retry", code, st)
+		}
+		if ps := bc.GetPendingSpend(billWallet); ps.Cmp(big.NewFloat(8)) != 0 {
+			t.Errorf("%d: billed %s, want $8 once", code, ps.Text('f', 4))
+		}
+		cleanup()
+		up.Close()
+	}
+}
+
+// TestBilling_ColdBalanceCacheIs503NotInsufficient: right after a restart, before the
+// first balance refresh, every wallet reads as zero. Found on the test gateway: ~12 s of
+// traffic got 402 "insufficient balance". That is a "starting" condition, not a funds
+// verdict: answer 503 + Retry-After and reserve nothing.
+func TestBilling_ColdBalanceCacheIs503NotInsufficient(t *testing.T) {
+	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		fmt.Fprint(w, `{"usage":{"prompt_tokens":1,"completion_tokens":1,"total_tokens":2}}`)
+	}))
+	defer up.Close()
+	gw, bc, cleanup := newBillingGateway(t, usdcWei(1000), up.URL)
+	defer cleanup()
+	bc.ResetWarmForTest()
+	if st := doChat(t, gw.URL, chatBody); st != 503 {
+		t.Fatalf("cold cache: got %d, want 503", st)
+	}
+	if ps := bc.GetPendingSpend(billWallet); ps.Sign() != 0 {
+		t.Fatalf("cold cache must reserve nothing, got %s", ps.Text('f', 4))
+	}
+	bc.ForceRefresh(t.Context())
+	if st := doChat(t, gw.URL, chatBody); st != 200 {
+		t.Fatalf("after the first refresh: got %d, want 200", st)
+	}
+}
+
+// TestBilling_LedgerNotWritableIs503NotFreeService: with the data disk full every
+// request was served 200 and its record dropped from billing ("request dropped from
+// billing" × every request) — free service until the disk had room. Billable work
+// must be refused while the ledger cannot be written, and resume once it can.
+func TestBilling_LedgerNotWritableIs503NotFreeService(t *testing.T) {
+	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		fmt.Fprint(w, `{"usage":{"prompt_tokens":1,"completion_tokens":1,"total_tokens":2}}`)
+	}))
+	defer up.Close()
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	registry := worker.NewRegistry(logger, "")
+	registry.Register(worker.WorkerRegistration{ID: "w0", Endpoint: up.URL, SchedulerURL: up.URL, GPUCount: 1})
+	registry.UpdateState("w0", "GPU_STATE_AVAILABLE", "running", 0, "test-model", 1)
+	scfg := &settlement.Config{
+		ModelPricesUSD: map[string]string{"default": "1000000"},
+		FILPriceUSD:    "2.0", FILPriceSource: "manual",
+		SupportedTokens:   []settlement.TokenConfig{{Symbol: "USDC", Address: billUSDC, Decimals: 6}},
+		DeductionPriority: []string{"USDC"}, DefaultMaxTokens: 100,
+	}
+	pricer := settlement.NewPricer(scfg, logger)
+	bc := settlement.NewBalanceCache(&fakeBalanceContract{usdc: usdcWei(1000)}, scfg.SupportedTokens, pricer, 30, logger)
+	bc.SetWallets([]string{billWallet})
+	bc.ForceRefresh(context.Background())
+	gw := New(registry, config.GatewayConfig{
+		RequestTimeoutSec: 5, RequestLogPath: filepath.Join(t.TempDir(), "requests.jsonl"),
+		APIKeys: []config.APIKey{{Key: "test", Name: "user1", Wallet: billWallet}},
+	}, logger)
+	gw.SetBalanceChecker(bc, scfg)
+	free := uint64(1 << 30)
+	gw.requestLogger.freeBytes = func(string) (uint64, error) { return free, nil }
+	srv := httptest.NewServer(gw.Handler())
+	defer func() { srv.Close(); _ = gw.Close() }()
+
+	if st := doChat(t, srv.URL, chatBody); st != 200 {
+		t.Fatalf("ledger writable: got %d, want 200", st)
+	}
+	before := bc.GetPendingSpend(billWallet)
+	free = 1 << 10 // disk full
+	gw.requestLogger.spaceCheckedAt.Store(0)
+	if st := doChat(t, srv.URL, chatBody); st != 503 {
+		t.Fatalf("ledger full: got %d, want 503 (serving would be free)", st)
+	}
+	if ps := bc.GetPendingSpend(billWallet); ps.Cmp(before) != 0 {
+		t.Fatalf("refused request must reserve nothing: pending %s → %s", before.Text('f', 4), ps.Text('f', 4))
+	}
+	free = 1 << 30 // space freed
+	gw.requestLogger.spaceCheckedAt.Store(0)
+	if st := doChat(t, srv.URL, chatBody); st != 200 {
+		t.Fatalf("after space freed: got %d, want 200", st)
+	}
+}
+
+// A failed write (e.g. ENOSPC between probes) closes the gate at once; the next
+// probe that finds room reopens it.
+func TestRequestLogger_WriteFailureClosesGate(t *testing.T) {
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	rl := NewRequestLogger(filepath.Join(t.TempDir(), "r.jsonl"), logger)
+	rl.freeBytes = func(string) (uint64, error) { return 1 << 30, nil }
+	if !rl.Writable() {
+		t.Fatal("fresh logger must be writable")
+	}
+	rl.file.Close() // next write fails
+	rl.Log(RequestRecord{RequestID: "x"})
+	if rl.Writable() {
+		t.Fatal("a failed write must close the gate until space is re-confirmed")
+	}
+	rl.spaceCheckedAt.Store(0)
+	if !rl.Writable() {
+		t.Fatal("a probe that finds room must reopen the gate")
+	}
+}
+
+// A short write (disk full mid-record) must not leave half a line behind: the next
+// record would be glued onto it and both would fail to parse — losing a request
+// that was served and written successfully.
+func TestRequestLogger_ShortWriteLeavesNoFragment(t *testing.T) {
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	path := filepath.Join(t.TempDir(), "r.jsonl")
+	rl := NewRequestLogger(path, logger)
+	rl.Log(RequestRecord{RequestID: "before"})
+	rl.write = func(f *os.File, b []byte) (int, error) {
+		n, _ := f.Write(b[:len(b)/2])
+		return n, syscall.ENOSPC
+	}
+	rl.Log(RequestRecord{RequestID: "lost-to-full-disk"})
+	rl.write = nil
+	rl.Log(RequestRecord{RequestID: "after"})
+	rl.Close()
+
+	data, _ := os.ReadFile(path)
+	var ids []string
+	for _, line := range strings.Split(strings.TrimSpace(string(data)), "\n") {
+		var r RequestRecord
+		if err := json.Unmarshal([]byte(line), &r); err != nil {
+			t.Fatalf("unparseable line after a short write: %q", line)
+		}
+		ids = append(ids, r.RequestID)
+	}
+	if strings.Join(ids, ",") != "before,after" {
+		t.Fatalf("want before,after got %v", ids)
 	}
 }

@@ -116,7 +116,7 @@ func flatCostFn(prices map[string]*big.Float) func(RequestRecord) *big.Float {
 	return func(rec RequestRecord) *big.Float {
 		return CostBreakdownUSD(rec.Model,
 			rec.PromptTokens, rec.CompletionTokens, rec.CachedTokens, rec.TotalTokens,
-			prices, nil, nil)
+			prices, nil, nil, nil, 0)
 	}
 }
 

@@ -1,6 +1,9 @@
 package settlement
 
-import "testing"
+import (
+	"strings"
+	"testing"
+)
 
 // TestApplyDefaultsFillsAll verifies every default-fill branch on an empty config.
 func TestApplyDefaultsFillsAll(t *testing.T) {
@@ -152,5 +155,94 @@ func TestRegistryResolverNilLister(t *testing.T) {
 	r := NewRegistryResolver(nil)
 	if got := r.GetWorkerSPMap(); got != nil {
 		t.Errorf("nil lister should yield nil map, got %v", got)
+	}
+}
+
+// modality / price_unit are closed vocabularies, and only token-priced entries
+// are billable on this version: a typo or a not-yet-supported unit must be a
+// startup error, never a silently mis-described or mis-billed model.
+func TestValidate_CatalogModalityAndPriceUnit(t *testing.T) {
+	base := func() *Config {
+		c := &Config{
+			Enabled: true, RPCURL: "http://rpc", ChainID: 1, ContractAddress: "0xabc",
+			OperatorPrivateKey: "k", ModelPricesUSD: map[string]string{"default": "0.20"},
+			FILPriceUSD: "3.0", FILPriceSource: "manual",
+			SupportedTokens:   []TokenConfig{{Symbol: "FIL", Address: "0x0", Decimals: 18}},
+			DeductionPriority: []string{"FIL"},
+		}
+		c.ApplyDefaults()
+		return c
+	}
+	ok := base()
+	ok.ModelCatalog = map[string]ModelInfo{"v": {Modality: ModalityVision, PriceUnit: PriceUnitToken, MaxImagesPerRequest: 2}}
+	if err := ok.Validate(); err != nil {
+		t.Fatalf("vision/token entry must validate: %v", err)
+	}
+	if got := ok.ModelCatalog["v"].EffectiveModality(); got != "vision" {
+		t.Fatalf("EffectiveModality: %q", got)
+	}
+	if got := (ModelInfo{}).EffectivePriceUnit(); got != "token" {
+		t.Fatalf("default price unit: %q", got)
+	}
+
+	typo := base()
+	typo.ModelCatalog = map[string]ModelInfo{"v": {Modality: "vison"}}
+	if err := typo.Validate(); err == nil || !strings.Contains(err.Error(), "modality") {
+		t.Fatalf("modality typo must be rejected, got %v", err)
+	}
+
+	// A per-image model is now billable, but only with the pieces it needs: a per-unit
+	// price and a matching modality. Each omission is its own error, because each would
+	// otherwise fail differently at billing time.
+	imgOk := base()
+	imgOk.ModelCatalog = map[string]ModelInfo{"g": {Modality: ModalityImage, PriceUnit: PriceUnitImage, UnitUSD: "2.00"}}
+	if err := imgOk.Validate(); err != nil {
+		t.Fatalf("per-image entry with a unit price must validate: %v", err)
+	}
+
+	imgNoPrice := base()
+	imgNoPrice.ModelCatalog = map[string]ModelInfo{"g": {Modality: ModalityImage, PriceUnit: PriceUnitImage}}
+	if err := imgNoPrice.Validate(); err == nil || !strings.Contains(err.Error(), "unit_usd") {
+		t.Fatalf("per-image pricing without a unit price must be refused (it would bill $0), got %v", err)
+	}
+
+	// price_unit and modality must agree: an "image" model priced per token is a
+	// different model than the operator declared.
+	imgMismatch := base()
+	imgMismatch.ModelCatalog = map[string]ModelInfo{"g": {Modality: ModalityText, PriceUnit: PriceUnitImage, UnitUSD: "2.00"}}
+	if err := imgMismatch.Validate(); err == nil || !strings.Contains(err.Error(), "modality") {
+		t.Fatalf("price_unit/modality mismatch must be refused, got %v", err)
+	}
+
+	// The reverse mistake: a per-unit price on a token model is revenue the operator
+	// believes they are collecting and never will.
+	tokenWithUnitPrice := base()
+	tokenWithUnitPrice.ModelCatalog = map[string]ModelInfo{"t": {Modality: ModalityText, PriceUnit: PriceUnitToken, UnitUSD: "2.00"}}
+	if err := tokenWithUnitPrice.Validate(); err == nil || !strings.Contains(err.Error(), "unit_usd") {
+		t.Fatalf("unit_usd on a token model must be refused, got %v", err)
+	}
+
+	// audio_second accepts either speech modality, and rejects a non-speech one.
+	ttsOk := base()
+	ttsOk.ModelCatalog = map[string]ModelInfo{"s": {Modality: ModalityTTS, PriceUnit: PriceUnitAudioSecond, UnitUSD: "0.01"}}
+	if err := ttsOk.Validate(); err != nil {
+		t.Fatalf("tts/audio_second must validate: %v", err)
+	}
+	audioWrongModality := base()
+	audioWrongModality.ModelCatalog = map[string]ModelInfo{"s": {Modality: ModalityText, PriceUnit: PriceUnitAudioSecond, UnitUSD: "0.01"}}
+	if err := audioWrongModality.Validate(); err == nil || !strings.Contains(err.Error(), "modality") {
+		t.Fatalf("audio_second on a text model must be refused, got %v", err)
+	}
+
+	badUnit := base()
+	badUnit.ModelCatalog = map[string]ModelInfo{"g": {PriceUnit: "per_pixel"}}
+	if err := badUnit.Validate(); err == nil || !strings.Contains(err.Error(), "price_unit") {
+		t.Fatalf("unknown price_unit must be rejected, got %v", err)
+	}
+
+	neg := base()
+	neg.ModelCatalog = map[string]ModelInfo{"v": {Modality: ModalityVision, MaxImagesPerRequest: -1}}
+	if err := neg.Validate(); err == nil {
+		t.Fatal("negative image cap must be rejected")
 	}
 }

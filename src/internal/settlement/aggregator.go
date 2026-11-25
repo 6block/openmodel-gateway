@@ -52,15 +52,15 @@ type aggregationKey struct {
 }
 
 type Aggregator struct {
-	modelPrices      map[string]*big.Float // model → USD per token (OUTPUT / base price, from ModelPricesUSD)
-	catalogInput     map[string]*big.Float // model → USD per input token (from ModelCatalog; presence enables the split)
-	catalogCacheRead map[string]*big.Float // model → USD per cached (prefix-hit) prompt token
-	spAddressMap     map[string]string     // miner address → EVM address (static config)
-	minerPayoutMap   map[string]string     // miner address → EVM address (miner-SIGNED at self-registration; wins over static)
-	workerSPMap      map[string]string     // worker_id → miner address (from registry)
-	tokens           []TokenConfig
-	deductPriority   []string
-	logger           *slog.Logger
+	// prices holds every price table the billing formula consumes, so the unit
+	// semantics (per-token vs per-unit) are applied in exactly one place (NewPrices).
+	prices         Prices
+	spAddressMap   map[string]string // miner address → EVM address (static config)
+	minerPayoutMap map[string]string // miner address → EVM address (miner-SIGNED at self-registration; wins over static)
+	workerSPMap    map[string]string // worker_id → miner address (from registry)
+	tokens         []TokenConfig
+	deductPriority []string
+	logger         *slog.Logger
 	// pricer supplies stablecoin USD price + depeg status (C3). Optional/nil-safe: when
 	// nil, non-FIL tokens are valued 1:1 with USD and never skipped (pre-C3 behavior),
 	// so the aggregator's unit tests keep constructing it without a pricer.
@@ -85,29 +85,83 @@ func parsePerToken(s string) (*big.Float, bool) {
 	return p, true
 }
 
-func NewAggregator(cfg *Config, workerSPMap map[string]string, logger *slog.Logger) *Aggregator {
-	prices := make(map[string]*big.Float)
-	for model, priceStr := range cfg.ModelPricesUSD {
-		price, ok := parsePerToken(priceStr)
-		if !ok {
-			logger.Warn("invalid model price, skipping", "model", model, "price", priceStr)
-			continue
-		}
-		prices[model] = price
+// parsePerUnit parses a "USD per unit" string (per image, per audio second).
+//
+// NOT divided by 1e6, unlike parsePerToken. A unit price is per ONE unit; dividing it
+// would underprice by six orders of magnitude. Keeping the two parsers separate is what
+// makes that mistake impossible to make by accident.
+func parsePerUnit(s string) (*big.Float, bool) {
+	if s == "" {
+		return nil, false
 	}
-	// Optional per-model catalog: input + cache-read rates. A model's presence in
-	// catalogInput switches its billing to the input/output/cache-read split.
-	catInput, catCacheRead := ParseCatalogPrices(cfg.ModelCatalog)
+	p, _, err := big.ParseFloat(s, 10, 128, big.ToNearestEven)
+	if err != nil {
+		return nil, false
+	}
+	return p, true
+}
 
+// Prices holds every price table the billing formula consumes, in one value so that a
+// caller cannot pass the output table where the input table belongs.
+type Prices struct {
+	Output      map[string]*big.Float // model → USD per token (output/base, from ModelPricesUSD)
+	CatalogIn   map[string]*big.Float // model → USD per input token (catalog split)
+	CacheRead   map[string]*big.Float // model → USD per cached prompt token
+	PerUnit     map[string]*big.Float // model → USD per unit, for non-token models
+	CachedModel map[string]PriceUnit  // model → its configured unit (asset models only)
+}
+
+// UnitPrice returns the configured per-unit price for a model, or nil when the model has
+// none. A nil result for an asset-billed model means the catalog is misconfigured; the
+// formula bills zero rather than guessing, and Validate refuses such a catalog at start-up.
+func (p Prices) UnitPrice(model string) *big.Float {
+	if p.PerUnit == nil {
+		return nil
+	}
+	return p.PerUnit[model]
+}
+
+// NewPrices builds every price table from the settlement config, applying the correct
+// unit semantics per model: token prices are per 1M tokens, non-token prices are per
+// single unit. This is the ONE place those two conventions are applied.
+func NewPrices(cfg *Config) Prices {
+	p := Prices{
+		Output:      map[string]*big.Float{},
+		CatalogIn:   map[string]*big.Float{},
+		CacheRead:   map[string]*big.Float{},
+		PerUnit:     map[string]*big.Float{},
+		CachedModel: map[string]PriceUnit{},
+	}
+	for model, s := range cfg.ModelPricesUSD {
+		if v, ok := parsePerToken(s); ok {
+			p.Output[model] = v
+		}
+	}
+	for model, info := range cfg.ModelCatalog {
+		if v, ok := parsePerToken(info.InputUSD); ok {
+			p.CatalogIn[model] = v
+		}
+		if v, ok := parsePerToken(info.CacheReadUSD); ok {
+			p.CacheRead[model] = v
+		}
+		if unit := info.EffectivePriceUnit(); !unit.IsToken() {
+			p.CachedModel[model] = unit
+			if v, ok := parsePerUnit(info.UnitUSD); ok {
+				p.PerUnit[model] = v
+			}
+		}
+	}
+	return p
+}
+
+func NewAggregator(cfg *Config, workerSPMap map[string]string, logger *slog.Logger) *Aggregator {
 	return &Aggregator{
-		modelPrices:      prices,
-		catalogInput:     catInput,
-		catalogCacheRead: catCacheRead,
-		spAddressMap:     cfg.SPAddressMap,
-		workerSPMap:      workerSPMap,
-		tokens:           cfg.SupportedTokens,
-		deductPriority:   cfg.DeductionPriority,
-		logger:           logger,
+		prices:         NewPrices(cfg),
+		spAddressMap:   cfg.SPAddressMap,
+		workerSPMap:    workerSPMap,
+		tokens:         cfg.SupportedTokens,
+		deductPriority: cfg.DeductionPriority,
+		logger:         logger,
 	}
 }
 
@@ -360,7 +414,33 @@ func (a *Aggregator) resolveWorkerToEVM(workerID string) string {
 func (a *Aggregator) recordCostUSD(rec RequestRecord) *big.Float {
 	return CostBreakdownUSD(rec.Model,
 		rec.PromptTokens, rec.CompletionTokens, rec.CachedTokens, rec.TotalTokens,
-		a.modelPrices, a.catalogInput, a.catalogCacheRead)
+		a.prices.Output, a.prices.CatalogIn, a.prices.CacheRead,
+		a.prices.UnitPrice(rec.Model), quantityOf(rec))
+}
+
+// quantityOf is the billed amount of an asset-unit record: what the worker attested it
+// produced. It is zero for a token record, which is how the formula tells the two
+// shapes apart.
+func quantityOf(rec RequestRecord) int {
+	if rec.Quantity > 0 {
+		return rec.Quantity
+	}
+	if rec.Receipt == nil {
+		return 0
+	}
+	return rec.Receipt.Quantity
+}
+
+// assetHashOf is the digest of the delivered asset, preferring the gateway's own hash
+// over the worker's attestation for the same reason quantityOf does.
+func assetHashOf(rec RequestRecord) string {
+	if rec.AssetHash != "" {
+		return rec.AssetHash
+	}
+	if rec.Receipt == nil {
+		return ""
+	}
+	return rec.Receipt.AssetHash
 }
 
 // CostBreakdownUSD is THE billing formula, shared by every component that prices a
@@ -370,6 +450,12 @@ func (a *Aggregator) recordCostUSD(rec RequestRecord) *big.Float {
 // cached (cache-read rate) and non-cached (input rate) and bills completion at the
 // output rate; otherwise it falls back to the flat total×output price.
 //
+// unitPrice is the USD price of ONE unit — one token, one image, one audio second —
+// and quantity is how many units of an asset-billed model were produced. For a token
+// model both are ignored and the token counts drive the price, so this formula produces
+// byte-for-byte the same number it always did. For an asset-billed model (quantity > 0)
+// the cost is simply quantity × unitPrice.
+//
 // It MUST stay the single source of truth: an audit found the gateway adjusting
 // pendingSpend with the flat price while settlement cleared it with this split — since
 // input < output, every settled request left a residue of
@@ -377,8 +463,23 @@ func (a *Aggregator) recordCostUSD(rec RequestRecord) *big.Float {
 // so pending grew monotonically until it hit the per-wallet cap and 402'd real traffic.
 // Worse, the reconciler also billed flat, so the residue was absorbed into "pending"
 // and billed==settled+pending held — the leak was invisible to the drift alert.
+//
+// The same trap applies to units: every caller must price a given record in the SAME
+// unit, so the unit is derived from the model's catalog entry in ONE place
+// (Config.UnitFor) rather than being passed in per caller.
 func CostBreakdownUSD(model string, promptTokens, completionTokens, cachedTokens, totalTokens int,
-	outPrices, catalogInput, catalogCacheRead map[string]*big.Float) *big.Float {
+	outPrices, catalogInput, catalogCacheRead map[string]*big.Float,
+	unitPrice *big.Float, quantity int) *big.Float {
+	// Asset-billed: the price is per unit, and the quantity came from the worker's
+	// attested output. A missing unit price is a configuration error, NOT a free
+	// request: falling back would bill quantity × nil = $0 and the reconciler would
+	// agree, so the under-charge would never surface as drift.
+	if quantity > 0 {
+		if unitPrice == nil {
+			return new(big.Float)
+		}
+		return new(big.Float).Mul(unitPrice, big.NewFloat(float64(quantity)))
+	}
 	out := lookupPrice(outPrices, model) // output / base per-token price
 	if out == nil {
 		out = new(big.Float)

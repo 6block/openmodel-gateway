@@ -49,7 +49,7 @@ func TestPollerFetchInferenceHealth(t *testing.T) {
 	registry := NewRegistry(logger, "")
 	poller := NewPoller(registry, time.Second, 3, logger)
 
-	engineState, activeReqs, model, _, _, _, err := poller.fetchInferenceHealth(context.Background(), "w-test", server.URL, "")
+	engineState, activeReqs, model, _, _, _, _, _, err := poller.fetchInferenceHealth(context.Background(), "w-test", server.URL, "")
 	if err != nil {
 		t.Fatal(err)
 	}

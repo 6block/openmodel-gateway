@@ -3,6 +3,7 @@ package settlement
 import (
 	"bytes"
 	"context"
+	"errors"
 	"log/slog"
 	"math/big"
 	"os"
@@ -37,6 +38,9 @@ type mockContract struct {
 	// Found=true) = every item settled. Set FailedCount/FailedIndexes to simulate the
 	// contract SKIPPING items (user balance drained mid-window).
 	outcome *SettlementOutcome
+	// landsAfterCheck: batches whose earlier submission mines just after resume's
+	// dedup read — the next IsProcessedBatch (and any submit) sees it processed.
+	landsAfterReads map[[32]byte]int
 }
 
 func newMockContract() *mockContract {
@@ -44,10 +48,24 @@ func newMockContract() *mockContract {
 }
 
 func (m *mockContract) IsProcessedBatch(ctx context.Context, h [32]byte) (bool, error) {
+	if n, ok := m.landsAfterReads[h]; ok && !m.processed[h] {
+		// The pre-restart tx is still in the mempool for the first n reads, then mines.
+		if n <= 0 {
+			m.processed[h] = true
+			delete(m.landsAfterReads, h)
+		} else {
+			m.landsAfterReads[h] = n - 1
+			return false, nil
+		}
+	}
 	return m.processed[h], nil
 }
 
 func (m *mockContract) SubmitSettlement(ctx context.Context, batch SettlementBatch) (*types.Transaction, error) {
+	if _, inMempool := m.landsAfterReads[batch.DetailsHash]; inMempool || m.processed[batch.DetailsHash] {
+		// The contract's own dedup: a second submission of a processed batch reverts.
+		return nil, errors.New("send submitSettlement: message execution failed (exit=[33], revert reason=[Error(batch already processed)])")
+	}
 	if m.submitErr != nil {
 		return nil, m.submitErr // simulate a submit failure: NOT marked processed
 	}
@@ -189,6 +207,35 @@ func TestResumePendingIdempotentAfterCrash(t *testing.T) {
 	}
 	if walExists(dir) {
 		t.Error("WAL should be deleted after dedup-confirm")
+	}
+}
+
+// TestResumePendingBatchLandsDuringResume: found on the test gateway — a restart while a
+// settlement tx was still unmined. Resume's dedup read saw "not processed", the old tx
+// mined, and the re-submission reverted "batch already processed"; the WAL then sat
+// unresolved (startup ERROR) until the next cycle. It must be confirmed on the spot,
+// with no second submission recorded.
+func TestResumePendingBatchLandsDuringResume(t *testing.T) {
+	mock := newMockContract()
+	s, dir := newTestSettler(t, mock, discardLogger())
+	p := s.buildPending([]SettlementItem{mkItem(usdc(5), usdcAddr)}, Cursor{Offset: 100, FileSize: 100},
+		map[string]string{walletU: "5"}, nil, nil)
+	if err := s.writePending(p); err != nil {
+		t.Fatal(err)
+	}
+	h, _ := hexToHash32(p.Batches[0].DetailsHash)
+	// Like Lotus: the duplicate reverts at gas estimation while processedBatches at the
+	// head still reads false for a few more polls.
+	mock.landsAfterReads = map[[32]byte]int{h: 3}
+	s.landPoll = time.Millisecond
+	if err := s.resumePending(context.Background()); err != nil {
+		t.Fatalf("a batch that landed mid-resume must be confirmed, not an error: %v", err)
+	}
+	if mock.submitCount != 0 {
+		t.Errorf("no submission should have succeeded (the chain already had it), got %d", mock.submitCount)
+	}
+	if walExists(dir) {
+		t.Error("WAL should be resolved")
 	}
 }
 

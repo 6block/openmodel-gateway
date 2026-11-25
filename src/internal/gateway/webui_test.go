@@ -12,6 +12,7 @@ import (
 
 	"openmodel/sp-state-agent/internal/config"
 	"openmodel/sp-state-agent/internal/settlement"
+	"openmodel/sp-state-agent/internal/worker"
 )
 
 func webuiTestGateway(t *testing.T) *Gateway {
@@ -19,6 +20,10 @@ func webuiTestGateway(t *testing.T) *Gateway {
 	g := newRegTestGateway(t)
 	g.webUI = config.WebUIConfig{Enabled: true, PublicQueryURL: "http://example.com:18020/"}
 	g.settlementCfg = &settlement.Config{ChainID: 314159, ContractAddress: "0x2e291E8C7eB5B053aeAC32F2A6Fa74b71B0E2e57"}
+	// webconfig resolves models through the registry (which models are actually
+	// served), so a nil registry panics on Register — and in production it is never
+	// nil. Tests that register a worker rely on this being present.
+	g.registry = worker.NewRegistry(testLogger(), "")
 	return g
 }
 

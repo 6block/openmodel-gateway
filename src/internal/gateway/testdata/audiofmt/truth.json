@@ -1,0 +1,86 @@
+{
+ "cbr_0_7.mp3": {
+  "decoded": 0.6999773242630386,
+  "intended": 0.7
+ },
+ "vbr_0_7.mp3": {
+  "decoded": 0.6999546485260771,
+  "intended": 0.7
+ },
+ "opus_0_7.ogg": {
+  "decoded": 0.7065,
+  "intended": 0.7
+ },
+ "opus_0_7.webm": {
+  "decoded": 0.7,
+  "intended": 0.7
+ },
+ "aac_0_7.m4a": {
+  "decoded": 0.7430385487528345,
+  "intended": 0.7
+ },
+ "aac_0_7.mp4": {
+  "decoded": 0.768,
+  "intended": 0.7
+ },
+ "flac_0_7.flac": {
+  "decoded": 0.7,
+  "intended": 0.7
+ },
+ "cbr_3_3.mp3": {
+  "decoded": 3.3,
+  "intended": 3.3
+ },
+ "vbr_3_3.mp3": {
+  "decoded": 3.3,
+  "intended": 3.3
+ },
+ "opus_3_3.ogg": {
+  "decoded": 3.3,
+  "intended": 3.3
+ },
+ "opus_3_3.webm": {
+  "decoded": 3.3,
+  "intended": 3.3
+ },
+ "aac_3_3.m4a": {
+  "decoded": 3.3436734693877552,
+  "intended": 3.3
+ },
+ "aac_3_3.mp4": {
+  "decoded": 3.3706666666666667,
+  "intended": 3.3
+ },
+ "flac_3_3.flac": {
+  "decoded": 3.3,
+  "intended": 3.3
+ },
+ "cbr_12_25.mp3": {
+  "decoded": 12.25,
+  "intended": 12.25
+ },
+ "vbr_12_25.mp3": {
+  "decoded": 12.249977324263039,
+  "intended": 12.25
+ },
+ "opus_12_25.ogg": {
+  "decoded": 12.25,
+  "intended": 12.25
+ },
+ "opus_12_25.webm": {
+  "decoded": 12.25,
+  "intended": 12.25
+ },
+ "aac_12_25.m4a": {
+  "decoded": 12.283356009070294,
+  "intended": 12.25
+ },
+ "aac_12_25.mp4": {
+  "decoded": 12.330666666666668,
+  "intended": 12.25
+ },
+ "flac_12_25.flac": {
+  "decoded": 12.25,
+  "intended": 12.25
+ }
+}

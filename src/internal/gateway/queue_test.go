@@ -3,6 +3,7 @@ package gateway
 import (
 	"encoding/json"
 	"fmt"
+	"io"
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
@@ -300,11 +301,14 @@ func TestRetry_WorkerReturns503ThenRecovers(t *testing.T) {
 	registry.Register(worker.WorkerRegistration{ID: "w1", Endpoint: backend.URL, SchedulerURL: "http://unused:9090", GPUCount: 1})
 	registry.UpdateState("w1", "GPU_STATE_AVAILABLE", "running", 0, "model", 1)
 	gw := New(registry, config.GatewayConfig{RequestTimeoutSec: 10}, logger)
-	gw.queueTimeout = 2 * time.Second // > 1s poll interval
+	gw.queueTimeout = 3 * time.Second // > 1s queue poll, with room after the recovery
 
 	go func() {
 		time.Sleep(1500 * time.Millisecond)
 		mining.Store(false) // worker finishes mining, starts answering 200
+		// …and its next health poll reports it available again (the 503 took it
+		// out of routing until then; no poller runs in this test).
+		registry.UpdateState("w1", "GPU_STATE_AVAILABLE", "running", 0, "model", 1)
 	}()
 
 	srv := httptest.NewServer(gw.Handler())
@@ -354,5 +358,135 @@ func TestQueue_LongYieldFailsFastAfterQueueTimeout(t *testing.T) {
 	}
 	if resp.Header.Get("Retry-After") == "" {
 		t.Fatal("503 must carry a Retry-After header")
+	}
+}
+
+// TestQueue_WaitsOutAModelSwitchBeyondTheQueueWindow: a worker reloading to serve the
+// requested model comes back within one reload. Found on a test worker: requests queued behind a
+// ~60 s 32B↔VL switch were refused at exactly the 60 s queue window.
+func TestQueue_WaitsOutAModelSwitchBeyondTheQueueWindow(t *testing.T) {
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.Write([]byte(`{"choices":[{"message":{"content":"ok"}}],"usage":{"prompt_tokens":1,"completion_tokens":1,"total_tokens":2}}`))
+	}))
+	defer backend.Close()
+	logger := discardGwLogger()
+	reg := worker.NewRegistry(logger, "")
+	reg.Register(worker.WorkerRegistration{ID: "w1", Endpoint: backend.URL, SchedulerURL: "http://x", GPUCount: 1,
+		SupportedModels: []string{"model-a", "model-b"}})
+	reg.UpdateState("w1", "GPU_STATE_AVAILABLE", "running", 0, "model-a", 1)
+	reg.MarkSwitching("w1", "model-a") // no-op: already loaded
+	reg.MarkSwitching("w1", "model-b") // switching away from model-a
+	gw := New(reg, config.GatewayConfig{RequestTimeoutSec: 10, QueueTimeoutSec: 2}, logger)
+	srv := httptest.NewServer(gw.Handler())
+	defer srv.Close()
+	go func() {
+		time.Sleep(4500 * time.Millisecond) // the reload takes longer than the 2 s queue window
+		reg.UpdateState("w1", "GPU_STATE_AVAILABLE", "running", 0, "model-b", 1)
+	}()
+	t0 := time.Now()
+	resp, err := http.Post(srv.URL+"/v1/chat/completions", "application/json",
+		strings.NewReader(`{"model":"model-a","messages":[{"role":"user","content":"hi"}]}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != 200 {
+		t.Fatalf("request behind a switch got %d after %s; want 200 once the worker is back", resp.StatusCode, time.Since(t0))
+	}
+}
+
+// TestDeadWorkerLeavesRoutingAtOnce: a worker whose engine died answers through its front
+// with 502. Found in a soak test: every queued request was released onto it once a
+// second for up to 300 s because the poll still said idle. One failed request must take
+// it out of routing until a poll sees it healthy again.
+func TestDeadWorkerLeavesRoutingAtOnce(t *testing.T) {
+	var dead atomic.Int32
+	deadSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		dead.Add(1)
+		w.WriteHeader(http.StatusBadGateway)
+	}))
+	defer deadSrv.Close()
+	okSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.Write([]byte(`{"choices":[{"message":{"content":"ok"}}],"usage":{"prompt_tokens":1,"completion_tokens":1,"total_tokens":2}}`))
+	}))
+	defer okSrv.Close()
+	logger := discardGwLogger()
+	reg := worker.NewRegistry(logger, "")
+	reg.Register(worker.WorkerRegistration{ID: "dead", Endpoint: deadSrv.URL, SchedulerURL: "http://x", GPUCount: 50})
+	reg.Register(worker.WorkerRegistration{ID: "ok", Endpoint: okSrv.URL, SchedulerURL: "http://y", GPUCount: 1})
+	reg.UpdateState("dead", "GPU_STATE_AVAILABLE", "running", 0, "m", 50)
+	reg.UpdateState("ok", "GPU_STATE_AVAILABLE", "running", 0, "m", 1)
+	gw := New(reg, config.GatewayConfig{RequestTimeoutSec: 10}, logger)
+	srv := httptest.NewServer(gw.Handler())
+	defer srv.Close()
+	for i := 0; i < 20; i++ {
+		resp, err := http.Post(srv.URL+"/v1/chat/completions", "application/json",
+			strings.NewReader(`{"model":"m","messages":[{"role":"user","content":"hi"}]}`))
+		if err != nil {
+			t.Fatal(err)
+		}
+		resp.Body.Close()
+		if resp.StatusCode != 200 {
+			t.Fatalf("request %d: %d", i, resp.StatusCode)
+		}
+	}
+	if n := dead.Load(); n != 1 {
+		t.Fatalf("the dead worker was tried %d times; after the first failure it must leave routing", n)
+	}
+	reg.UpdateState("dead", "GPU_STATE_AVAILABLE", "running", 0, "m", 50) // a good poll
+	if w, _ := reg.Get("dead"); w.State != worker.StateIdle {
+		t.Fatalf("a healthy poll must bring it back, state=%s", w.State)
+	}
+}
+
+// TestRetry_503TakesWorkerOutOfRoutingUntilNextPoll: a worker answering 503 has
+// yielded its GPUs. Before the next health poll the registry still showed it idle, so
+// the queue handed the request straight back to it — on the test gateway one request
+// bounced off a yielding worker ~30 times in 30 s. After the first 503 it must not be
+// tried again until a poll reports it available.
+func TestRetry_503TakesWorkerOutOfRoutingUntilNextPoll(t *testing.T) {
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	registry := worker.NewRegistry(logger, "")
+	var hits atomic.Int32
+	var mining atomic.Bool
+	mining.Store(true)
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		hits.Add(1)
+		if mining.Load() {
+			w.WriteHeader(http.StatusServiceUnavailable)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		io.WriteString(w, `{"choices":[{"message":{"role":"assistant","content":"ok"},"finish_reason":"stop"}]}`)
+	}))
+	defer backend.Close()
+	registry.Register(worker.WorkerRegistration{ID: "w1", Endpoint: backend.URL, SchedulerURL: "http://unused:9090", GPUCount: 1})
+	registry.UpdateState("w1", "GPU_STATE_AVAILABLE", "running", 0, "model", 1)
+	// The last poll said "next yield in 16 h" (seconds_until_change while servable).
+	// After the 503 that must not read as "recovery in 16 h" and fail the wait at once.
+	registry.SetUntilChange("w1", 59640)
+	gw := New(registry, config.GatewayConfig{RequestTimeoutSec: 20}, logger)
+	gw.queueTimeout = 10 * time.Second
+
+	go func() {
+		time.Sleep(3 * time.Second)
+		mining.Store(false)
+		registry.UpdateState("w1", "GPU_STATE_AVAILABLE", "running", 0, "model", 1) // the next poll
+	}()
+	srv := httptest.NewServer(gw.Handler())
+	defer srv.Close()
+	resp, err := http.Post(srv.URL+"/v1/chat/completions", "application/json",
+		strings.NewReader(`{"model":"test-model","messages":[{"role":"user","content":"hi"}]}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != 200 {
+		t.Fatalf("want 200 once the worker is back, got %d", resp.StatusCode)
+	}
+	if n := hits.Load(); n > 2 {
+		t.Fatalf("the yielding worker was hit %d times before its next poll; want 1 + the successful retry", n)
 	}
 }

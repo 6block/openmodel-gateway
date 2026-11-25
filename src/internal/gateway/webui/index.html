@@ -126,11 +126,69 @@
         <select id="model-select"></select>
       </div>
       <div id="model-price" class="hint"></div>
-      <div class="kv"><span>Thinking</span>
+      <div class="kv" id="thinking-row"><span>Thinking</span>
         <label class="hint" style="display:flex;align-items:center;gap:6px">
           <input type="checkbox" id="thinking-toggle"> show reasoning (slower, billed as output)
         </label>
       </div>
+      <div id="tts-settings" hidden>
+        <div class="kv"><span>Voice</span>
+          <select id="tts-voice">
+            <option value="af_heart" selected>English (US) · female</option>
+            <option value="am_michael">English (US) · male</option>
+            <option value="bf_emma">English (UK) · female</option>
+            <option value="bm_george">English (UK) · male</option>
+            <option value="zf_xiaoxiao">Mandarin · female</option>
+            <option value="zm_yunxi">Mandarin · male</option>
+            <option value="ef_dora">Spanish · female</option>
+            <option value="ff_siwis">French · female</option>
+          </select>
+        </div>
+        <div class="kv"><span>Speed</span>
+          <select id="tts-speed">
+            <option value="0.8">0.8×</option>
+            <option value="1" selected>1×</option>
+            <option value="1.25">1.25×</option>
+            <option value="1.5">1.5×</option>
+          </select>
+        </div>
+      </div>
+      <div id="gen-settings" hidden>
+        <div class="kv"><span>Size</span>
+          <select id="gen-size">
+            <option value="512x512">512 × 512</option>
+            <option value="768x768">768 × 768</option>
+            <option value="1024x1024" selected>1024 × 1024</option>
+          </select>
+        </div>
+        <div class="kv"><span>Steps</span>
+          <select id="gen-steps">
+            <option value="4">4 (fastest)</option>
+            <option value="20" selected>20</option>
+            <option value="30">30 (best)</option>
+          </select>
+        </div>
+        <div class="kv"><span>Images</span>
+          <select id="gen-n">
+            <option value="1" selected>1</option>
+            <option value="2">2</option>
+            <option value="4">4</option>
+          </select>
+        </div>
+        <div class="kv"><span>Seed</span>
+          <input id="gen-seed" type="number" min="0" placeholder="random" style="width:9em">
+        </div>
+        <p class="hint">Billed per delivered image. Same prompt + same seed renders the same picture.</p>
+      </div>
+      <div class="kv" id="img-size-row" hidden><span>Image size</span>
+        <select id="img-size">
+          <option value="512">≤512 px</option>
+          <option value="1024" selected>≤1024 px</option>
+          <option value="0">original</option>
+        </select>
+      </div>
+      <p class="hint" id="img-size-hint" hidden></p>
+      <p class="hint" id="vision-hint" hidden></p>
       <details id="pricing-details">
         <summary class="hint">All model pricing</summary>
         <div id="pricing-table"></div>
@@ -154,9 +212,20 @@
       </div>
     </div>
     <div id="composer">
-      <textarea id="input" rows="2" placeholder="Message… (Enter to send, Shift+Enter for newline)"></textarea>
-      <button id="btn-stop" class="danger" hidden>Stop</button>
-      <button id="btn-send" class="primary" disabled>Send</button>
+      <div id="attach-strip" hidden>
+        <div id="attach-thumbs"></div>
+        <div class="attach-meta hint"><span id="attach-count"></span><span id="attach-budget"></span></div>
+      </div>
+      <div class="composer-row">
+        <button id="btn-attach" class="small" title="Attach images (or drag &amp; drop / paste)">＋ Image</button>
+        <button id="btn-audio" class="small" title="Upload an audio file to transcribe (WAV, FLAC, MP3, OGG, WebM, M4A)" hidden>＋ Audio</button>
+        <button id="btn-record" class="small" title="Record from the microphone" hidden>● Record</button>
+        <textarea id="input" rows="2" placeholder="Message… (Enter to send, Shift+Enter for newline; drop or paste images to attach)"></textarea>
+        <button id="btn-stop" class="danger" hidden>Stop</button>
+        <button id="btn-send" class="primary" disabled>Send</button>
+      </div>
+      <input type="file" id="file-input" accept="image/*" multiple hidden>
+      <input type="file" id="audio-input" accept="audio/*,.wav,.flac,.mp3,.ogg,.opus,.webm,.m4a,.mp4" hidden>
     </div>
     <div id="statusline" class="hint"></div>
   </main>

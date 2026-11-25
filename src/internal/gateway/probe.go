@@ -15,6 +15,7 @@ import (
 	"sync"
 	"time"
 
+	"openmodel/sp-state-agent/internal/settlement"
 	"openmodel/sp-state-agent/internal/worker"
 )
 
@@ -103,6 +104,126 @@ var defaultModelFloors = map[string]float64{
 	// admission runs measured 16/16); floor inherited from that tier pending a
 	// dedicated 320-item fleet measurement.
 	"qwen3.8-27b": 46.0 / 48.0,
+	// Qwen3-VL-8B: image-understanding items (probe_vision.go — background
+	// colour / circle count on a rendered 192×192 image). These score on a
+	// different axis from the arithmetic set, so this floor is derived from the
+	// IMPERSONATION side rather than inherited from the big tier: a text model
+	// answering blind can name only one of 6 palette colours (1/6) and count
+	// 1..4 shapes (1/4), so over the 48-item window (24 of each kind) it averages
+	// 10.00/48 with an SD of 2.80 items. 33/48 sits 8.2 SD above that: blind
+	// escape is 8.6e-13 per window, ~1e-25 once confirmBelowFloor requires a
+	// second independent run, while an honest VLM scoring 0.85 is still refused
+	// only 0.12% of the time (0.80 → 2.10%, 0.90 → 0.0%).
+	//
+	// Deliberately looser than the big tier's 46/48, and kept that way now that
+	// the honest side has been measured. The 48-item honest window scores 48/48
+	// (three independent 16-item runs, fresh images each), i.e. a 95% lower bound
+	// of 0.9397 — but that is ONE model on ONE machine, and it is exactly the
+	// quantity a fraud-claiming worker would also have to reach. Deriving the
+	// floor from the score that only an honest VLM can produce would make the
+	// instrument circular: the claim "a real VLM clears it" is what the run was
+	// meant to establish. The blind-guess arithmetic above needs no honest run at
+	// all, so it stays the derivation, and the looser floor is what it buys: a
+	// worker that perceives colour but cannot count scores 0.625 and is refused
+	// 87.9% of the time here, where 30/48 would refuse it only 42.2%. Do not go
+	// below 33/48 on this family — the honest side is already at 0% false-ban
+	// there, so the only thing left to trade away is that catch rate.
+	//
+	// The other side of this floor was measured 2026-10-08, after the arithmetic
+	// was already written. A py-inference box cannot produce the liar, because
+	// ensure_model corrects the claim before the first item (the probe's opening
+	// request triggered a 23.9s reload and the VLM answered all 48 items), so the
+	// lie was built as a standalone responder instead — stdlib, claims the VLM,
+	// accepts the multimodal array, ignores the pixels, answers the text. Two
+	// versions, two 48-item windows each, zero aborts anywhere; background half
+	// first, count half second:
+	//
+	//	blind    guesses both kinds   14/48 ( 3/24,  11/24)    9/48 ( 4/24, 5/24)
+	//	colour   1 background pixel   28/48 (24/24,   4/24)   30/48 (24/24, 6/24)
+	//
+	// The colour variant is the 0.625 worker priced above, and it measured exactly
+	// that in the second window: it takes the whole background half (24/24) and
+	// nothing of the count half (6/24, i.e. chance), which is 30/48 — still under
+	// the floor. That is the margin the 33-vs-30 choice buys: at 30/48 this worker
+	// would sit ON the threshold. The blind windows straddle their own 10.00 mean
+	// and miss by 19 and 24 items; that spread is what the 8.2 SD figure means in
+	// practice. Two windows cannot measure an escape RATE; what they establish is
+	// that a responder with no reading of the image does not reach the threshold,
+	// which is the claim the floor rests on.
+	"qwen3-vl-8b": 33.0 / 48.0,
+	// image-generation family (probe_imagegen.go). Scored on RENDERED BYTES, not on
+	// answers, so the arithmetic is even more favourable than the vision family's: there
+	// is no partial credit to guess at.
+	//
+	// Derived from the IMPERSONATION side, as the vision floor is. A responder that
+	// fabricates output has no path to passing an item:
+	//
+	//	random bytes       fail to decode at all
+	//	a blank canvas     passes decode + size, fails the flat-colour check
+	//	correctly-sized    decode, size and flatness all pass — caught by the prompt-shape
+	//	noise              check, since noise has neither a red centre nor white corners
+	//	one canned image   passes every per-item check — caught by the diversity gate,
+	//	                   which requires distinct bytes across the round's fresh seeds
+	//
+	// The realistic impersonation is therefore the "correctly-sized noise" case, and even
+	// granting it the prompt-shape check by luck, the probability that independent noise
+	// lands a red centre AND a white corner is far below the 1/6 the vision family's
+	// blind guesser enjoys; a model that emits noise clears one item at most by accident.
+	//
+	// Floor derived from BOTH sides on real hardware (SDXL base 1.0, fp16, RTX 3080,
+	// 2026-10-20), at the probe's own parameters (1024x1024, 24 steps):
+	//
+	//	honest     14/16 items passed (the two misses drew the circle as a busy pattern
+	//	           with too little plain background); Wilson 95% lower bound on the
+	//	           per-item rate is 0.64
+	//	impostors  uniform noise, red-speckled light noise, a blank canvas and a flat
+	//	           red frame each scored 0/50
+	//
+	// The floor sits where the honest side survives even at that lower bound: at
+	// p=0.64, P(≥24/48) ≈ 0.98, while every measured impersonation passes nothing.
+	// An earlier 40/48 placeholder, set before any measurement, would have refused
+	// the honest model about one round in seven at its MEASURED rate and most rounds
+	// at the lower bound.
+	"flux-schnell": 24.0 / 48.0,
+	"sdxl":         24.0 / 48.0,
+	// The upstream repository name ("stabilityai/stable-diffusion-xl-base-1.0")
+	// normalises to "...stablediffusionxl...", which contains no "sdxl": without this
+	// key the model silently fell through to probe.min_score.
+	"stable-diffusion-xl": 24.0 / 48.0,
+
+	// Speech. Both sides measured on a test worker (2026-11-05, 48 items each, TestSpeechLive):
+	//
+	//	ASR  honest whisper-small 48; an empty transcript 0; random digit words 0
+	//	     (a guessed 4-digit sequence is right with probability 1e-4)
+	//	TTS  honest Kokoro 48; silence 0, a steady tone 0, white noise 0, one fixed
+	//	     recording 3. Noise gated at a syllable rate scored 48 and a recording
+	//	     stretched to the expected length 38 on the shape checks alone — the
+	//	     content check (transcription on an admitted ASR worker) scores both 0.
+	//
+	// Every fabricator lands near 0 once checked, and the honest side at 48, so the
+	// floors have a wide margin in both directions. Not established by either probe:
+	// that the answer came from THIS model. whisper-tiny scored 45 as whisper-small and
+	// espeak-ng 48 as Kokoro — lesser models of the same kind pass, as a smaller
+	// diffusion model passes the image probe. That is outside what admission measures.
+	"whisper": 40.0 / 48.0,
+	"kokoro":  24.0 / 48.0,
+}
+
+// probeKind is the probe family a model's NAME implies (family markers). The auditor
+// asks kindOf, which prefers the catalog's configured modality.
+func probeKind(model string) string {
+	switch {
+	case isASRModel(model):
+		return "asr"
+	case isTTSModel(model):
+		return "tts"
+	case isImageGenModel(model):
+		return "image_gen"
+	case isVisionModel(model):
+		return "vision"
+	default:
+		return "text"
+	}
 }
 
 // floorFor resolves the score floor for a claimed model.
@@ -140,6 +261,9 @@ func (a *auditor) floorFor(model string) float64 {
 	}
 	if bestLen >= 0 {
 		return best
+	}
+	if f, ok := kindFloors[a.kindOf(model)]; ok {
+		return f
 	}
 	return a.cfg.MinScore
 }
@@ -206,19 +330,101 @@ const evidenceWindow = 3
 // only the extra minute before it is caught. A transport error returns an error
 // rather than a verdict, so a network blip is never read as confirmed guilt.
 func (a *auditor) confirmBelowFloor(ctx context.Context, w worker.Worker, model string, floor float64) (stillBelow bool, score float64, err error) {
-	qs := a.generate(a.cfg.NumQuestions)
-	correct := 0
+	correct, n, err := a.runModelProbe(ctx, w, model)
+	if err != nil {
+		return false, 0, err
+	}
+	score = float64(correct) / float64(n)
+	return score < floor, score, nil
+}
+
+// runModelProbe runs one full probe round (NumQuestions fresh items) against a
+// claimed model and returns (correct, asked). The item kind follows the model family:
+// an image-generation model gets rendered-image byte checks (probe_imagegen.go), an
+// image-understanding model gets rendered-image questions (probe_vision.go), everything
+// else the arithmetic set. A transport error aborts the round (not counted) — the caller
+// decides whether that is retryable.
+//
+// Dispatch is table-driven rather than an if/else chain: with three families a chain
+// reads as nested conditions and the ORDER silently decides which wins when a model name
+// matches two marker sets. Here the order is explicit and each entry states its own
+// claim, so adding a fourth family is one line and cannot reorder the others by accident.
+// kindOf is the probe family for model: the catalog's configured modality when it
+// names a non-text one, otherwise the family markers in the model's name (probeKind).
+// A model whose name carries no marker ("segmind/SSD-1B" is an image generator) was
+// otherwise probed with chat questions it cannot answer and never admitted.
+func (a *auditor) kindOf(model string) string {
+	if a.gw != nil && a.gw.settlementCfg != nil {
+		switch a.gw.modalityOf(a.gw.canonicalCatalogModel(model)) {
+		case settlement.ModalityImage:
+			return "image_gen"
+		case settlement.ModalityASR:
+			return "asr"
+		case settlement.ModalityTTS:
+			return "tts"
+		case settlement.ModalityVision:
+			return "vision"
+		}
+	}
+	return probeKind(model)
+}
+
+// kindFloors is the floor of a model no family key matches, by probe family. The
+// image and speech probes measure the kind of output, not which model produced it
+// (see the speech note in defaultModelFloors), so a model of the family is held to
+// the family's floor rather than to the permissive probe.min_score.
+var kindFloors = map[string]float64{
+	"image_gen": 24.0 / 48.0,
+	"asr":       40.0 / 48.0,
+	"tts":       24.0 / 48.0,
+	"vision":    33.0 / 48.0,
+}
+
+func (a *auditor) runModelProbe(ctx context.Context, w worker.Worker, model string) (correct, n int, err error) {
+	// A speech or image model must never fall through to the text probe, which would
+	// send it chat it cannot answer; kindOf decides the family before anything is sent.
+	switch a.kindOf(model) {
+	case "asr":
+		return a.runASRProbe(ctx, w, model)
+	case "tts":
+		return a.runTTSProbe(ctx, w, model)
+	case "image_gen":
+		return a.runImageGenProbe(ctx, w, model)
+	case "vision":
+		return a.runVisionProbe(ctx, w, model)
+	default:
+		return a.runTextProbe(ctx, w, model)
+	}
+}
+
+// runVisionProbe is the image-understanding round (rendered-image questions).
+func (a *auditor) runVisionProbe(ctx context.Context, w worker.Worker, model string) (correct, n int, err error) {
+	qs := a.generateVision(a.cfg.NumQuestions)
 	for _, q := range qs {
-		ok, aerr := a.askModel(ctx, w, model, q)
+		ok, aerr := a.askVision(ctx, w, model, q)
 		if aerr != nil {
-			return false, 0, aerr
+			return 0, 0, aerr
 		}
 		if ok {
 			correct++
 		}
 	}
-	score = float64(correct) / float64(len(qs))
-	return score < floor, score, nil
+	return correct, len(qs), nil
+}
+
+// runTextProbe is the arithmetic round for everything else.
+func (a *auditor) runTextProbe(ctx context.Context, w worker.Worker, model string) (correct, n int, err error) {
+	qs := a.generate(a.cfg.NumQuestions)
+	for _, q := range qs {
+		ok, aerr := a.askModel(ctx, w, model, q)
+		if aerr != nil {
+			return 0, 0, aerr
+		}
+		if ok {
+			correct++
+		}
+	}
+	return correct, len(qs), nil
 }
 
 // record appends a run and returns the pooled score plus whether the window is
@@ -348,7 +554,12 @@ type auditor struct {
 	// single Run goroutine, so unlocked. In-memory: a restart forgets it, which
 	// at worst means one extra spot check per worker after a restart.
 	lastChecked map[string]time.Time
-	now         func() time.Time // injectable for tests
+	// spotCursor rotates spot checks across a multi-pool worker's resident models:
+	// one model per cycle, the next one the following cycle. Without it only the
+	// primary model would ever be spot-checked and a worker could serve its other
+	// pools with anything. Run-goroutine only, like lastChecked.
+	spotCursor map[string]int
+	now        func() time.Time // injectable for tests
 }
 
 func newAuditor(cfg ProbeConfig, gw *Gateway, logger *slog.Logger) *auditor {
@@ -386,6 +597,7 @@ func newAuditor(cfg ProbeConfig, gw *Gateway, logger *slog.Logger) *auditor {
 		admFails:    make(map[string]int),
 		evidence:    make(map[string][]probeRun),
 		lastChecked: make(map[string]time.Time),
+		spotCursor:  make(map[string]int),
 		now:         time.Now,
 	}
 }
@@ -440,7 +652,7 @@ func (a *auditor) Run(ctx context.Context) {
 func (a *auditor) candidates() []worker.Worker {
 	var out []worker.Worker
 	for _, w := range a.gw.registry.List() {
-		if !w.SelfRegistered || w.IsBanned() || w.LoadedModel == "" {
+		if !w.SelfRegistered || w.IsBanned() || len(loadedModels(&w)) == 0 {
 			continue
 		}
 		if !a.spotDue(w.ID) {
@@ -478,10 +690,14 @@ func (a *auditor) nextUnverified() (worker.Worker, string, bool) {
 			}
 			return w, m, true
 		}
-		// A worker that advertised no supported list still gets its loaded model
+		// A worker that advertised no supported list still gets its loaded models
 		// verified — otherwise the gate would starve it forever.
-		if len(w.SupportedModels) == 0 && w.LoadedModel != "" && !workerVerifiedFor(&w, w.LoadedModel) {
-			return w, w.LoadedModel, true
+		if len(w.SupportedModels) == 0 {
+			for _, m := range loadedModels(&w) {
+				if !workerVerifiedFor(&w, m) {
+					return w, m, true
+				}
+			}
 		}
 	}
 	return worker.Worker{}, "", false
@@ -501,10 +717,12 @@ func (a *auditor) nextExpired() (worker.Worker, string, bool) {
 		if time.Since(w.VerifiedAt) < a.cfg.VerifyTTL {
 			continue
 		}
-		// Re-confirm the loaded model if it is one of the verified ones (no switch
-		// cost); otherwise the first verified model.
-		if w.LoadedModel != "" && workerVerifiedFor(&w, w.LoadedModel) {
-			return w, w.LoadedModel, true
+		// Re-confirm a resident model if one is verified (no switch cost);
+		// otherwise the first verified model.
+		for _, m := range loadedModels(&w) {
+			if workerVerifiedFor(&w, m) {
+				return w, m, true
+			}
 		}
 		return w, w.VerifiedModels[0], true
 	}
@@ -518,29 +736,31 @@ func (a *auditor) nextExpired() (worker.Worker, string, bool) {
 // never count — a mining yield or blip just retries next tick.
 func (a *auditor) verifyModel(ctx context.Context, w worker.Worker, model string) {
 	key := w.ID + "|" + model
-	qs := a.generate(a.cfg.NumQuestions)
-	correct := 0
-	for _, q := range qs {
-		ok, err := a.askModel(ctx, w, model, q)
-		if err != nil {
-			a.logger.Warn("admission probe aborted (transport error, not counted)",
-				"worker", w.ID, "model", model, "error", err)
-			return
-		}
-		if ok {
-			correct++
-		}
+	// Probing a model that is not resident makes the worker switch to it, exactly as a
+	// user request would; mark it the same way so other requests for that pool are not
+	// routed onto the reloading engine meanwhile.
+	if !workerHasLoaded(&w, model) {
+		by := "probe-" + generateRequestID()
+		a.gw.registry.MarkSwitching(w.ID, model, by)
+		defer a.gw.registry.EndSwitchBy(by)
 	}
-	score := float64(correct) / float64(len(qs))
+	correct, n, err := a.runModelProbe(ctx, w, model)
+	if err != nil {
+		a.logger.Warn("admission probe aborted (transport error, not counted)",
+			"worker", w.ID, "model", model, "error", err)
+		return
+	}
+	score := float64(correct) / float64(n)
 	floor := a.floorFor(model)
-	pooled, full := a.record(key, correct, len(qs))
+	pooled, full := a.record(key, correct, n)
 	// Verdict on POOLED evidence, never on one run — see evidenceWindow.
 	// A first pass admits optimistically (the worker starts earning while
 	// evidence accumulates); only a full window can convict.
 	pass := pooled >= floor
 	a.logger.Info("admission probe complete", "worker", w.ID, "model", model,
+		"kind", a.kindOf(model),
 		"score", fmt.Sprintf("%.3f", score), "pooled", fmt.Sprintf("%.3f", pooled),
-		"floor", fmt.Sprintf("%.3f", floor), "correct", correct, "n", len(qs),
+		"floor", fmt.Sprintf("%.3f", floor), "correct", correct, "n", n,
 		"window_full", full, "pass", pass)
 
 	// Recompute the verified set from the CURRENT registry snapshot (this probe
@@ -605,34 +825,31 @@ func (a *auditor) verifyModel(ctx context.Context, w worker.Worker, model string
 
 // probeWorker runs one probe against a single worker and bans it on a suspect verdict.
 func (a *auditor) probeWorker(ctx context.Context, w worker.Worker) {
-	qs := a.generate(a.cfg.NumQuestions)
-	correct := 0
-	for _, q := range qs {
-		ok, err := a.ask(ctx, w, q)
-		if err != nil {
-			// A transport error is not evidence of fraud — skip the run rather than
-			// punish for a network blip or a mid-probe mining yield.
-			a.logger.Warn("probe aborted (transport error, not counted)", "worker", w.ID, "error", err)
-			return
-		}
-		if ok {
-			correct++
-		}
+	model := a.nextSpotModel(w)
+	if model == "" {
+		return
 	}
-	score := float64(correct) / float64(len(qs))
+	correct, n, err := a.runModelProbe(ctx, w, model)
+	if err != nil {
+		// A transport error is not evidence of fraud — skip the run rather than
+		// punish for a network blip or a mid-probe mining yield.
+		a.logger.Warn("probe aborted (transport error, not counted)", "worker", w.ID, "error", err)
+		return
+	}
+	score := float64(correct) / float64(n)
 	a.markChecked(w.ID) // a full run completed — start the spot-check cooldown
-	pooled, full := a.record(w.ID+"|"+w.LoadedModel, correct, len(qs))
+	pooled, full := a.record(w.ID+"|"+model, correct, n)
 	// Same rule as admission: convict on pooled evidence only. One unlucky run
 	// must never ban a worker that is serving the model it claims.
-	floor := a.floorFor(w.LoadedModel)
+	floor := a.floorFor(model)
 	suspect := full && pooled < floor
 	a.logger.Info("probe complete", "worker", w.ID, "miner", w.MinerAddress,
-		"model", w.LoadedModel, "score", fmt.Sprintf("%.3f", score),
+		"model", model, "kind", a.kindOf(model), "score", fmt.Sprintf("%.3f", score),
 		"pooled", fmt.Sprintf("%.3f", pooled), "floor", fmt.Sprintf("%.3f", floor),
-		"correct", correct, "n", len(qs), "window_full", full, "suspect", suspect)
+		"correct", correct, "n", n, "window_full", full, "suspect", suspect)
 	if suspect {
 		// Independent confirmation before punishment (see confirmBelowFloor).
-		stillBad, confScore, cerr := a.confirmBelowFloor(ctx, w, w.LoadedModel, floor)
+		stillBad, confScore, cerr := a.confirmBelowFloor(ctx, w, model, floor)
 		if cerr != nil {
 			a.logger.Warn("confirmation run failed transport-wise; no punishment this cycle",
 				"worker", w.ID, "error", cerr)
@@ -640,23 +857,30 @@ func (a *auditor) probeWorker(ctx context.Context, w worker.Worker) {
 		}
 		if !stillBad {
 			a.logger.Info("confirmation run PASSED — pooled verdict not upheld, no ban",
-				"worker", w.ID, "model", w.LoadedModel,
+				"worker", w.ID, "model", model,
 				"confirm_score", fmt.Sprintf("%.3f", confScore), "floor", fmt.Sprintf("%.3f", floor))
-			a.clearEvidence(w.ID + "|" + w.LoadedModel) // stale evidence: restart the window
+			a.clearEvidence(w.ID + "|" + model) // stale evidence: restart the window
 			return
 		}
 		until := time.Now().Add(time.Duration(a.cfg.BanSeconds) * time.Second)
 		reason := fmt.Sprintf("probe pooled score %.3f below floor %.3f over %d runs (model %s)",
-			pooled, floor, evidenceWindow, w.LoadedModel)
+			pooled, floor, evidenceWindow, model)
 		a.banOrWarn(w.ID, reason, until, "miner", w.MinerAddress,
 			"pooled", fmt.Sprintf("%.3f", pooled),
 			"note", "on-chain confiscation of frozen earnings requires manual arbiter review")
 	}
 }
 
-// ask sends one probe question against the worker's LOADED model.
-func (a *auditor) ask(ctx context.Context, w worker.Worker, q probeQuestion) (bool, error) {
-	return a.askModel(ctx, w, w.LoadedModel, q)
+// nextSpotModel picks which resident model of w this spot check audits, rotating so
+// every pool of a multi-pool worker is checked in turn.
+func (a *auditor) nextSpotModel(w worker.Worker) string {
+	models := loadedModels(&w)
+	if len(models) == 0 {
+		return ""
+	}
+	i := a.spotCursor[w.ID] % len(models)
+	a.spotCursor[w.ID] = i + 1
+	return models[i]
 }
 
 // askModel sends one probe question with an EXPLICIT model name (admission probes
@@ -681,10 +905,37 @@ func (a *auditor) askModel(ctx context.Context, w worker.Worker, model string, q
 		// generation stops at the model's own stop token.
 		"max_tokens": 2048,
 	})
+	answer, err := a.sendProbe(ctx, w, body)
+	if err != nil {
+		return false, err
+	}
+	if a.scoreOverride != nil {
+		return a.scoreOverride(q, answer), nil
+	}
+	return scoreProbeAnswer(q, answer), nil
+}
+
+// askVision sends one image-understanding probe item (multimodal body) and scores it.
+func (a *auditor) askVision(ctx context.Context, w worker.Worker, model string, q visionQuestion) (bool, error) {
+	answer, err := a.sendProbe(ctx, w, visionProbeBody(model, q))
+	if err != nil {
+		return false, err
+	}
+	if a.scoreOverride != nil {
+		return a.scoreOverride(q.probeQuestion, answer), nil
+	}
+	return scoreVisionAnswer(q, answer), nil
+}
+
+// sendProbe POSTs a prepared chat-completions body to the worker's inference port
+// and returns the assistant message text. Transport is identical for text and
+// vision probes and for forwarded user traffic (same headers, same mTLS client),
+// so a probe cannot be told apart from a paying request.
+func (a *auditor) sendProbe(ctx context.Context, w worker.Worker, body []byte) (string, error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost,
 		strings.TrimRight(w.Endpoint, "/")+"/v1/chat/completions", bytes.NewReader(body))
 	if err != nil {
-		return false, err
+		return "", err
 	}
 	req.Header.Set("Content-Type", "application/json")
 	// Wear the same headers a forwarded user request wears. A probe that is
@@ -707,15 +958,15 @@ func (a *auditor) askModel(ctx context.Context, w worker.Worker, model string, q
 	}
 	resp, err := probeClient.Do(req)
 	if err != nil {
-		return false, err
+		return "", err
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
-		return false, fmt.Errorf("worker returned %d", resp.StatusCode)
+		return "", fmt.Errorf("worker returned %d", resp.StatusCode)
 	}
 	raw, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
 	if err != nil {
-		return false, err
+		return "", err
 	}
 	var parsed struct {
 		Choices []struct {
@@ -723,12 +974,9 @@ func (a *auditor) askModel(ctx context.Context, w worker.Worker, model string, q
 		} `json:"choices"`
 	}
 	if err := json.Unmarshal(raw, &parsed); err != nil || len(parsed.Choices) == 0 {
-		return false, fmt.Errorf("unparseable worker response")
+		return "", fmt.Errorf("unparseable worker response")
 	}
-	if a.scoreOverride != nil {
-		return a.scoreOverride(q, parsed.Choices[0].Message.Content), nil
-	}
-	return scoreProbeAnswer(q, parsed.Choices[0].Message.Content), nil
+	return parsed.Choices[0].Message.Content, nil
 }
 
 // probeInstructions rotate by content hash so there is no single fixed suffix to

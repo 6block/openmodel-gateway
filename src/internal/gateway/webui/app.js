@@ -12,7 +12,7 @@
 "use strict";
 
 const $ = (id) => document.getElementById(id);
-const LS = { key: "om_api_key", wallet: "om_wallet", msgs: "om_messages", session: "om_session", refunds: "om_refunds", walletRdns: "om_wallet_rdns" };
+const LS = { key: "om_api_key", wallet: "om_wallet", msgs: "om_messages", session: "om_session", refunds: "om_refunds", walletRdns: "om_wallet_rdns", imgSize: "om_img_size" };
 
 /* API keys are wallet-scoped: a key bills the wallet it was registered under,
  * so adopting one wallet's key while ANOTHER wallet is connected silently
@@ -62,7 +62,9 @@ const state = {
   thinking: false,      // per-request opt-in: ask the model to reason before answering
   filPrice: 0,          // USD per FIL (live when /v1/me refreshes it)
   prices: null,         // {out, inp, cache} USD per TOKEN for the default model
-  catalog: null,        // model id → {input, output, cache, available} USD per 1M tokens
+  catalog: null,        // model id → {input, output, cache, available, modality, context_window, max_output}
+  attach: [],           // images staged for the NEXT message: [{dataUrl,w,h,name,bytes,tokens}]
+  attachSrc: [],        // decoded originals, 1:1 with `attach`; kept so a size change re-encodes them
 };
 
 state.apiKey = initialKey();
@@ -100,6 +102,9 @@ async function boot() {
   updateDepositEstimate();
   initWalletDiscovery();
   wireEvents();
+  $("img-size").value = localStorage.getItem(LS.imgSize) || "1024";
+  onModelChanged();          // sets the attach button's visibility for the first model
+  renderAttachments();
   renderKey();
   renderMessages();
   if (state.apiKey) { loadModels(); refreshMe(); }
@@ -223,7 +228,12 @@ function wireEvents() {
     persist();
     renderMessages();
   };
-  $("model-select").onchange = updateModelPrice;
+  $("model-select").onchange = () => {
+    localStorage.setItem(LS.model, $("model-select").value);
+    $("model-select").dataset.want = $("model-select").value;
+    updateModelPrice();
+    onModelChanged();
+  };
   $("btn-loadkeys").onclick = loadKeyList;
   $("btn-createkey").onclick = createKey;
   $("btn-copynewkey").onclick = () => navigator.clipboard.writeText($("new-key-full").textContent);
@@ -261,6 +271,58 @@ function wireEvents() {
   $("thinking-toggle").onchange = (e) => { state.thinking = e.target.checked; };
   $("deposit-amount").addEventListener("input", updateDepositEstimate);
   $("btn-send").onclick = send;
+
+  /* ---- image attachments ---- */
+  $("btn-attach").onclick = () => {
+    if (!modelIsVision()) {
+      setStatus("The selected model does not read images — pick a vision model first.");
+      return;
+    }
+    $("file-input").click();
+  };
+  $("file-input").onchange = (e) => { addFiles(e.target.files); e.target.value = ""; };
+  $("btn-audio").onclick = () => $("audio-input").click();
+  $("audio-input").onchange = (e) => {
+    const f = e.target.files && e.target.files[0];
+    e.target.value = "";
+    if (f) transcribeAudio(f, f.name);
+  };
+  $("btn-record").onclick = toggleRecording;
+  $("img-size").onchange = async () => {
+    localStorage.setItem(LS.imgSize, $("img-size").value);
+    try {
+      await reencodeAttachments();   // applies to images already attached, not just the next one
+    } catch (e) {
+      setStatus(errMsg(e));
+    }
+  };
+  // Drag & drop anywhere in the composer, plus paste-into-textarea for screenshots.
+  const comp = $("composer");
+  comp.addEventListener("dragover", (e) => {
+    if (!Array.from(e.dataTransfer.types || []).includes("Files")) return;
+    e.preventDefault();
+    comp.classList.add("droptarget");
+  });
+  comp.addEventListener("dragleave", () => comp.classList.remove("droptarget"));
+  comp.addEventListener("drop", (e) => {
+    comp.classList.remove("droptarget");
+    if (!e.dataTransfer.files || !e.dataTransfer.files.length) return;
+    e.preventDefault();
+    addFiles(e.dataTransfer.files);
+  });
+  document.addEventListener("paste", (e) => {
+    const items = e.clipboardData && e.clipboardData.items;
+    if (!items) return;
+    const files = [];
+    for (const it of items) {
+      if (it.kind === "file" && it.type.startsWith("image/")) {
+        const f = it.getAsFile();
+        if (f) files.push(f);
+      }
+    }
+    if (files.length) { e.preventDefault(); addFiles(files); }
+  });
+  $("input").addEventListener("input", renderBudget);   // typed text counts against the budget
   $("input").addEventListener("keydown", (e) => {
     if (e.key === "Enter" && !e.shiftKey) {
       e.preventDefault();
@@ -581,7 +643,11 @@ async function refreshMe() {
     for (const u of rows.slice(0, 10)) {
       const div = document.createElement("div");
       const cost = u.cost_usd ? " · $" + trimNum(u.cost_usd) : "";
-      div.textContent = `${u.ts.slice(11, 19)} ${u.status} ${u.prompt_tokens}+${u.completion_tokens}tok${cost}`;
+      const unitShort = { image: "img", audio_second: "s", character: "chars" };
+      const what = u.quantity
+        ? `${u.quantity} ${unitShort[u.unit] || u.unit || "img"}`
+        : u.images ? `${u.images} img` : `${u.prompt_tokens}+${u.completion_tokens}tok`;
+      div.textContent = `${u.ts.slice(11, 19)} ${u.status} ${what}${cost}`;
       box.appendChild(div);
     }
     updateDepositEstimate();
@@ -727,6 +793,7 @@ async function deposit() {
       if (state.apiKey) {
         const b = await refreshMe();
         if (b && before != null && parseFloat(b.available_usd) > parseFloat(before)) {
+          await refreshBalance(); // the wallet card's on-chain line still showed the pre-deposit amount
           $("deposit-status").innerHTML = `✓ funds visible to the gateway — ready to chat`;
           return;
         }
@@ -864,12 +931,27 @@ function buildCatalog(cfg) {
   // "0.20"/"0.60"); parsing to float here would strip trailing zeros. No
   // arithmetic is done on these — the bar/table just interpolate them.
   state.catalog = {};
+  _catalogIndex = null;   // the normalized lookup must be rebuilt for the new catalog
   for (const m of cfg.models_pricing || []) {
     state.catalog[m.id] = {
       input: m.input_per_mtok || "0",
       output: m.output_per_mtok || "0",
       cache: m.cache_read_per_mtok || "0",
       available: !!m.available,
+      // Vision plumbing (see the attachments section): modality gates the attach
+      // UI, the window/output pair sizes the token budget. Absent on older
+      // gateways, where the UI falls back to a text-only, 8192-window view.
+      modality: m.modality || "",
+      context_window: m.context_window || 0,
+      max_output: m.max_output || 0,
+      // Image generation: priced per image (unit_price_usd), not per token, and
+      // served by /v1/images/generations rather than chat. Absent on token models.
+      price_unit: m.price_unit || "token",
+      unit_price: m.unit_price_usd || "",
+      max_gen_images: m.max_images_per_generation || 0,
+      // Speech: transcription is billed per input second, synthesis per character.
+      max_audio_sec: m.max_audio_sec || 0,
+      max_chars: m.max_chars || 0,
     };
   }
   const d = cfg.prices_usd;
@@ -894,27 +976,72 @@ function buildCatalog(cfg) {
 
 function fillModelOptions(ids) {
   const sel = $("model-select");
-  const cur = sel.value;
-  sel.innerHTML = "";
+  // Canonicalize to the CATALOG spelling before building the options. The picker is
+  // filled twice — once from /v1/webconfig (catalog spelling) and again from
+  // /v1/models (worker spelling) — and those differ ("/models/Qwen--Qwen3-VL-8B-
+  // Instruct" vs "Qwen/Qwen3-VL-8B-Instruct"). Keeping whichever came last made every
+  // downstream `catalog[id]` lookup miss, which is how the picker ended up showing a
+  // vision model's name while the price line and the attach button behaved as if a
+  // text model were selected. Normalizing here fixes all of those at once.
+  const seen = new Set();
+  const canonical = [];
   for (const id of ids) {
+    // Prefer the configured key when this id names a catalog model; otherwise keep
+    // the id as given (a model the catalog does not price).
+    const key = _catalogIndex && _catalogIndex[normalizeModelID(id)]
+      ? (Object.keys(state.catalog).find((k) => k !== "default" && normalizeModelID(k) === normalizeModelID(id)) || id)
+      : id;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    canonical.push(key);
+  }
+  // Restore by REMEMBERED id, not by "is the current value still in the list".
+  // Rebuilding the options resets selectedIndex to 0; if the current value is not in
+  // the new list the old code simply left that reset in place.
+  const cur = sel.value || sel.dataset.want || localStorage.getItem(LS.model) || "";
+  sel.innerHTML = "";
+  for (const id of canonical) {
     const o = document.createElement("option");
     o.value = id;
     o.textContent = friendlyModelName(id);
     sel.appendChild(o);
   }
-  if (ids.includes(cur)) sel.value = cur;
+  // Match the remembered choice on the normalized key too, so a value remembered
+  // under one spelling is still restored when the options arrive in the other.
+  const curNorm = normalizeModelID(cur);
+  const match = canonical.find((id) => id === cur || normalizeModelID(id) === curNorm);
+  if (match) {
+    sel.value = match;
+  } else if (canonical.length) {
+    // No remembered match: prefer a vision model, since attaching images is the
+    // capability this picker most often exists to reach.
+    const vis = canonical.find((id) => { const e = catalogEntry(id); return e && e.modality === "vision"; });
+    sel.value = vis || canonical[0];
+  }
+  sel.dataset.want = sel.value;
+  onModelChanged();
 }
 
 function priceFor(modelId) {
-  return (state.catalog && state.catalog[modelId]) || (state.catalog && state.catalog.default) || null;
+  // catalogEntry (not a raw key lookup) so the price line shows the right tier
+  // whether the selected id came from the catalog spelling or the live list's.
+  return catalogEntry(modelId) || (state.catalog && state.catalog.default) || null;
 }
 
 /* The current model's rate, shown both in the sidebar and as the chat-pane bar. */
+/* One price line for a catalog entry, in the unit it is actually billed in. */
+function priceLine(p) {
+  if (p && p.price_unit === "image") return `$${p.unit_price || "?"} / image`;
+  if (p && p.price_unit === "audio_second") return `$${p.unit_price || "?"} / second of audio`;
+  if (p && p.price_unit === "character") return `$${p.unit_price || "?"} / character`;
+  return `in $${p.input} · cached $${p.cache} · out $${p.output} / 1M tok`;
+}
+
 function updateModelPrice() {
   const id = $("model-select").value;
   const p = priceFor(id);
   if (!p) { $("model-price").textContent = ""; $("model-price-bar").hidden = true; return; }
-  const line = `in $${p.input} · cached $${p.cache} · out $${p.output} / 1M tok`;
+  const line = priceLine(p);
   $("model-price").textContent = line;
   const bar = $("model-price-bar");
   bar.textContent = `${friendlyModelName(id)} — ${line}`;
@@ -931,6 +1058,13 @@ function renderPricingTable() {
   for (const id of ids) {
     const p = state.catalog[id];
     const dim = p.available ? "" : ' class="offline"';
+    const unitLabel = { image: "per image", audio_second: "per second of audio", character: "per character" }[p.price_unit];
+    if (unitLabel) {
+      // Per-unit models do not have input/cached/output token rates; one cell
+      // spanning the three says what is actually charged.
+      html += `<tr${dim}><td title="${esc(id)}">${esc(friendlyModelName(id))}</td><td colspan="3">$${p.unit_price || "?"} ${unitLabel}</td></tr>`;
+      continue;
+    }
     html += `<tr${dim}><td title="${esc(id)}">${esc(friendlyModelName(id))}</td><td>$${p.input}</td><td>$${p.cache}</td><td>$${p.output}</td></tr>`;
   }
   html += "</tbody></table>";
@@ -949,18 +1083,384 @@ async function loadModels() {
   } catch { /* dropdown keeps whatever the public catalog populated */ }
 }
 
+/* Build the outgoing messages array. Turns that carried images keep them, but only
+ * the newest turn re-sends the pixels: history images would be re-billed on every
+ * follow-up and, with no per-request image cap, would eventually push the prompt
+ * past the context window on their own. Older turns carry a text marker instead so
+ * the model can still see that a picture was discussed. */
+function buildRequestMessages() {
+  let lastImgIdx = -1;
+  // Only a vision model receives pixels. After switching to a text model mid-conversation
+  // the earlier image turn would otherwise be re-sent and every later message refused
+  // ("does not accept image input") until the conversation was cleared.
+  if (modelIsVision()) {
+    state.messages.forEach((m, i) => { if (m.role === "user" && m.images && m.images.length) lastImgIdx = i; });
+  }
+  // Image-generation turns are not chat: a text model would read "prompt → (empty
+  // reply)" pairs and get confused, and the generated pixels are not context for it.
+  const genIdx = new Set();
+  state.messages.forEach((m, i) => {
+    // Failed turns too: the page's own "⚠ 400: …" text sent back as an assistant
+    // reply was parroted by the model on the next question.
+    if (m.role === "assistant" && m.meta && (m.meta.gen || m.meta.speech || m.meta.error)) { genIdx.add(i); if (i > 0) genIdx.add(i - 1); }
+  });
+  return state.messages.map((m, i) => ({ m, i })).filter(({ i }) => !genIdx.has(i)).map(({ m, i }) => {
+    if (m.role === "user" && m.images && m.images.length) {
+      if (i !== lastImgIdx) {
+        return { role: "user", content: (m.content ? m.content + " " : "") + "[image omitted from history]" };
+      }
+      const parts = [];
+      if (m.content) parts.push({ type: "text", text: m.content });
+      for (const url of m.images) parts.push({ type: "image_url", image_url: { url } });
+      return { role: "user", content: parts };
+    }
+    return { role: m.role, content: m.content };
+  });
+}
+
+/* ---------------- image attachments ----------------
+ *
+ * The model's catalog entry decides everything here: `modality` says whether the
+ * selected model reads images at all, and `context_window` / `max_output` bound
+ * how much can be sent. There is deliberately NO image-count limit — the worker
+ * accepts as many as fit, and the real ceiling is the context window, enforced
+ * here before anything is uploaded so a request that would be rejected (or, worse,
+ * billed almost nothing and answered blind) is never sent.
+ *
+ * Token accounting, measured against Qwen3-VL on the real hardware:
+ *   visual tokens ≈ pixels / 1000   → 512² ≈ 258, 1024² ≈ 1026 per image.
+ * Text is estimated at ~4 chars per token, the same heuristic the gateway uses to
+ * size its balance reservation. Both are estimates: the authoritative count comes
+ * back in `usage.prompt_tokens` after the request, and that is what is billed.
+ */
+const ATTACH_MAX_BYTES = 7 * 1024 * 1024;   // matches the worker's per-image reject point
+const IMG_FALLBACK_CTX = 8192;              // used when the catalog omits the window
+
+/* Catalog lookup that tolerates the two spellings the gateway uses for one model.
+ *
+ * /v1/webconfig and /v1/catalog key their entries by the CONFIG spelling
+ * ("/models/Qwen--Qwen3-VL-8B-Instruct"), while /v1/models lists the worker-reported
+ * spelling ("Qwen/Qwen3-VL-8B-Instruct") — the same model, and the gateway accepts
+ * either on a request. The picker is filled from both sources (catalog first, then
+ * the live list), so a raw `catalog[sel.value]` lookup misses whenever the live list
+ * won — price fell back to the default tier and the vision checks read "not a vision
+ * model", which is exactly the "name looks right, features are wrong" symptom.
+ * Compare on a normalized key instead: drop the "/models/" prefix and treat "--" and
+ * "/" as the same separator. */
+function normalizeModelID(id) {
+  return String(id || "")
+    .replace(/^\/?models\//i, "")
+    .replace(/--/g, "/")
+    .replace(/^\/+/, "")
+    .toLowerCase();
+}
+
+let _catalogIndex = null;   // normalized id → catalog entry; rebuilt when the catalog changes
+
+function catalogEntry(id) {
+  if (!state.catalog) return null;
+  if (!_catalogIndex) {
+    _catalogIndex = {};
+    for (const k of Object.keys(state.catalog)) {
+      if (k === "default") continue;
+      _catalogIndex[normalizeModelID(k)] = state.catalog[k];
+    }
+  }
+  return state.catalog[id] || _catalogIndex[normalizeModelID(id)] || null;
+}
+
+function modelMeta() {
+  return catalogEntry($("model-select").value);
+}
+
+/* Whether the currently selected model accepts image parts. */
+function modelIsVision() {
+  const m = modelMeta();
+  return !!(m && m.modality === "vision");
+}
+
+/* Whether the currently selected model GENERATES images. Such a model is served by
+ * /v1/images/generations, not chat: the composer's text becomes the prompt and the
+ * reply is the rendered image(s). Decided by the catalog, like modelIsVision. */
+/* Speech models: ASR transcribes uploaded audio, TTS speaks the composer text. */
+function modelIsASR() {
+  const m = modelMeta();
+  return !!(m && (m.modality === "asr" || m.price_unit === "audio_second"));
+}
+function modelIsTTS() {
+  const m = modelMeta();
+  return !!(m && (m.modality === "tts" || m.price_unit === "character"));
+}
+
+function modelIsImageGen() {
+  const m = modelMeta();
+  return !!(m && (m.modality === "image" || m.price_unit === "image"));
+}
+
+function ctxWindow() {
+  const m = modelMeta();
+  return (m && m.context_window) || IMG_FALLBACK_CTX;
+}
+
+function outReserve() {
+  const m = modelMeta();
+  return (m && m.max_output) || 0;
+}
+
+/* Input budget: everything except the space reserved for the reply. */
+function availTokens() { return Math.max(0, ctxWindow() - outReserve()); }
+
+function imgTokens(a) { return a.tokens || Math.round((a.w * a.h) / 1000); }
+function attachTokens() { return state.attach.reduce((n, a) => n + imgTokens(a), 0); }
+
+/* Prompt text already in the conversation, plus what is typed now. Cheap and
+ * deliberately conservative — over-counting only makes the bar warn earlier. */
+function promptTextTokens() {
+  let chars = $("input").value.length;
+  for (const m of state.messages) {
+    if (typeof m.content === "string") chars += m.content.length;
+    else if (Array.isArray(m.content)) for (const p of m.content) if (p.type === "text") chars += (p.text || "").length;
+  }
+  return Math.round(chars / 4) + 8;
+}
+
+function usedTokens() { return attachTokens() + promptTextTokens(); }
+function overBudget() { return Math.max(0, usedTokens() - availTokens()); }
+
+/* The size ceiling currently selected, or 0 for "keep the original". Small images
+ * are never enlarged: blowing up a 90×80 icon to 1024² invents pixels the model
+ * cannot read and bills ~1k tokens for them. */
+function targetSide(bmp) {
+  const want = parseInt($("img-size").value, 10) || 0;
+  if (!want) return 0;
+  return Math.max(bmp.width, bmp.height) <= want ? 0 : want;
+}
+
+function loadBitmap(file) {
+  if (window.createImageBitmap) return createImageBitmap(file).catch(() => loadViaImg(file));
+  return loadViaImg(file);
+}
+
+function loadViaImg(file) {
+  return new Promise((res, rej) => {
+    const url = URL.createObjectURL(file);
+    const im = new Image();
+    im.onload = () => { URL.revokeObjectURL(url); res(im); };
+    im.onerror = () => { URL.revokeObjectURL(url); rej(new Error("cannot decode this image")); };
+    im.src = url;
+  });
+}
+
+/* Re-encode every kept original at the current size setting. Keeping the decoded
+ * bitmap is what lets a size change apply to images already attached — without it
+ * the setting would only affect the next file chosen. */
+async function reencodeAttachments() {
+  const out = [];
+  for (const src of state.attachSrc) {
+    const bmp = src.bmp;
+    const side = targetSide(bmp);
+    let w = bmp.width, h = bmp.height;
+    if (side > 0) {
+      const scale = side / Math.max(w, h);
+      w = Math.max(1, Math.round(w * scale));
+      h = Math.max(1, Math.round(h * scale));
+    }
+    const cv = document.createElement("canvas");
+    cv.width = w; cv.height = h;
+    const ctx = cv.getContext("2d");
+    ctx.fillStyle = "#fff";   // JPEG has no alpha: transparent pixels would go black
+    ctx.fillRect(0, 0, w, h);
+    ctx.drawImage(bmp, 0, 0, w, h);
+    let dataUrl = cv.toDataURL("image/jpeg", 0.9);
+    if (dataUrl.length > ATTACH_MAX_BYTES * 1.37) dataUrl = cv.toDataURL("image/jpeg", 0.7);
+    const bytes = Math.round((dataUrl.length - dataUrl.indexOf(",") - 1) * 0.75);
+    if (bytes > ATTACH_MAX_BYTES) {
+      throw new Error(src.name + " is still " + (bytes / 1048576).toFixed(1) + " MiB after resizing (limit 7 MiB)");
+    }
+    out.push({ dataUrl, w, h, name: src.name, bytes, tokens: Math.round((w * h) / 1000) });
+  }
+  state.attach = out;
+  renderAttachments();
+}
+
+async function addFiles(files) {
+  if (!modelIsVision()) {
+    setStatus("The selected model does not read images — pick a vision model first.");
+    return;
+  }
+  const list = Array.from(files).filter((f) => {
+    if (!f.type.startsWith("image/")) { setStatus("Skipped a non-image file: " + (f.name || "?")); return false; }
+    return true;
+  });
+  if (!list.length) return;
+  // Snapshot before mutating: a rejected addition must undo ONLY the new files and
+  // leave whatever was already staged in place. Truncating the arrays by count
+  // instead loses the earlier attachments too (they all get re-encoded together).
+  const prevSrc = state.attachSrc.slice();
+  const prevAtt = state.attach.slice();
+  try {
+    for (const f of list) state.attachSrc.push({ bmp: await loadBitmap(f), name: f.name || "pasted.png" });
+    await reencodeAttachments();
+  } catch (e) {
+    state.attachSrc = prevSrc;
+    state.attach = prevAtt;
+    renderAttachments();
+    setStatus(errMsg(e));
+    return;
+  }
+  const over = overBudget();
+  if (over > 0) {
+    // Refuse the addition outright rather than let Send produce a guaranteed 400.
+    state.attachSrc = prevSrc;
+    state.attach = prevAtt;
+    renderAttachments();
+    setStatus("That would exceed the model's input budget by ~" + over + " tokens. "
+      + "Remove an image, choose a smaller size, or start a new conversation.");
+    return;
+  }
+  setStatus(state.attach.length + " image" + (state.attach.length > 1 ? "s" : "") + " attached ("
+    + attachTokens() + " of " + availTokens() + " input tokens used).");
+}
+
+/* Switching models can invalidate staged images: a text-only model cannot accept
+ * them, and a different vision model may have a different window/budget. Clearing
+ * is the honest move — silently sending them would be a guaranteed 400. */
+function onModelChanged() {
+  const vision = modelIsVision();
+  const gen = modelIsImageGen();
+  const asr = modelIsASR();
+  const tts = modelIsTTS();
+  $("btn-attach").hidden = !vision;
+  $("gen-settings").hidden = !gen;
+  $("tts-settings").hidden = !tts;
+  $("btn-audio").hidden = !asr;
+  $("btn-record").hidden = !asr;
+  $("thinking-row").hidden = gen || asr || tts;   // these models do not reason in text
+  $("input").placeholder = gen
+    ? "Describe the image to generate… (Enter to generate)"
+    : tts ? "Type the text to speak… (Enter to synthesize)"
+    : asr ? "Upload an audio file (WAV, FLAC, MP3, OGG, WebM, M4A) or record — the transcript appears below"
+    : "Message… (Enter to send, Shift+Enter for newline; drop or paste images to attach)";
+  if (gen) {
+    // Cap the count picker at what the catalog allows (1 when unset).
+    const cap = (modelMeta() && modelMeta().max_gen_images) || 1;
+    const n = $("gen-n");
+    for (const o of n.options) o.disabled = Number(o.value) > cap;
+    if (Number(n.value) > cap) n.value = "1";
+  }
+  if (!vision && state.attach.length) {
+    state.attach = [];
+    state.attachSrc = [];
+    setStatus("The newly selected model does not read images, so the attached "
+      + "image(s) were removed.");
+  }
+  renderAttachments();
+}
+
+function renderAttachments() {
+  const strip = $("attach-strip");
+  const box = $("attach-thumbs");
+  const has = state.attach.length > 0;
+  strip.hidden = !has;
+  box.innerHTML = "";
+  state.attach.forEach((a, i) => {
+    const d = document.createElement("div");
+    d.className = "attach-thumb";
+    d.innerHTML = '<img src="' + a.dataUrl + '" alt="">'
+      + '<button class="attach-x" title="Remove">×</button>'
+      + '<div class="attach-tok">' + a.w + "×" + a.h + " · " + imgTokens(a) + " tok</div>";
+    d.querySelector(".attach-x").onclick = () => {
+      state.attach.splice(i, 1);
+      state.attachSrc.splice(i, 1);
+      renderAttachments();
+      setStatus(state.attach.length
+        ? state.attach.length + " image" + (state.attach.length > 1 ? "s" : "") + " attached ("
+          + attachTokens() + " of " + availTokens() + " input tokens used)."
+        : "Image removed.");
+    };
+    box.appendChild(d);
+  });
+  renderBudget();
+  updateImgSizeHint();
+  // A size change re-encodes in place, so re-state the totals; without this the
+  // status line keeps quoting the count from before the change.
+  if (has) $("attach-count").textContent = state.attach.length + " image"
+    + (state.attach.length > 1 ? "s" : "") + " · " + attachTokens() + " tok";
+}
+
+function renderBudget() {
+  const el = $("attach-budget");
+  if (!el) return;
+  const avail = availTokens(), used = usedTokens(), over = overBudget();
+  const pct = avail ? Math.min(100, (used / avail) * 100) : 0;
+  const cls = over > 0 ? "over" : (pct >= 80 ? "warn" : "");
+  el.innerHTML = '<span class="budget"><i class="' + cls + '" style="width:' + pct.toFixed(1) + '%"></i></span> '
+    + used + " / " + avail + " tok"
+    + (over > 0 ? ' — <b>over by ' + over + '</b>' : "");
+  // Send stays disabled while over budget: there is no request that would succeed.
+  $("btn-send").disabled = state.streaming || !state.apiKey || over > 0;
+}
+
+function updateImgSizeHint() {
+  const row = $("img-size-row"), hint = $("img-size-hint"), vh = $("vision-hint");
+  const on = modelIsVision();
+  row.hidden = !on;
+  hint.hidden = !on;
+  if (!on) {
+    // Point out how to get the feature instead of silently hiding it: a user who
+    // cannot find the attach button has no way to learn it depends on the model.
+    const hasVision = Object.keys(state.catalog || {}).some((id) => state.catalog[id].modality === "vision");
+    vh.hidden = !hasVision;
+    if (hasVision) {
+      vh.textContent = "Image input is available on the vision model — pick it above to attach images.";
+    }
+    return;
+  }
+  vh.hidden = true;
+  let w = 0, h = 0;
+  for (const s of state.attachSrc) {
+    if (s.bmp.width * s.bmp.height > w * h) { w = s.bmp.width; h = s.bmp.height; }
+  }
+  const long = Math.max(w, h);
+  const desc = (want) => {
+    if (!want || !long || long <= want) return long ? ("as-is " + w + "×" + h) : "as-is";
+    const scale = want / long;
+    const tw = Math.round(w * scale), th = Math.round(h * scale);
+    return tw + "×" + th + " ≈ " + Math.round((tw * th) / 1000) + " tok each";
+  };
+  const opts = $("img-size").options;
+  opts[0].textContent = "≤512 px" + (long ? " (" + desc(512) + ")" : "");
+  opts[1].textContent = "≤1024 px" + (long ? " (" + desc(1024) + ")" : "");
+  opts[2].textContent = "original" + (long ? " (" + desc(0) + ")" : "");
+  hint.textContent = "Images are sent as prompt tokens (~pixels/1000; 1024² ≈ 1030 tok). "
+    + "This model takes " + availTokens() + " input tokens per request.";
+}
+
 /* ---------------- chat ---------------- */
 
 async function send() {
+  if (modelIsImageGen()) return generateImage();
+  if (modelIsTTS()) return synthesizeSpeech();
+  if (modelIsASR()) { setStatus("Pick an audio file or record — this model transcribes audio."); return; }
   const text = $("input").value.trim();
-  if (!text || !state.apiKey || state.streaming) return;
+  const imgs = state.attach.map((a) => a.dataUrl);
+  if ((!text && !imgs.length) || !state.apiKey || state.streaming) return;
   const model = $("model-select").value;
   if (!model) {
     setStatus("No model is available right now — pick one once a model comes online.");
     return;
   }
+  if (overBudget()) {
+    // Nothing that follows can succeed: the prompt would not fit.
+    setStatus("This request is ~" + overBudget() + " tokens over the model's input budget. "
+      + "Remove an image, pick a smaller size, or start a new conversation.");
+    return;
+  }
   $("input").value = "";
-  state.messages.push({ role: "user", content: text });
+  state.messages.push({ role: "user", content: text, images: imgs });
+  state.attach = [];
+  state.attachSrc = [];
+  renderAttachments();
   const assistant = { role: "assistant", content: "", meta: {} };
   state.messages.push(assistant);
   persist();
@@ -991,10 +1491,19 @@ async function send() {
           model,
           stream: true,
           enable_thinking: state.thinking,
-          messages: state.messages.slice(0, -1).map(({ role, content }) => ({ role, content })),
+          messages: buildRequestMessages().slice(0, -1),   // drop the empty streaming placeholder
         }),
       });
-      if ((res.status !== 503 && res.status !== 502) || attempt >= 12) break;
+      let retry = res.status === 503 || res.status === 502;
+      if (res.ok) {
+        // While it waits for a GPU the gateway keeps the stream open with comment
+        // lines; if the wait then fails, the 503 arrives as an error event inside the
+        // stream. Before any text was shown that is the same retryable 503.
+        const status = await readSSE(res.body, assistant, { retryableBeforeContent: attempt < 12 });
+        if (status !== "retry") break;
+        retry = true;
+      }
+      if (!retry || attempt >= 12) break;
       setStatus("Model is loading or providers are mining — retrying (" + (attempt + 1) + ")…");
       await new Promise((ok) => setTimeout(ok, 20000));
       if (state.abort.signal.aborted) throw Object.assign(new Error("aborted"), { name: "AbortError" });
@@ -1005,14 +1514,13 @@ async function send() {
       assistant.meta.error = true;
       return;
     }
-    await readSSE(res.body, assistant);
   } catch (e) {
     if (e && e.name === "AbortError") {
       // User pressed Stop: delivered text stays; billing already meters exactly
       // the delivered part (client-gone accounting on the gateway).
       assistant.meta.stopped = true;
     } else {
-      assistant.content = assistant.content || "Request failed: " + errMsg(e);
+      assistant.content = assistant.content || friendlyNetworkError(e);
       assistant.meta.error = true;
     }
   } finally {
@@ -1027,7 +1535,241 @@ async function send() {
   }
 }
 
-async function readSSE(bodyStream, assistant) {
+/* Image generation turn. The composer text is the prompt; the reply bubble shows the
+ * rendered image(s). Not streamed — a picture has no partial form — so the request is
+ * a single POST with the same 503/502 backoff as chat (a model switch onto the GPU,
+ * or a mining window, both self-heal). The gateway bills the images it actually
+ * DELIVERED, so a reply with fewer images than asked is charged for fewer. */
+async function generateImage() {
+  const prompt = $("input").value.trim();
+  if (!prompt || !state.apiKey || state.streaming) return;
+  const model = $("model-select").value;
+  if (!model) { setStatus("No image model is available right now."); return; }
+  const size = $("gen-size").value;
+  const steps = Number($("gen-steps").value) || 20;
+  const n = Number($("gen-n").value) || 1;
+  const seedRaw = $("gen-seed").value.trim();
+  const seed = seedRaw === "" ? Math.floor(Math.random() * 2 ** 31) : Number(seedRaw);
+
+  $("input").value = "";
+  state.messages.push({ role: "user", content: prompt });
+  const assistant = { role: "assistant", content: "", meta: { gen: { size, steps, n, seed } } };
+  state.messages.push(assistant);
+  persist();
+  renderMessages(true);
+
+  state.streaming = true;
+  state.abort = new AbortController();
+  $("btn-stop").hidden = false;
+  renderKey();
+  setStatus("Rendering " + n + " image" + (n > 1 ? "s" : "") + " at " + size + "…");
+  const t0 = performance.now();
+  try {
+    let res;
+    for (let attempt = 0; ; attempt++) {
+      res = await fetch("/v1/images/generations", {
+        method: "POST",
+        signal: state.abort.signal,
+        headers: {
+          "Content-Type": "application/json",
+          Authorization: "Bearer " + state.apiKey,
+          "X-OM-Receipt-Req": "1",
+        },
+        body: JSON.stringify({ model, prompt, n, size, steps, seed, response_format: "b64_json" }),
+      });
+      if ((res.status !== 503 && res.status !== 502) || attempt >= 12) break;
+      setStatus("Image model is loading or providers are mining — retrying (" + (attempt + 1) + ")…");
+      await new Promise((ok) => setTimeout(ok, 20000));
+      if (state.abort.signal.aborted) throw Object.assign(new Error("aborted"), { name: "AbortError" });
+    }
+    const body = await res.json().catch(() => ({}));
+    if (!res.ok) {
+      assistant.content = friendlyHTTPError(res.status, errBody(body));
+      assistant.meta.error = true;
+      return;
+    }
+    const imgs = (body.data || []).filter((d) => d && d.b64_json).map((d) => "data:image/png;base64," + d.b64_json);
+    assistant.genImages = imgs;
+    assistant.meta.gen.seconds = ((performance.now() - t0) / 1000).toFixed(1);
+    const rid = res.headers.get("X-Request-ID");
+    if (rid) assistant.meta.receipt = { request_id: rid, images: imgs.length };
+    if (!imgs.length) {
+      assistant.content = "⚠ The provider returned no image (nothing was billed).";
+      assistant.meta.error = true;
+    }
+  } catch (e) {
+    if (e && e.name === "AbortError") {
+      assistant.content = "⏹ stopped before the image arrived";
+      assistant.meta.stopped = true;
+    } else {
+      assistant.content = friendlyNetworkError(e);
+      assistant.meta.error = true;
+    }
+  } finally {
+    state.streaming = false;
+    state.abort = null;
+    $("btn-stop").hidden = true;
+    persist();
+    renderMessages();
+    renderKey();
+    setStatus("");
+    refreshMe();
+  }
+}
+
+/* ---------------- speech ----------------
+ *
+ * Transcription: the file (or a recording) is posted as multipart to
+ * /v1/audio/transcriptions. The gateway bills the INPUT duration, rounded up to whole
+ * seconds. A browser recording is decoded and re-encoded to 16 kHz mono WAV here before
+ * upload: the recorders' WebM output (Chrome) carries no reliable length until the
+ * recording is finalized, and a fixed format keeps the billed seconds predictable.
+ *
+ * Synthesis: the composer text is posted to /v1/audio/speech and billed per character
+ * (Unicode code points, as the gateway counts); the reply is a WAV played inline.
+ */
+
+let _recorder = null, _recChunks = [];
+
+async function toggleRecording() {
+  if (_recorder) { _recorder.stop(); return; }
+  try {
+    const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+    _recChunks = [];
+    _recorder = new MediaRecorder(stream);
+    _recorder.ondataavailable = (e) => { if (e.data.size) _recChunks.push(e.data); };
+    _recorder.onstop = async () => {
+      stream.getTracks().forEach((t) => t.stop());
+      _recorder = null;
+      $("btn-record").textContent = "● Record";
+      const blob = new Blob(_recChunks, { type: _recChunks[0] ? _recChunks[0].type : "audio/webm" });
+      try {
+        const wav = await blobToWav16k(blob);
+        transcribeAudio(wav, "recording.wav");
+      } catch (e) {
+        setStatus("Could not convert the recording: " + errMsg(e));
+      }
+    };
+    _recorder.start();
+    $("btn-record").textContent = "■ Stop";
+    setStatus("Recording… press Stop when done.");
+  } catch (e) {
+    setStatus("Microphone unavailable: " + errMsg(e));
+  }
+}
+
+/* Decode any browser-playable audio and re-encode as 16 kHz mono 16-bit WAV. */
+async function blobToWav16k(blob) {
+  const ctx = new (window.AudioContext || window.webkitAudioContext)();
+  const decoded = await ctx.decodeAudioData(await blob.arrayBuffer());
+  ctx.close();
+  const rate = 16000;
+  const off = new OfflineAudioContext(1, Math.ceil(decoded.duration * rate), rate);
+  const src = off.createBufferSource();
+  src.buffer = decoded; src.connect(off.destination); src.start();
+  const out = (await off.startRendering()).getChannelData(0);
+  const buf = new ArrayBuffer(44 + out.length * 2);
+  const v = new DataView(buf);
+  const str = (o, s) => { for (let i = 0; i < s.length; i++) v.setUint8(o + i, s.charCodeAt(i)); };
+  str(0, "RIFF"); v.setUint32(4, 36 + out.length * 2, true); str(8, "WAVEfmt ");
+  v.setUint32(16, 16, true); v.setUint16(20, 1, true); v.setUint16(22, 1, true);
+  v.setUint32(24, rate, true); v.setUint32(28, rate * 2, true); v.setUint16(32, 2, true); v.setUint16(34, 16, true);
+  str(36, "data"); v.setUint32(40, out.length * 2, true);
+  for (let i = 0; i < out.length; i++) v.setInt16(44 + i * 2, Math.max(-1, Math.min(1, out[i])) * 32767, true);
+  return new Blob([buf], { type: "audio/wav" });
+}
+
+async function postWithRetry(url, init, label) {
+  let res;
+  for (let attempt = 0; ; attempt++) {
+    res = await fetch(url, { ...init, signal: state.abort.signal });
+    if ((res.status !== 503 && res.status !== 502) || attempt >= 12) return res;
+    setStatus(label + " model is loading or providers are mining — retrying (" + (attempt + 1) + ")…");
+    await new Promise((ok) => setTimeout(ok, 20000));
+    if (state.abort.signal.aborted) throw Object.assign(new Error("aborted"), { name: "AbortError" });
+  }
+}
+
+async function transcribeAudio(file, name) {
+  if (!state.apiKey || state.streaming) return;
+  const model = $("model-select").value;
+  state.messages.push({ role: "user", content: "🎙 " + name });
+  const assistant = { role: "assistant", content: "", meta: { speech: { kind: "asr", file: name } } };
+  state.messages.push(assistant);
+  renderMessages(true);
+  state.streaming = true; state.abort = new AbortController();
+  $("btn-stop").hidden = false; renderKey(); setStatus("Transcribing…");
+  try {
+    const fd = new FormData();
+    fd.append("model", model);
+    fd.append("file", file, name);
+    const res = await postWithRetry("/v1/audio/transcriptions", {
+      method: "POST",
+      headers: { Authorization: "Bearer " + state.apiKey, "X-OM-Receipt-Req": "1" },
+      body: fd,
+    }, "Speech");
+    const body = await res.json().catch(() => ({}));
+    if (!res.ok) { assistant.content = friendlyHTTPError(res.status, errBody(body)); assistant.meta.error = true; return; }
+    assistant.content = body.text || "(no speech detected)";
+    const sec = (body.usage && body.usage.seconds) || 0;
+    Object.assign(assistant.meta.speech, { seconds: sec, language: body.language });
+    const rid = res.headers.get("X-Request-ID");
+    if (rid) assistant.meta.receipt = { request_id: rid, units: sec, unit: "s" };
+  } catch (e) {
+    if (e && e.name === "AbortError") { assistant.content = "⏹ stopped"; assistant.meta.stopped = true; }
+    else { assistant.content = friendlyNetworkError(e); assistant.meta.error = true; }
+  } finally {
+    state.streaming = false; state.abort = null; $("btn-stop").hidden = true;
+    persist(); renderMessages(); renderKey(); setStatus(""); refreshMe();
+  }
+}
+
+async function synthesizeSpeech() {
+  const text = $("input").value;
+  if (!text.trim() || !state.apiKey || state.streaming) return;
+  const meta = modelMeta() || {};
+  const chars = Array.from(text).length;   // code points — the gateway's count
+  if (meta.max_chars && chars > meta.max_chars) {
+    setStatus(`That is ${chars} characters; this model accepts at most ${meta.max_chars} per request.`);
+    return;
+  }
+  const model = $("model-select").value;
+  const voice = $("tts-voice").value;
+  $("input").value = "";
+  state.messages.push({ role: "user", content: text });
+  const assistant = { role: "assistant", content: "", meta: { speech: { kind: "tts", chars, voice } } };
+  state.messages.push(assistant);
+  renderMessages(true);
+  state.streaming = true; state.abort = new AbortController();
+  $("btn-stop").hidden = false; renderKey(); setStatus("Synthesizing " + chars + " characters…");
+  const t0 = performance.now();
+  try {
+    const res = await postWithRetry("/v1/audio/speech", {
+      method: "POST",
+      headers: { "Content-Type": "application/json", Authorization: "Bearer " + state.apiKey, "X-OM-Receipt-Req": "1" },
+      body: JSON.stringify({ model, input: text, voice, speed: Number($("tts-speed").value) || 1, response_format: "wav" }),
+    }, "Speech");
+    if (!res.ok) {
+      const body = await res.json().catch(() => ({}));
+      assistant.content = friendlyHTTPError(res.status, errBody(body)); assistant.meta.error = true; return;
+    }
+    assistant.audioUrl = URL.createObjectURL(await res.blob());
+    assistant.meta.speech.secondsTaken = ((performance.now() - t0) / 1000).toFixed(1);
+    const rid = res.headers.get("X-Request-ID");
+    if (rid) assistant.meta.receipt = { request_id: rid, units: chars, unit: "chars" };
+  } catch (e) {
+    if (e && e.name === "AbortError") { assistant.content = "⏹ stopped"; assistant.meta.stopped = true; }
+    else { assistant.content = friendlyNetworkError(e); assistant.meta.error = true; }
+  } finally {
+    state.streaming = false; state.abort = null; $("btn-stop").hidden = true;
+    persist(); renderMessages(); renderKey(); setStatus(""); refreshMe();
+  }
+}
+
+/* Reads an SSE chat stream into `assistant`. Returns "retry" when, with
+ * opts.retryableBeforeContent, the stream carried a 502/503 error event before any
+ * text was delivered (the caller retries the request); otherwise "done". */
+async function readSSE(bodyStream, assistant, opts = {}) {
   const reader = bodyStream.getReader();
   const decoder = new TextDecoder();
   let buf = "";
@@ -1050,6 +1792,16 @@ async function readSSE(bodyStream, assistant) {
           continue;
         }
         if (obj.error) {
+          const st = obj.error.status;
+          if (opts.retryableBeforeContent && (st === 503 || st === 502) && !assistant.content && !assistant.reasoning) {
+            reader.cancel().catch(() => {});
+            return "retry";
+          }
+          if (st && !assistant.content) {
+            assistant.meta.error = true;
+            assistant.content = friendlyHTTPError(st, obj.error.message || "");
+            continue;
+          }
           assistant.meta.error = true;
           assistant.content += (assistant.content ? "\n\n" : "") + "⚠ " + (obj.error.message || JSON.stringify(obj.error));
           continue;
@@ -1067,6 +1819,14 @@ async function readSSE(bodyStream, assistant) {
       }
     }
   }
+  return "done";
+}
+
+/* A fetch that failed without any HTTP response: the connection could not be made
+ * or was cut (network change, VPN / proxy, the browser going to sleep). */
+function friendlyNetworkError(e) {
+  return "⚠ The connection to the gateway was interrupted (" + errMsg(e) + "). "
+    + "Check your network, VPN or proxy and send the message again — a request that delivered nothing is not billed.";
 }
 
 function friendlyHTTPError(status, msg) {
@@ -1087,6 +1847,29 @@ function renderMessages(streaming) {
     const div = document.createElement("div");
     div.className = "msg " + m.role + (m.meta && m.meta.error ? " error" : "");
     div.innerHTML = mdLite(m.content || (streaming ? "▌" : ""));
+    if (m.images && m.images.length) {
+      // Show what was actually sent. Only the newest turn's pixels go back to the
+      // model, but every turn keeps its thumbnails so the transcript reads correctly.
+      const strip = document.createElement("div");
+      strip.className = "msg-imgs";
+      for (const url of m.images) {
+        const im = document.createElement("img");
+        im.src = url; im.alt = "attached image";
+        strip.appendChild(im);
+      }
+      div.prepend(strip);
+    } else if (m.imageCount) {
+      // Restored transcript: the bytes were never stored (see persist), so say so
+      // rather than showing a bubble that reads as if it were plain text.
+      const strip = document.createElement("div");
+      strip.className = "msg-imgs";
+      const note = document.createElement("span");
+      note.className = "hint";
+      note.textContent = "[" + m.imageCount + " image" + (m.imageCount > 1 ? "s" : "")
+        + " sent in this message — not kept in browser history]";
+      strip.appendChild(note);
+      div.prepend(strip);
+    }
     if (m.reasoning) {
       const th = document.createElement("details");
       th.className = "think";
@@ -1103,8 +1886,66 @@ function renderMessages(streaming) {
     if (m.meta && m.meta.stopped) {
       const s = document.createElement("div");
       s.className = "hint";
-      s.textContent = "⏹ stopped — you are billed only for the text above";
+      s.textContent = (m.meta.gen || m.meta.speech) ? "⏹ stopped" : "⏹ stopped — you are billed only for the text above";
       div.appendChild(s);
+    }
+    if (m.audioUrl) {
+      // Synthesized speech: an inline player plus a download link. The bytes live in
+      // a blob URL for this page only — never in localStorage (see persist).
+      const box = document.createElement("div");
+      box.className = "gen-audio";
+      const au = document.createElement("audio");
+      au.controls = true; au.src = m.audioUrl;
+      const a = document.createElement("a");
+      a.href = m.audioUrl; a.download = "openmodel-speech.wav"; a.textContent = "download"; a.className = "hint";
+      box.appendChild(au); box.appendChild(a);
+      div.appendChild(box);
+    } else if (m.audioGone) {
+      const note = document.createElement("div");
+      note.className = "hint";
+      note.textContent = "[synthesized audio — not kept in browser history]";
+      div.appendChild(note);
+    }
+    if (m.meta && m.meta.speech && !m.meta.error) {
+      const sp = m.meta.speech;
+      const info = document.createElement("div");
+      info.className = "hint";
+      info.textContent = sp.kind === "asr"
+        ? `${sp.file} · ${sp.seconds}s billed` + (sp.language ? ` · ${sp.language}` : "")
+        : `${sp.chars} characters · voice ${sp.voice}` + (sp.secondsTaken ? ` · ${sp.secondsTaken}s` : "");
+      div.appendChild(info);
+    }
+    if (m.genImages && m.genImages.length) {
+      // Generated pictures, full width, each with a download link. Kept in memory
+      // only (see persist): a single 1024px PNG is ~1.5 MB of base64.
+      const grid = document.createElement("div");
+      grid.className = "gen-imgs";
+      m.genImages.forEach((url, i) => {
+        const fig = document.createElement("figure");
+        const im = document.createElement("img");
+        im.src = url; im.alt = "generated image";
+        im.addEventListener("click", () => window.open(url, "_blank"));
+        const a = document.createElement("a");
+        a.href = url; a.download = "openmodel-" + ((m.meta.gen && m.meta.gen.seed) || "img") + "-" + (i + 1) + ".png";
+        a.textContent = "download";
+        a.className = "hint";
+        fig.appendChild(im); fig.appendChild(a);
+        grid.appendChild(fig);
+      });
+      div.appendChild(grid);
+    } else if (m.genImageCount) {
+      const note = document.createElement("div");
+      note.className = "hint";
+      note.textContent = "[" + m.genImageCount + " generated image" + (m.genImageCount > 1 ? "s" : "")
+        + " — not kept in browser history]";
+      div.appendChild(note);
+    }
+    if (m.meta && m.meta.gen && !m.meta.error && (m.genImages || m.genImageCount)) {
+      const g = m.meta.gen;
+      const info = document.createElement("div");
+      info.className = "hint";
+      info.textContent = `${g.size} · ${g.steps} steps · seed ${g.seed}` + (g.seconds ? ` · ${g.seconds}s` : "");
+      div.appendChild(info);
     }
     if (m.meta && m.meta.receipt) div.appendChild(receiptChip(m.meta.receipt));
     box.appendChild(div);
@@ -1118,7 +1959,11 @@ function receiptChip(r) {
   const rid = r.request_id || "";
   let tokens = "";
   void 0;
-  if (r.prompt_tokens != null && r.completion_tokens != null) {
+  if (r.units != null && r.unit) {
+    tokens = `${r.units} ${r.unit}<span class="chip-cost" data-rid="${esc(rid)}"></span> · `;
+  } else if (r.images != null) {
+    tokens = `${r.images} image${r.images === 1 ? "" : "s"}<span class="chip-cost" data-rid="${esc(rid)}"></span> · `;
+  } else if (r.prompt_tokens != null && r.completion_tokens != null) {
     // Tokens only — the dollar amount is filled in from /v1/me (the gateway's
     // own billing figure) right after the reply lands. The chip used to price
     // itself with the UI's display rates and drifted from the account panel the
@@ -1180,7 +2025,32 @@ function errMsg(e) { return (e && (e.message || e.toString())) || "unknown error
 function errBody(b) { return (b && b.error && (b.error.message || JSON.stringify(b.error))) || JSON.stringify(b); }
 function setStatus(s) { $("statusline").textContent = s; }
 function persist() {
-  localStorage.setItem(LS.msgs, JSON.stringify(state.messages.slice(-80)));
+  // Stored WITHOUT the image bytes. The base64 of even one screenshot is larger
+  // than the whole transcript budget (localStorage is ~5 MB per origin), so keeping
+  // the DataURLs here would silently wipe the conversation the moment an image was
+  // attached. A count is stored instead, so the restored transcript can say "an
+  // image was sent here" without pretending to have it.
+  const slim = state.messages.slice(-80).map((m) => {
+    let out = m;
+    if (m.genImages && m.genImages.length) {
+      const { genImages, ...rest } = out;
+      out = { ...rest, genImageCount: genImages.length };
+    }
+    if (out.audioUrl) {
+      const { audioUrl, ...rest } = out;
+      out = { ...rest, audioGone: true };
+    }
+    if (!out.images || !out.images.length) return out;
+    const { images, ...rest } = out;
+    return { ...rest, imageCount: images.length };
+  });
+  try {
+    localStorage.setItem(LS.msgs, JSON.stringify(slim));
+  } catch (e) {
+    // Quota can still be hit by very long text transcripts; dropping the oldest
+    // half is better than losing the whole conversation to an exception.
+    try { localStorage.setItem(LS.msgs, JSON.stringify(slim.slice(-40))); } catch { /* give up */ }
+  }
   localStorage.setItem(LS.session, state.sessionId);
 }
 

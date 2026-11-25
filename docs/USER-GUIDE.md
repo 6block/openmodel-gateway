@@ -10,12 +10,13 @@ Hosted mainnet deployment (alpha) used in every example:
 | | |
 |---|---|
 | API + web UI + public queries (publicly-trusted certificate) | `https://openmodel.filfox.info` |
-| Settlement contract (Filecoin mainnet, verified on [Filfox](https://filfox.info/en/address/0x60D41baEaBe1ABE061AE82c44425debc35bA524A)) | `0x60D41baEaBe1ABE061AE82c44425debc35bA524A` |
+| Settlement contract (Filecoin mainnet, verified on [Filfox](https://filfox.info/en/address/0x29b994f63D91e447945a1cDeA2776167B7415c26)) | `0x29b994f63D91e447945a1cDeA2776167B7415c26` |
 | USDFC token (18 decimals) | `0x80B98d3aa09ffff255c3ba4A241111Ff1262F045` |
 
 Everything is served on one origin behind a publicly-trusted certificate.
 The web UI at the
-same address covers registration, deposits and usage interactively — this
+same address covers registration, deposits, usage and chat with every model
+kind (vision, image generation, transcription, speech) interactively — this
 guide documents the API/contract path that works without a browser.
 
 ---
@@ -81,7 +82,7 @@ curl https://openmodel.filfox.info/v1/me -H "Authorization: Bearer sk-om-YOURKEY
 | `balance.fil_price_usd` | the FIL/USD rate billing currently uses |
 | `balance.pending_usd` | cost reserved for requests in flight / not yet settled |
 | `balance.available_usd` | what the payment gate sees: deposits valued in USD minus pending |
-| `recent_usage` | your last 20 requests on this key |
+| `recent_usage` | your last 20 requests on this key: model, status, billed amount (`prompt_tokens`/`completion_tokens`, or `quantity` + `unit` for image, audio and speech requests) and `cost_usd` |
 
 `available_usd` is computed by the **same** multi-token, buffer-adjusted rule
 the 402 gate uses: if it is positive, your next request passes.
@@ -99,13 +100,13 @@ credits `msg.sender`.
 Send FIL straight to the contract address from your wallet (a plain transfer
 credits your balance — the contract's receive hook records it), or call
 `depositFIL()` with value. From MetaMask: a normal send to
-`0x60D41baEaBe1ABE061AE82c44425debc35bA524A` is enough.
+`0x29b994f63D91e447945a1cDeA2776167B7415c26` is enough.
 
 ### 2.2 USDFC (stablecoin)
 
 Two transactions, standard ERC-20 flow:
 
-1. `approve(0x60D41baE…, amount)` on the USDFC token contract
+1. `approve(0x29b994f63D91e447945a1cDeA2776167B7415c26, amount)` on the USDFC token contract
 2. `depositToken(0x80B98d3a…, amount)` on the settlement contract
 
 USDFC has **18 decimals** (not 6): 1 USDFC = `1000000000000000000` units.
@@ -120,9 +121,8 @@ Those senders need the f410 form of an address. Derive yours:
 curl "https://openmodel.filfox.info/v1/f4addr?wallet=0xYOURWALLET"
 ```
 
-**Withdraw to your own f410 address first**, then move funds from your wallet
-to the contract. Never point an exchange withdrawal directly at the contract:
-the deposit would be credited to the exchange's wallet, not yours.
+Withdraw to your own f410 address first, then move funds from your wallet to
+the contract.
 
 ### 2.4 Confirming arrival
 
@@ -147,8 +147,12 @@ nothing else. Everything below runs against the hosted deployment as-is.
 | Endpoint | Auth | Purpose |
 |---|---|---|
 | `GET /v1/models` | Bearer key | Models servable *right now* (live, verified workers — changes as providers join or switch) |
-| `GET /v1/catalog` | Bearer key | The models with per-model USD prices and the live FIL rate |
-| `POST /v1/chat/completions` | Bearer key | Chat (primary; streaming via `"stream": true`) |
+| `GET /v1/catalog` | Bearer key | The models with per-model USD prices, billing unit, limits and the live FIL rate |
+| `POST /v1/chat/completions` | Bearer key | Chat, text and image understanding (primary; streaming via `"stream": true`) |
+| `POST /v1/images/generations` | Bearer key | Image generation (§3.8) |
+| `POST /v1/audio/transcriptions` | Bearer key | Speech recognition (§3.9) |
+| `POST /v1/audio/translations` | Bearer key | Speech translated into English text (§3.9) |
+| `POST /v1/audio/speech` | Bearer key | Speech synthesis (§3.10) |
 | `POST /v1/completions` | Bearer key | Legacy text completions |
 | `GET /v1/me` | Bearer key | Account self-view: balance, pending spend, recent usage (§1.3) |
 | `GET /v1/register/message`, `POST /v1/register` | open | Wallet-signed registration (§1.1) |
@@ -175,7 +179,10 @@ curl https://openmodel.filfox.info/v1/chat/completions \
 `/models/Org--Name` and HF form `Org/Name` both work; the `"default"` alias
 returns 400). A model no worker currently serves returns 404. Supported
 parameters: `messages`, `max_tokens`, `temperature`, `top_p`, `stop`,
-`stream`, `n` (only `n=1`); `tools`/`functions` and `response_format` are not
+`stream`, `n` (only `n=1`), `seed`, `presence_penalty`, `frequency_penalty`
+and `response_format` (`json_object` or `json_schema` — the answer is then a
+JSON object, matching the schema if one is given); `max_completion_tokens` is
+accepted as another name for `max_tokens`. `tools`/`functions` are not
 supported. Reasoning models want `max_tokens` ≥ 256 (§7).
 
 ### 3.3 Streaming
@@ -280,17 +287,137 @@ interrupted streams resume mid-generation on another worker without the
 client noticing. If *every* provider is mining, requests queue briefly (503
 with `Retry-After` only if the wait exceeds the window).
 
+### 3.8 Image understanding, image generation, speech
+
+Besides text chat, the API serves three more kinds of model. Each model
+belongs to one kind; `GET /v1/models` tells you which (`modality`), which
+endpoint serves it (`endpoint`) and its billing unit (`price_unit`). Pick a
+model by kind rather than hard-coding one — the set changes as providers
+switch:
+
+```bash
+BASE=https://openmodel.filfox.info
+KEY=sk-om-YOURKEY
+curl -s "$BASE/v1/models" -H "Authorization: Bearer $KEY" \
+  | jq -r '.data[] | "\(.modality)\t\(.price_unit)\t\(.endpoint)\t\(.id)"'
+```
+
+**Image understanding** (`vision`) — ordinary chat with an image part in the
+message, as a base64 data URI:
+
+```bash
+MODEL=$(curl -s "$BASE/v1/models" -H "Authorization: Bearer $KEY" \
+  | jq -r '.data[] | select(.modality=="vision") | .id' | head -1)
+base64 < photo.png | tr -d '\n' > photo.b64
+jq -n --arg model "$MODEL" --rawfile img photo.b64 '{
+  model: $model, max_tokens: 64,
+  messages: [{role: "user", content: [
+    {type: "text", text: "Describe this picture in one sentence."},
+    {type: "image_url", image_url: {url: ("data:image/png;base64," + $img)}}
+  ]}]}' > vision.json
+curl -s "$BASE/v1/chat/completions" \
+  -H "Authorization: Bearer $KEY" -H "Content-Type: application/json" \
+  -d @vision.json | jq -r '.choices[0].message.content'
+```
+
+One image per request unless the model allows more
+(`max_images_per_request` in `/v1/catalog`); each image at most 10 MiB, and
+the whole request within the 10 MiB body cap.
+
+**Image generation** (`image`):
+
+```bash
+MODEL=$(curl -s "$BASE/v1/models" -H "Authorization: Bearer $KEY" \
+  | jq -r '.data[] | select(.modality=="image") | .id' | head -1)
+curl -s "$BASE/v1/images/generations" \
+  -H "Authorization: Bearer $KEY" -H "Content-Type: application/json" \
+  -d "{\"model\":\"$MODEL\",\"prompt\":\"a lighthouse on a cliff at dusk, watercolor\",\"size\":\"1024x1024\"}" \
+  | jq -r '.data[0].b64_json' | base64 --decode > image.png
+```
+
+`size` is `WxH` with each side a multiple of 8 from 256 to 1024, or `auto`
+(1024×1024); larger sizes such as `1792x1024` are scaled down to fit. `n`
+asks for several images (up to the model's `max_images_per_generation`);
+optional `steps` (the model's default when omitted), `guidance` and `seed`.
+Images come back as base64 PNG; `output_format` `jpeg` or `webp` changes the
+encoding, and `response_format: "url"` returns a link that is valid for one
+hour instead of the bytes.
+
+### 3.9 Speech recognition
+
+Upload the audio as multipart form data — **WAV, FLAC, MP3, OGG (Opus /
+Vorbis), WebM or M4A** (other formats are refused with 400; at most 25 MiB and
+the model's `max_audio_sec`):
+
+```bash
+MODEL=$(curl -s "$BASE/v1/models" -H "Authorization: Bearer $KEY" \
+  | jq -r '.data[] | select(.modality=="asr") | .id' | head -1)
+curl -s "$BASE/v1/audio/transcriptions" -H "Authorization: Bearer $KEY" \
+  -F model="$MODEL" -F file=@speech.wav
+```
+
+```json
+{"text": "Storage providers lend idle graphics cards to inference.", "language": "en", "duration": 4.05, "usage": {"type": "duration", "seconds": 5}}
+```
+
+Optional form fields: `language` (e.g. `en`; detected when omitted), `prompt`
+(text in the vocabulary of the speech — helps spell names), `temperature`,
+and `response_format`: `json` (default), `text`, `verbose_json` (timed
+segments), `srt` or `vtt` (subtitles). `POST /v1/audio/translations` takes the
+same fields and returns the speech translated into English; it bills the same
+seconds.
+
+### 3.10 Speech synthesis
+
+```bash
+MODEL=$(curl -s "$BASE/v1/models" -H "Authorization: Bearer $KEY" \
+  | jq -r '.data[] | select(.modality=="tts") | .id' | head -1)
+curl -s "$BASE/v1/audio/speech" \
+  -H "Authorization: Bearer $KEY" -H "Content-Type: application/json" \
+  -d "{\"model\":\"$MODEL\",\"input\":\"Storage providers lend idle graphics cards to inference.\"}" \
+  -o speech.wav
+```
+
+The response is a WAV file unless `response_format` asks for `mp3`, `opus`,
+`aac`, `flac` or `pcm`. `voice` selects one of the model's voices, or an
+OpenAI voice name (`alloy`, `nova`, `onyx`, …) mapped to a similar one
+(default when omitted); `speed` is 0.25–4.0; `input` may be up to the model's
+`max_chars`. The price depends only on the characters of `input`, not on the
+format.
+
+Field-by-field reference for all four endpoints: inference-api.md.
+
 ---
 
 ## 4. Billing: what you pay and when
 
-- **Pricing** is USD per million tokens, per model — read it from
-  `GET /v1/catalog`. Prompt and completion tokens both count.
+- **Units**: every model is billed in one unit, shown as `price_unit` in
+  `GET /v1/models` and `GET /v1/catalog`:
+
+  | Unit | Models | What is counted | Price field in `/v1/catalog` |
+  |---|---|---|---|
+  | `token` | text and image-understanding chat | prompt + completion tokens; an image in the prompt counts as the visual tokens it becomes (in `usage.prompt_tokens`) | `input_price_usd_per_1m`, `output_price_usd_per_1m`, `cache_read_price_usd_per_1m` (USD per 1,000,000 tokens) |
+  | `image` | image generation | images delivered (`usage.images`) | `unit_price_usd` per image |
+  | `audio_second` | speech recognition | input audio duration, **rounded up** to whole seconds, minimum 1 (`usage.seconds`: 4.05 s → 5) | `unit_price_usd` per second |
+  | `character` | speech synthesis | characters of `input`, counted as Unicode code points (each letter, space, punctuation mark or CJK character is 1) | `unit_price_usd` per character |
+
+  Cost of a non-token request = quantity × `unit_price_usd`. Prices change
+  with the deployment, so read them live:
+
+```bash
+curl -s https://openmodel.filfox.info/v1/catalog -H "Authorization: Bearer sk-om-YOURKEY" \
+  | jq '.fil_price_usd, (.data[] | {id, price_unit, unit_price_usd, input_price_usd_per_1m, output_price_usd_per_1m})'
+```
+
 - **Reservation**: before a request runs, its worst-case cost
   (`max_tokens` × price) is reserved against your balance; after it runs the
   reservation settles to actual usage. This is why `pending_usd` briefly
   exceeds the final cost, and why a tiny balance can 402 on a large
   `max_tokens` — lower `max_tokens` if you are running the balance down.
+  Image generation reserves `n` images and settles to the number delivered;
+  transcription and speech reserve the exact amount, which the gateway
+  measures from your request (audio duration, input characters) before
+  serving it.
 - **Thinking is billed as output**: with `enable_thinking` on, reasoning
   tokens count as completion tokens at the model's normal output rate — a
   thinking answer can cost several times a direct one.
@@ -310,10 +437,14 @@ with `Retry-After` only if the wait exceeds the window).
 
 You do not have to trust the operator's numbers.
 
-1. Every response carries `X-Request-ID`. Non-streaming responses also carry
-   `X-Om-Receipt` — a receipt for exactly your request, **signed by the worker
-   that served it** (ed25519). Streaming: send `X-OM-Receipt-Req: 1` and the
-   receipt arrives as a final `om_receipt` SSE event.
+1. Every response carries `X-Request-ID`. Non-streaming responses (chat,
+   image, audio) also carry `X-Om-Receipt` — a receipt for exactly your
+   request, **signed by the worker that served it** (ed25519). Streaming: send
+   `X-OM-Receipt-Req: 1` and the receipt arrives as a final `om_receipt` SSE
+   event. For image, audio and speech requests the receipt states the billed
+   `quantity` and an `asset_hash`: the sha256 of the image(s) or WAV you
+   received, or of the audio file you uploaded — compare it with
+   `shasum -a 256` of your file.
 2. Once its batch settles (≤ ~20 min), fetch the public inclusion proof —
    no auth, anyone can:
 
@@ -326,7 +457,7 @@ curl "https://openmodel.filfox.info/api/v1/receipt-proof/req-YOURREQUESTID"
 
 ```bash
 python3 verify-receipt.py https://openmodel.filfox.info req-YOURREQUESTID \
-  https://rpc.ankr.com/filecoin 0x60D41baEaBe1ABE061AE82c44425debc35bA524A
+  https://rpc.ankr.com/filecoin 0x29b994f63D91e447945a1cDeA2776167B7415c26
 ```
 
 (`verify-receipt.py` ships in the
@@ -337,8 +468,9 @@ worker attested about your request. Receipts contain hashes of your
 request/response, never the content itself.
 
 You can also read the network's totals straight from the contract:
-`cumulativeRequests()` / `cumulativeTokens()` on the Filfox "Read Contract"
-tab, and aggregate stats at `GET /api/v1/network-stats` (no auth).
+`cumulativeRequests()` and `cumulativeVolume(i)` (`i` = 0 tokens, 1 images,
+2 audio seconds, 3 characters) on the Filfox "Read Contract" tab, and
+aggregate stats at `GET /api/v1/network-stats` (no auth).
 
 ---
 
@@ -347,7 +479,7 @@ tab, and aggregate stats at `GET /api/v1/network-stats` (no auth).
 Deposits are yours; withdrawal is a two-step, time-locked flow (the delay is
 the operator's protection against spend-then-drain races — on the hosted
 deployment it is **3600 s / 1 hour**). All three functions are callable from
-the [Filfox contract page](https://filfox.info/en/address/0x60D41baEaBe1ABE061AE82c44425debc35bA524A)
+the [Filfox contract page](https://filfox.info/en/address/0x29b994f63D91e447945a1cDeA2776167B7415c26)
 ("Write Contract", connect the registered wallet) or from any EVM tooling.
 
 1. **Request**: `requestRefund(token, amount)` — `token` is
@@ -378,7 +510,7 @@ Worked example with ethers v6 (FIL, 0.05):
 
 ```js
 const { ethers } = require("ethers");
-const c = new ethers.Contract("0x60D41baEaBe1ABE061AE82c44425debc35bA524A", [
+const c = new ethers.Contract("0x29b994f63D91e447945a1cDeA2776167B7415c26", [
   "function requestRefund(address,uint256) returns (uint256)",
   "function claimRefund(uint256)",
   "event RefundRequested(uint256 indexed requestId, address indexed user, address indexed token, uint256 amount, uint256 claimableAt)",
@@ -404,9 +536,8 @@ missing. Keys are hashes server-side: nobody can look yours up, replace it
 
 **402 with money in the wallet** — three usual causes, in order of likelihood:
 (1) the reservation, not the balance, is short: lower `max_tokens`;
-(2) the deposit came from a different address than the registered wallet
-(exchange withdrawal straight to the contract — see §2.3; the credit went to
-the exchange's wallet);
+(2) the deposit came from a different address than the registered wallet —
+deposits are credited to the address that sends them;
 (3) a pending refund request marked the amount (§6): marked funds still back
 your usage during the window, but a large mark can make the *free* balance too
 small for new marks — spending is unaffected; `cancelRefund` clears it.
@@ -425,6 +556,24 @@ endpoints precisely so that one flaky endpoint cannot show you a fake zero.
 
 **404 unknown model** — the model is not currently served. Pick from
 `GET /v1/models`; the set changes as providers switch loads.
+
+**400 "… is an image-generation model; use /v1/images/generations"** (or a
+speech / image-understanding / text variant) — the model was sent to the
+wrong endpoint. `GET /v1/models` lists each model's `endpoint`.
+
+**400 "unsupported audio format: …"** — transcription accepts WAV, FLAC,
+MP3, OGG, WebM and M4A. Convert anything else first, e.g.
+`ffmpeg -i input.wma speech.mp3`.
+
+**400 "audio plays Xs but its container declares Ys"** — the file's header
+does not match its audio (a damaged or hand-edited file). Re-encode it, e.g.
+`ffmpeg -i input.m4a speech.mp3`.
+
+**400 "size must be "WxH" …"** — image sides must be multiples of 8 between
+256 and 1024 (or `auto`).
+
+**400 "unknown voice …"** — the message lists the voices the model has; the
+OpenAI voice names are accepted too.
 
 **409 on register** — the wallet already has an account; use `/v1/keys` for
 additional keys.
@@ -463,8 +612,10 @@ exactly as they are when thinking mode is on.
 ## 8. Privacy
 
 - Registration stores your wallet address and key hash — no email, no name.
-- Request logs keep token counts, hashes and routing metadata for billing;
-  receipts commit to `sha256(request)` / `sha256(response)`, never plaintext.
+- Request logs keep token counts or unit quantities, hashes and routing
+  metadata for billing; receipts commit to `sha256(request)` /
+  `sha256(response)` and, for images and audio, `sha256` of the asset — never
+  the content itself.
 - Public endpoints (`receipt-proof`, `sp-earnings-detail`, `network-stats`)
   expose aggregates and per-request billing facts, never your key, wallet
   balance, or content.

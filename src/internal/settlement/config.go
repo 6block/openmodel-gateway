@@ -12,14 +12,16 @@ type Config struct {
 	// first (backward compat); on a persistent transport failure the contract client
 	// rotates to the next healthy endpoint, so one flaky provider (a GLIF blip — the
 	// 24h soak was bitten by exactly this) no longer stalls settlement/balance refresh.
-	RPCURLs            []string          `yaml:"rpc_urls"`
-	ChainID            int64             `yaml:"chain_id"`
-	ContractAddress    string            `yaml:"contract_address"`
+	RPCURLs         []string `yaml:"rpc_urls"`
+	ChainID         int64    `yaml:"chain_id"`
+	ContractAddress string   `yaml:"contract_address"`
 	// ContractSchema selects the contract ABI generation: 2 = v1.2 and earlier
 	// (the default when unset — every existing deployment, mainnet included), 3 =
-	// v1.3+ (submitSettlement carries per-item request/token stats). Schema 3 is
-	// verified against the live contract at startup (SCHEMA_VERSION()).
-	ContractSchema int `yaml:"contract_schema"`
+	// v1.3 (submitSettlement carries per-item request/token stats), 4 = v1.4
+	// (per-item per-unit volume, so a network serving tokens and images reports each
+	// in its own counter). Schema 3 and 4 are verified against the live contract at
+	// startup (SCHEMA_VERSION()) so a mismatch dies loudly instead of at settle time.
+	ContractSchema     int               `yaml:"contract_schema"`
 	OperatorPrivateKey string            `yaml:"operator_private_key"`
 	IntervalMinutes    int               `yaml:"interval_minutes"`
 	MaxBatchSize       int               `yaml:"max_batch_size"`
@@ -100,11 +102,124 @@ type TokenConfig struct {
 // per 1M tokens. InputUSD / CacheReadUSD supplement ModelPricesUSD (the output
 // price); CacheReadUSD is the discounted rate for prompt tokens served from the
 // prefix cache. ContextWindow / MaxOutput are display-only for the catalog.
+//
+// Modality and PriceUnit describe what kind of model this is and what the price
+// is per. Both default to the text-model values ("text" / "token") so every
+// existing catalog entry keeps its meaning without edits. Image-understanding
+// models (Modality "vision") still bill per token: their image input is
+// tokenized into visual prompt tokens by the worker and reported in the same
+// prompt_tokens field, so the whole token pipeline applies unchanged.
 type ModelInfo struct {
 	InputUSD      string `yaml:"input"`
 	CacheReadUSD  string `yaml:"cache_read"`
 	ContextWindow int    `yaml:"context_window"`
 	MaxOutput     int    `yaml:"max_output"`
+	// UnitUSD is the price of ONE unit for a model billed in a non-token unit: one
+	// generated image, one second of audio. It is a separate field from InputUSD on
+	// purpose. InputUSD is "USD per 1M tokens" and is divided by 1e6 when parsed;
+	// reusing it here would mean an image price had to be written as "USD per 1,000,000
+	// images", and an operator writing the intuitive "2" for $2/image would underprice
+	// a thousand-fold. Required for a non-token unit, ignored for a token one.
+	UnitUSD string `yaml:"unit_usd"`
+	// Modality: "text" (default), "vision" (image understanding — chat with image
+	// parts), "image" (image generation), "asr" (speech-to-text), "tts"
+	// (text-to-speech). Grouping/display only; routing is by model id.
+	Modality string `yaml:"modality"`
+	// PriceUnit: "token" (default; prices are per 1M tokens), "image" (per
+	// generated image) or "audio_second" (per second of audio). A model is billed in
+	// exactly one unit, and this field — configuration — is what decides it.
+	PriceUnit PriceUnit `yaml:"price_unit"`
+	// MaxImagesPerRequest caps how many image parts a single chat request to a
+	// vision model may carry (0 = worker default). Display-only in the catalog
+	// today; a per-request clamp is the natural next consumer.
+	MaxImagesPerRequest int `yaml:"max_images_per_request"`
+	// MaxImagesPerGeneration caps how many images one image-generation request may
+	// ask for (0 = no declared cap). Named apart from MaxImagesPerRequest, which
+	// bounds image INPUT to a vision model; this bounds image OUTPUT from a
+	// generative one. Both are display-and-clamp values, not routing keys.
+	MaxImagesPerGeneration int `yaml:"max_images_per_generation"`
+	// MaxAudioSec caps the input audio one transcription request may carry, in whole
+	// seconds as billed (0 = unset). MaxChars caps the input text of one speech
+	// request, in Unicode code points (0 = unset). Each clamps its own unit only.
+	MaxAudioSec int `yaml:"max_audio_sec"`
+	MaxChars    int `yaml:"max_chars"`
+}
+
+// Recognised ModelInfo.Modality values.
+const (
+	ModalityText   = "text"
+	ModalityVision = "vision"
+	ModalityImage  = "image"
+	ModalityASR    = "asr"
+	ModalityTTS    = "tts"
+)
+
+// Recognised ModelInfo.PriceUnit values (see unit.go for the PriceUnit type).
+const (
+	PriceUnitToken       PriceUnit = "token"
+	PriceUnitImage       PriceUnit = "image"
+	PriceUnitAudioSecond PriceUnit = "audio_second"
+	// PriceUnitCharacter bills a text-to-speech request by the characters it was asked
+	// to speak (Unicode code points of the input), as OpenAI tts-1, ElevenLabs and
+	// Polly do. The gateway counts them itself from the request, so the quantity is
+	// first-hand and the client can know the price before sending.
+	PriceUnitCharacter PriceUnit = "character"
+)
+
+// Volume unit indices, matching the contract's UNIT_* constants (schema 4). These are
+// the ABI: they are what a caller indexes CumulativeVolumeByUnit by, and what goes on
+// the wire in submitSettlement's units column. Duplicated from the contract rather than
+// derived, because a mismatch must break loudly in a test rather than silently agree.
+const (
+	UnitToken = iota
+	UnitImage
+	UnitAudioSecond
+	UnitCharacter
+	UnitCount
+)
+
+// UnitIndex maps a PriceUnit to the contract's volume-unit index. An unrecognised unit
+// maps to -1 so a caller cannot silently file it under tokens.
+func UnitIndex(u PriceUnit) int {
+	switch EffectiveUnit(u) {
+	case PriceUnitToken:
+		return UnitToken
+	case PriceUnitImage:
+		return UnitImage
+	case PriceUnitAudioSecond:
+		return UnitAudioSecond
+	case PriceUnitCharacter:
+		return UnitCharacter
+	}
+	return -1
+}
+
+// EffectiveModality returns the modality with the text default applied.
+func (m ModelInfo) EffectiveModality() string {
+	if m.Modality == "" {
+		return ModalityText
+	}
+	return m.Modality
+}
+
+// EffectivePriceUnit returns the price unit with the token default applied.
+func (m ModelInfo) EffectivePriceUnit() PriceUnit {
+	return EffectiveUnit(m.PriceUnit)
+}
+
+// UnitFor reports the billing unit configured for a model, defaulting to token for a
+// model with no catalog entry or an entry that declares no unit. This is the single
+// place the rest of the code asks "what is this model priced in" — the answer always
+// comes from configuration, never from a request or a worker's attestation.
+func (c *Config) UnitFor(model string) PriceUnit {
+	if c == nil {
+		return PriceUnitToken
+	}
+	info, ok := c.ModelCatalog[model]
+	if !ok {
+		return PriceUnitToken
+	}
+	return info.EffectivePriceUnit()
 }
 
 func (c *Config) ApplyDefaults() {
@@ -219,6 +334,63 @@ func (c *Config) Validate() error {
 			if _, _, err := big.ParseFloat(v, 10, 128, big.ToNearestEven); err != nil {
 				return fmt.Errorf("settlement.model_catalog[%q].%s = %q is not a valid number", model, field, v)
 			}
+		}
+		// modality / price_unit are closed vocabularies: a typo ("vison") would
+		// silently fall back to text/token and mis-describe the model to every
+		// client reading the catalog.
+		switch info.Modality {
+		case "", ModalityText, ModalityVision, ModalityImage, ModalityASR, ModalityTTS:
+		default:
+			return fmt.Errorf("settlement.model_catalog[%q].modality = %q is not one of text|vision|image|asr|tts", model, info.Modality)
+		}
+		switch info.PriceUnit {
+		case "", PriceUnitToken, PriceUnitImage, PriceUnitAudioSecond, PriceUnitCharacter:
+		default:
+			return fmt.Errorf("settlement.model_catalog[%q].price_unit = %q is not one of token|image|audio_second|character", model, info.PriceUnit)
+		}
+		// A non-token unit is billable now, so instead of refusing it we require the
+		// pieces it needs. A per-image model with no per-unit price would bill
+		// quantity × nil = $0, and the reconciler would agree — an under-charge that
+		// never surfaces as drift. Refuse it at start-up instead.
+		if u := info.EffectivePriceUnit(); !u.IsToken() {
+			if _, ok := parsePerUnit(info.UnitUSD); !ok {
+				return fmt.Errorf("settlement.model_catalog[%q].unit_usd is required for price_unit %q (got %q)", model, u, info.UnitUSD)
+			}
+			// Unit and modality must describe the same kind of model. A mismatch
+			// (e.g. modality "image" priced per token) is a configuration mistake that
+			// would otherwise bill the model in a unit nobody intended.
+			wantModality := map[PriceUnit]string{
+				PriceUnitImage:       ModalityImage,
+				PriceUnitAudioSecond: "", // asr or tts — either is valid for per-second
+				PriceUnitCharacter:   ModalityTTS,
+			}
+			if want, ok := wantModality[u]; ok && want != "" && info.EffectiveModality() != want {
+				return fmt.Errorf("settlement.model_catalog[%q]: price_unit %q requires modality %q, got %q",
+					model, u, want, info.EffectiveModality())
+			}
+			if u == PriceUnitAudioSecond {
+				m := info.EffectiveModality()
+				if m != ModalityASR && m != ModalityTTS {
+					return fmt.Errorf("settlement.model_catalog[%q]: price_unit %q requires modality asr or tts, got %q",
+						model, u, m)
+				}
+			}
+		} else if info.UnitUSD != "" {
+			// The reverse mistake: a per-unit price on a token model is money the
+			// operator thinks they are charging but never will.
+			return fmt.Errorf("settlement.model_catalog[%q].unit_usd is set but price_unit is token; set price_unit to image, audio_second or character", model)
+		}
+		if info.MaxImagesPerRequest < 0 {
+			return fmt.Errorf("settlement.model_catalog[%q].max_images_per_request must be >= 0", model)
+		}
+		if info.MaxAudioSec < 0 {
+			return fmt.Errorf("settlement.model_catalog[%q].max_audio_sec must be >= 0", model)
+		}
+		if info.MaxChars < 0 {
+			return fmt.Errorf("settlement.model_catalog[%q].max_chars must be >= 0", model)
+		}
+		if info.MaxImagesPerGeneration < 0 {
+			return fmt.Errorf("settlement.model_catalog[%q].max_images_per_generation must be >= 0", model)
 		}
 	}
 	return nil

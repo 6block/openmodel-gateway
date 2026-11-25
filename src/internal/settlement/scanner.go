@@ -2,6 +2,8 @@ package settlement
 
 import (
 	"bufio"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"log/slog"
@@ -28,6 +30,11 @@ type RequestRecord struct {
 	// Receipt is the worker-signed attestation captured by the gateway (A1); only the
 	// fields the Merkle leaf needs are decoded here (extra JSON fields are ignored).
 	Receipt *RecordReceipt `json:"receipt,omitempty"`
+	// Quantity / AssetHash: the gateway's first-hand count and digest of the delivered
+	// asset (see gateway.RequestRecord). Absent on records written before they existed;
+	// quantityOf / assetHashOf then fall back to the receipt.
+	Quantity  int    `json:"quantity,omitempty"`
+	AssetHash string `json:"asset_hash,omitempty"`
 }
 
 // RecordReceipt mirrors the gateway's ReceiptInfo in FULL: the public receipt-proof
@@ -48,6 +55,11 @@ type RecordReceipt struct {
 	Sig              string `json:"sig"`
 	Verified         bool   `json:"verified"`
 	VerifyError      string `json:"verify_error,omitempty"`
+	// Quantity / AssetHash carry the asset-billed attestation (image, audio_second);
+	// absent for token models. Mirror of gateway.ReceiptInfo — every signed field must
+	// survive the ledger round-trip or external verifiers cannot rebuild the payload.
+	Quantity  int    `json:"quantity,omitempty"`
+	AssetHash string `json:"asset_hash,omitempty"`
 }
 
 type Cursor struct {
@@ -62,6 +74,40 @@ type Cursor struct {
 	// cursor / first run).
 	Inode uint64 `json:"inode,omitempty"`
 	Dev   uint64 `json:"dev,omitempty"`
+	// TailHash fingerprints the bytes just before Offset (up to tailHashLen). A
+	// new inode alone does not mean a rotation: copying or restoring the data
+	// directory (cp -a, rsync, a disk migration) gives the SAME log a new inode.
+	// Read as a rotation, the whole history was re-read from offset 0 and would
+	// have been billed a second time (seen in a disk drill: unsettled spend
+	// restored as $5.29 against an actual $0.001). Matching bytes = same file.
+	TailHash string `json:"tail_hash,omitempty"`
+}
+
+// tailHashLen bounds the fingerprint window: enough bytes to span several
+// request records, so two different logs cannot match by chance.
+const tailHashLen = 4096
+
+// tailHash returns the hex sha256 of the up-to-tailHashLen bytes before offset,
+// or "" when it cannot be read (offset 0, short file, I/O error).
+func tailHash(path string, offset int64) string {
+	if offset <= 0 {
+		return ""
+	}
+	start := offset - tailHashLen
+	if start < 0 {
+		start = 0
+	}
+	f, err := os.Open(path)
+	if err != nil {
+		return ""
+	}
+	defer f.Close()
+	buf := make([]byte, offset-start)
+	if _, err := f.ReadAt(buf, start); err != nil {
+		return ""
+	}
+	sum := sha256.Sum256(buf)
+	return hex.EncodeToString(sum[:])
 }
 
 type Scanner struct {
@@ -132,6 +178,13 @@ func (s *Scanner) Peek() (records []RequestRecord, oldCursor, newCursor Cursor, 
 	// covers inode reuse and platforms without inode support).
 	rotated := (idOK && oldCursor.Inode != 0 && mainIno != oldCursor.Inode) ||
 		(oldCursor.Offset > 0 && mainInfo.Size() < oldCursor.Offset)
+	if rotated && oldCursor.TailHash != "" && mainInfo.Size() >= oldCursor.Offset &&
+		tailHash(s.logPath, oldCursor.Offset) == oldCursor.TailHash {
+		// Same bytes up to the cursor: the log was moved or copied, not rotated.
+		s.logger.Info("request log has a new file identity but the same content up to the cursor; "+
+			"treating it as relocated, not rotated", "old_inode", oldCursor.Inode, "new_inode", mainIno)
+		rotated = false
+	}
 
 	var lastTS time.Time
 	if rotated {
@@ -217,7 +270,8 @@ func (s *Scanner) Peek() (records []RequestRecord, oldCursor, newCursor Cursor, 
 		if lastTS.IsZero() {
 			lastTS = oldCursor.LastTimestamp
 		}
-		newCursor = Cursor{Offset: end, LastTimestamp: lastTS, FileSize: mainInfo.Size(), Inode: mainIno, Dev: mainDev}
+		newCursor = Cursor{Offset: end, LastTimestamp: lastTS, FileSize: mainInfo.Size(), Inode: mainIno, Dev: mainDev,
+			TailHash: tailHash(s.logPath, end)}
 		return records, oldCursor, newCursor, nil
 	}
 
@@ -229,7 +283,8 @@ func (s *Scanner) Peek() (records []RequestRecord, oldCursor, newCursor Cursor, 
 	if ts.IsZero() {
 		ts = oldCursor.LastTimestamp
 	}
-	newCursor = Cursor{Offset: end, LastTimestamp: ts, FileSize: mainInfo.Size(), Inode: mainIno, Dev: mainDev}
+	newCursor = Cursor{Offset: end, LastTimestamp: ts, FileSize: mainInfo.Size(), Inode: mainIno, Dev: mainDev,
+		TailHash: tailHash(s.logPath, end)}
 	return recs, oldCursor, newCursor, nil
 }
 
@@ -279,11 +334,23 @@ func (s *Scanner) scanFrom(path string, startOffset int64) (records []RequestRec
 	return records, endOffset, lastTS, nil
 }
 
+// isBillable reports whether a record carries something to charge for.
+//
+// A record is billable when it produced usage in EITHER unit family: tokens for a
+// token model, or an attested quantity for an asset-billed one (image, audio_second).
+// The token test alone is not enough — an image generation returns no tokens, and
+// reading that as "no usage" would silently drop the request from billing entirely:
+// the reservation would be released in full and the request would never settle.
 func (s *Scanner) isBillable(rec RequestRecord) bool {
-	return rec.Status == 200 &&
-		rec.TotalTokens > 0 &&
-		rec.Wallet != "" &&
-		rec.ErrorReason == ""
+	if rec.Status != 200 || rec.Wallet == "" || rec.ErrorReason != "" {
+		return false
+	}
+	if rec.TotalTokens > 0 {
+		return true
+	}
+	// Asset-billed: a quantity attested by the worker is the billable amount. Whether
+	// the gateway actually priced it is a separate question, settled at billing time.
+	return quantityOf(rec) > 0
 }
 
 func (s *Scanner) loadCursor() (Cursor, error) {

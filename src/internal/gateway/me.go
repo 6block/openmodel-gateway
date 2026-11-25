@@ -42,8 +42,15 @@ type usageEntry struct {
 	Prompt     int       `json:"prompt_tokens"`
 	Cached     int       `json:"cached_tokens,omitempty"`
 	Completion int       `json:"completion_tokens"`
-	CostUSD    string    `json:"cost_usd,omitempty"`
-	RequestID  string    `json:"request_id"`
+	// Quantity/Unit are the billed amount for a per-unit model (image, audio_second,
+	// character), absent for token models — so a dashboard row can say "7 s" or
+	// "2 images" instead of "0+0 tok". Images repeats Quantity for image models only,
+	// for clients that read that field.
+	Quantity  int    `json:"quantity,omitempty"`
+	Unit      string `json:"unit,omitempty"`
+	Images    int    `json:"images,omitempty"`
+	CostUSD   string `json:"cost_usd,omitempty"`
+	RequestID string `json:"request_id"`
 }
 
 func newUsageRing(n int) *usageRing { return &usageRing{buf: make([]usageEntry, n)} }
@@ -89,9 +96,28 @@ func (g *Gateway) recordUsage(rec RequestRecord) {
 		Status: rec.Status, Prompt: rec.PromptTokens, Cached: rec.CachedTokens,
 		Completion: rec.CompletionTokens, RequestID: rec.RequestID,
 	}
-	if rec.Status == http.StatusOK && g.modelPrices != nil {
+	if rec.Status == http.StatusOK {
+		// The gateway's own count of what it delivered; the receipt only attests it.
+		assetQty := rec.Quantity
+		if assetQty == 0 && rec.Receipt != nil {
+			assetQty = rec.Receipt.Quantity
+		}
+		if assetQty > 0 {
+			unit := settlement.PriceUnitImage
+			if g.settlementCfg != nil {
+				unit = g.settlementCfg.UnitFor(rec.Model)
+			}
+			e.Quantity, e.Unit = assetQty, string(unit)
+			if unit == settlement.PriceUnitImage {
+				e.Images = assetQty
+			}
+		}
+		// Prices in the same unit settlement will: the per-unit price for an image
+		// (or audio) model, the token split otherwise. /v1/me is a dashboard view, but
+		// a divergent formula here is how the residue class of bug starts (#47).
 		cost := settlement.CostBreakdownUSD(rec.Model, rec.PromptTokens, rec.CompletionTokens,
-			rec.CachedTokens, rec.TotalTokens, g.modelPrices, g.catalogInput, g.catalogCacheRead)
+			rec.CachedTokens, rec.TotalTokens, g.prices.Output, g.prices.CatalogIn,
+			g.prices.CacheRead, g.prices.UnitPrice(rec.Model), assetQty)
 		if cost != nil && cost.Sign() > 0 {
 			e.CostUSD = cost.Text('f', 8)
 		}

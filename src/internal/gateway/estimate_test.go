@@ -40,3 +40,40 @@ func TestEstimatePromptTokens_LargePromptDominates(t *testing.T) {
 		t.Fatalf("large prompt should estimate ~10k tokens, got %d", est)
 	}
 }
+
+// Vision requests carry the image as billable visual prompt tokens. The estimator
+// must reserve for them (imagePromptTokenEstimate per image part) and must still
+// count the text parts of a multimodal content array; the text-only heuristic
+// used to see a non-string content and count nothing.
+func TestEstimatePromptTokens_MultimodalContent(t *testing.T) {
+	text := `{"messages":[{"role":"user","content":[{"type":"text","text":"aaaaaaaa"}]}]}`
+	if got := estimatePromptTokens([]byte(text)); got != 2 {
+		t.Fatalf("text-only array: want 2 (8 chars/4), got %d", got)
+	}
+	oneImage := `{"messages":[{"role":"user","content":[` +
+		`{"type":"text","text":"aaaaaaaa"},` +
+		`{"type":"image_url","image_url":{"url":"data:image/png;base64,AAAA"}}]}]}`
+	if got := estimatePromptTokens([]byte(oneImage)); got != 2+imagePromptTokenEstimate {
+		t.Fatalf("one image: want %d, got %d", 2+imagePromptTokenEstimate, got)
+	}
+	// The image payload itself must NOT be counted as text: a multi-megabyte data
+	// URI would otherwise inflate the reservation by ~250k tokens per MiB.
+	big := make([]byte, 100000)
+	for i := range big {
+		big[i] = 'A'
+	}
+	bigImage := `{"messages":[{"role":"user","content":[` +
+		`{"type":"image_url","image_url":{"url":"data:image/png;base64,` + string(big) + `"}}]}]}`
+	if got := estimatePromptTokens([]byte(bigImage)); got != imagePromptTokenEstimate {
+		t.Fatalf("payload bytes leaked into estimate: want %d, got %d", imagePromptTokenEstimate, got)
+	}
+	twoImages := `{"messages":[{"role":"user","content":[` +
+		`{"type":"image_url","image_url":{"url":"x"}},{"type":"image","url":"y"}]}]}`
+	if got := estimatePromptTokens([]byte(twoImages)); got != 2*imagePromptTokenEstimate {
+		t.Fatalf("two images (both spellings): want %d, got %d", 2*imagePromptTokenEstimate, got)
+	}
+	// Plain-string content is unchanged by the multimodal branch.
+	if got := estimatePromptTokens([]byte(`{"messages":[{"role":"user","content":"aaaaaaaa"}]}`)); got != 2 {
+		t.Fatalf("string content regression: want 2, got %d", got)
+	}
+}

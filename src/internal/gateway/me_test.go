@@ -11,6 +11,7 @@ import (
 	faddress "github.com/filecoin-project/go-address"
 
 	"openmodel/sp-state-agent/internal/settlement"
+	"openmodel/sp-state-agent/internal/worker"
 )
 
 func TestMeRequiresAuthAndReturnsUsage(t *testing.T) {
@@ -142,5 +143,183 @@ func TestWebConfigCarriesPerModelPricing(t *testing.T) {
 	}
 	if prem["input_per_mtok"] != "0.40" || prem["output_per_mtok"] != "1.20" || prem["cache_read_per_mtok"] != "0.10" {
 		t.Fatalf("premium pricing wrong: %v", prem)
+	}
+}
+
+// The chat UI decides BEFORE login whether it can accept an image upload, and how
+// large a prompt it may build, from this public payload alone: it has no key yet,
+// so /v1/catalog is out of reach. Losing `modality` would silently hide the attach
+// button on a vision model; losing context_window/max_output would let the UI stage
+// a prompt the worker must reject. Both halves are asserted here for that reason.
+func TestWebConfigCarriesVisionCapabilities(t *testing.T) {
+	g := webuiTestGateway(t)
+	g.settlementCfg.ModelPricesUSD = map[string]string{"default": "0.60"}
+	g.settlementCfg.ModelCatalog = map[string]settlement.ModelInfo{
+		"default": {InputUSD: "0.20", ContextWindow: 32768, MaxOutput: 4096},
+		"/models/Qwen--Qwen3-VL-8B-Instruct": {
+			InputUSD: "0.30", ContextWindow: 8192, MaxOutput: 4096,
+			Modality: settlement.ModalityVision, MaxImagesPerRequest: 1,
+		},
+	}
+	// The catalog only lists models the registry actually serves; register the VLM
+	// so resolveModels returns it (same as production, where a worker claims it).
+	g.registry.Register(worker.WorkerRegistration{
+		ID: "w-vlm", Endpoint: "http://127.0.0.1:8000", SchedulerURL: "http://127.0.0.1:9090",
+		GPUCount: 1, SelfRegistered: false,
+		SupportedModels: []string{"/models/Qwen--Qwen3-VL-8B-Instruct"},
+	})
+	g.registry.UpdateState("w-vlm", "GPU_STATE_AVAILABLE", "running", 0,
+		"/models/Qwen--Qwen3-VL-8B-Instruct", 1)
+
+	var m map[string]interface{}
+	_ = json.Unmarshal(getPath(g, "/v1/webconfig").Body.Bytes(), &m)
+	list, ok := m["models_pricing"].([]interface{})
+	if !ok {
+		t.Fatalf("models_pricing = %v", m["models_pricing"])
+	}
+	var vlm map[string]interface{}
+	for _, e := range list {
+		row := e.(map[string]interface{})
+		if row["id"] == "/models/Qwen--Qwen3-VL-8B-Instruct" {
+			vlm = row
+		}
+	}
+	if vlm == nil {
+		t.Fatalf("vision model missing from webconfig: %v", list)
+	}
+	if vlm["modality"] != settlement.ModalityVision {
+		t.Fatalf("modality = %v, want %q — the attach UI keys off this field",
+			vlm["modality"], settlement.ModalityVision)
+	}
+	if vlm["context_window"] != float64(8192) || vlm["max_output"] != float64(4096) {
+		t.Fatalf("budget fields wrong: context_window=%v max_output=%v",
+			vlm["context_window"], vlm["max_output"])
+	}
+	// The image cap is part of the same contract: absent means "no count limit",
+	// which is what the multi-image path relies on.
+	if vlm["max_images_per_request"] != float64(1) {
+		t.Fatalf("max_images_per_request = %v, want 1", vlm["max_images_per_request"])
+	}
+}
+
+// No configured image cap must mean the field is ABSENT, not zero. The UI reads
+// absence as "no count limit — bound by the context window", which is the shipped
+// multi-image behaviour; a literal 0 would read as "zero images allowed".
+func TestWebConfigOmitsImageCapWhenUnset(t *testing.T) {
+	g := webuiTestGateway(t)
+	g.settlementCfg.ModelPricesUSD = map[string]string{"default": "0.60"}
+	g.settlementCfg.ModelCatalog = map[string]settlement.ModelInfo{
+		"default": {InputUSD: "0.20", ContextWindow: 8192, MaxOutput: 4096},
+		"/models/Qwen--Qwen3-VL-8B-Instruct": {
+			InputUSD: "0.30", ContextWindow: 8192, MaxOutput: 4096,
+			Modality: settlement.ModalityVision, // MaxImagesPerRequest deliberately 0
+		},
+	}
+	g.registry.Register(worker.WorkerRegistration{
+		ID: "w-vlm2", Endpoint: "http://127.0.0.1:8000", SchedulerURL: "http://127.0.0.1:9090",
+		GPUCount: 1, SelfRegistered: false,
+		SupportedModels: []string{"/models/Qwen--Qwen3-VL-8B-Instruct"},
+	})
+	g.registry.UpdateState("w-vlm2", "GPU_STATE_AVAILABLE", "running", 0,
+		"/models/Qwen--Qwen3-VL-8B-Instruct", 1)
+
+	var m map[string]interface{}
+	_ = json.Unmarshal(getPath(g, "/v1/webconfig").Body.Bytes(), &m)
+	list := m["models_pricing"].([]interface{})
+	for _, e := range list {
+		row := e.(map[string]interface{})
+		if row["id"] != "/models/Qwen--Qwen3-VL-8B-Instruct" {
+			continue
+		}
+		if _, has := row["max_images_per_request"]; has {
+			t.Fatalf("unset cap must be omitted, got %v", row["max_images_per_request"])
+		}
+		if row["modality"] != settlement.ModalityVision {
+			t.Fatalf("modality = %v", row["modality"])
+		}
+		return
+	}
+	t.Fatal("vision model missing from webconfig")
+}
+
+// TestWebConfigCarriesImageGenPricing: an image-generation model is priced per IMAGE.
+// The pre-login UI must learn that from /v1/webconfig — otherwise it shows a per-token
+// price line for a model that is never billed by tokens, and sends the prompt to
+// chat/completions where the gateway refuses it.
+func TestWebConfigCarriesImageGenPricing(t *testing.T) {
+	g := webuiTestGateway(t)
+	g.settlementCfg.ModelPricesUSD = map[string]string{"default": "0.60"}
+	g.settlementCfg.ModelCatalog = map[string]settlement.ModelInfo{
+		"default": {InputUSD: "0.20", ContextWindow: 32768, MaxOutput: 4096},
+		"/models/stabilityai--stable-diffusion-xl-base-1.0": {
+			Modality: settlement.ModalityImage, PriceUnit: settlement.PriceUnitImage,
+			UnitUSD: "0.004", MaxImagesPerGeneration: 2,
+		},
+	}
+	g.registry.Register(worker.WorkerRegistration{
+		ID: "w-img", Endpoint: "http://127.0.0.1:8000", SchedulerURL: "http://127.0.0.1:9090",
+		GPUCount: 1, SupportedModels: []string{"/models/stabilityai--stable-diffusion-xl-base-1.0"},
+	})
+
+	var m map[string]interface{}
+	_ = json.Unmarshal(getPath(g, "/v1/webconfig").Body.Bytes(), &m)
+	rows := map[string]map[string]interface{}{}
+	for _, e := range m["models_pricing"].([]interface{}) {
+		row := e.(map[string]interface{})
+		rows[row["id"].(string)] = row
+	}
+	img := rows["/models/stabilityai--stable-diffusion-xl-base-1.0"]
+	if img == nil {
+		t.Fatalf("image model missing from webconfig: %v", rows)
+	}
+	if img["modality"] != settlement.ModalityImage || img["price_unit"] != string(settlement.PriceUnitImage) {
+		t.Fatalf("image model must advertise modality=image price_unit=image, got %v / %v",
+			img["modality"], img["price_unit"])
+	}
+	if img["unit_price_usd"] != "0.004" {
+		t.Fatalf("unit_price_usd = %v, want the configured \"0.004\"", img["unit_price_usd"])
+	}
+	if img["max_images_per_generation"] != float64(2) {
+		t.Fatalf("max_images_per_generation = %v, want 2", img["max_images_per_generation"])
+	}
+}
+
+// TestUsageEntryNamesTheUnit: a per-unit row carries its quantity WITH its unit. Before,
+// every per-unit quantity landed in "images", so a 7-second transcription read as
+// "7 img" on the dashboard.
+func TestUsageEntryNamesTheUnit(t *testing.T) {
+	g := webuiTestGateway(t)
+	g.settlementCfg.ModelCatalog = map[string]settlement.ModelInfo{
+		"/models/sdxl":    {Modality: settlement.ModalityImage, PriceUnit: settlement.PriceUnitImage, UnitUSD: "0.004"},
+		"/models/whisper": {Modality: settlement.ModalityASR, PriceUnit: settlement.PriceUnitAudioSecond, UnitUSD: "0.00003"},
+		"/models/kokoro":  {Modality: settlement.ModalityTTS, PriceUnit: settlement.PriceUnitCharacter, UnitUSD: "0.000001"},
+	}
+	g.usage = newUsageRing(8)
+	for _, r := range []struct {
+		model string
+		qty   int
+	}{{"/models/sdxl", 2}, {"/models/whisper", 7}, {"/models/kokoro", 67}, {"default", 0}} {
+		g.recordUsage(RequestRecord{RequestID: r.model, APIKeyName: "u", Timestamp: time.Now(),
+			Model: r.model, Status: 200, Quantity: r.qty, PromptTokens: 1, CompletionTokens: 1, TotalTokens: 2})
+	}
+	got := map[string]usageEntry{}
+	for _, e := range g.usage.lastByKey("u", 8) {
+		got[e.Model] = e
+	}
+	want := map[string]struct {
+		qty    int
+		unit   string
+		images int
+	}{
+		"/models/sdxl":    {2, "image", 2},
+		"/models/whisper": {7, "audio_second", 0},
+		"/models/kokoro":  {67, "character", 0},
+		"default":         {0, "", 0},
+	}
+	for m, w := range want {
+		e := got[m]
+		if e.Quantity != w.qty || e.Unit != w.unit || e.Images != w.images {
+			t.Errorf("%s: quantity/unit/images = %d/%q/%d, want %d/%q/%d", m, e.Quantity, e.Unit, e.Images, w.qty, w.unit, w.images)
+		}
 	}
 }

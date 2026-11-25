@@ -350,6 +350,83 @@ func (r *Registry) SetFeatures(id string, features []string, receiptPubkey strin
 	}
 }
 
+// SetLoadedModels records every model the worker currently has resident (multi-pool
+// workers report several). The primary LoadedModel is always included so callers can
+// iterate this list alone. An empty report (an older worker that only sends
+// loaded_model) degrades to just the primary.
+// SetPools records the per-model pool capacity and load of a multi-pool worker (nil
+// maps for a single-engine worker, which is then weighed by its GPUCount as before).
+func (r *Registry) SetPools(id string, capacity, active map[string]int, notReady map[string]bool) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if w, ok := r.workers[id]; ok {
+		w.PoolCapacity, w.PoolActive, w.PoolNotReady = capacity, active, notReady
+		// A pool-level switch is done once the target is resident AND its pool reports
+		// running. The worker names the target as its model the moment the switch
+		// starts (~45 s before it can serve); clearing on the name alone let the next
+		// request trigger a switch back while the first was still loading.
+		if len(w.SwitchingModels) > 0 {
+			for _, m := range w.LoadedModels {
+				if sameModelBasename(m, w.SwitchingTo) && !notReady[m] {
+					w.SwitchingTo, w.SwitchingSince, w.SwitchingModels = "", time.Time{}, nil
+					break
+				}
+			}
+		}
+	}
+}
+
+func (r *Registry) SetPoolGroups(id string, groups [][]string) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if w, ok := r.workers[id]; ok {
+		w.PoolGroups = groups
+	}
+}
+
+// poolGroupFor returns the pool group that would serve targetModel on w (it holds or
+// may switch to it), or nil when w is not multi-pool or no pool claims it.
+func poolGroupFor(w *Worker, targetModel string) []string {
+	for _, g := range w.PoolGroups {
+		for _, m := range g {
+			if sameModelBasename(m, targetModel) {
+				return g
+			}
+		}
+	}
+	return nil
+}
+
+func (r *Registry) SetModelLimits(id string, limits map[string]ModelLimit) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if w, ok := r.workers[id]; ok {
+		w.ModelLimits = limits
+	}
+}
+
+func (r *Registry) SetLoadedModels(id string, models []string) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	w, ok := r.workers[id]
+	if !ok {
+		return
+	}
+	out := make([]string, 0, len(models)+1)
+	seen := map[string]bool{}
+	add := func(m string) {
+		if m != "" && !seen[m] {
+			seen[m] = true
+			out = append(out, m)
+		}
+	}
+	add(w.LoadedModel)
+	for _, m := range models {
+		add(m)
+	}
+	w.LoadedModels = out
+}
+
 // SetUntilChange records the scheduler's state-duration estimate (B1 predictive
 // routing). Transient runtime state, refreshed each poll; never persisted.
 func (r *Registry) SetUntilChange(id string, seconds int64) {
@@ -390,9 +467,16 @@ func (r *Registry) UpdateState(id string, gpuState, engineState string, activeRe
 	// loaded (switch done), or the switch exceeds loadingTimeout (hung/failed).
 	if w.SwitchingTo != "" {
 		switch {
-		case sameModelBasename(loadedModel, w.SwitchingTo):
+		case len(w.SwitchingModels) == 0 && sameModelBasename(loadedModel, w.SwitchingTo):
 			w.SwitchingTo = ""
 			w.SwitchingSince = time.Time{}
+		case len(w.SwitchingModels) > 0:
+			// Pool-level switch: the worker stays routable; SetLoadedModels clears the
+			// mark once the target is resident, the timeout below if it never is.
+			if r.loadingTimeout > 0 && !w.SwitchingSince.IsZero() && now.Sub(w.SwitchingSince) > r.loadingTimeout {
+				r.logger.Warn("worker pool model switch exceeded timeout", "worker", id, "switching_to", w.SwitchingTo)
+				w.SwitchingTo, w.SwitchingSince, w.SwitchingModels = "", time.Time{}, nil
+			}
 		case r.loadingTimeout > 0 && !w.SwitchingSince.IsZero() && now.Sub(w.SwitchingSince) > r.loadingTimeout:
 			r.logger.Warn("worker model switch exceeded timeout, treating as offline",
 				"worker", id, "switching_to", w.SwitchingTo, "elapsed", now.Sub(w.SwitchingSince).String())
@@ -450,7 +534,42 @@ func (r *Registry) UpdateState(id string, gpuState, engineState string, activeRe
 // notices — but py-inference reports engine_state="running" throughout a switch,
 // so the poll never marks it loading, and requests pile onto the reloading engine
 // and hang until they time out. No-op if the worker already has the target model.
-func (r *Registry) MarkSwitching(id, targetModel string) {
+// MarkUnreachable takes a worker out of routing until its next successful poll, after
+// a request found it unable to serve (transport error, or its front answering 502/504:
+// the engine process is down). The poll marks it idle/busy again as soon as /health
+// answers; until then the gateway's request-retry and queue loops must not pick it.
+// Found in a soak test: after an inference crash every queued request was released
+// onto the dead worker each second for up to 300 s, because the poll still said idle.
+func (r *Registry) MarkUnreachable(id string) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if w, ok := r.workers[id]; ok && (w.State == StateIdle || w.State == StateBusy) {
+		w.State = StateOffline
+		r.logger.Warn("worker marked unreachable until its next good poll", "worker", id)
+	}
+}
+
+// MarkYielding takes a worker out of routing the moment it answers 503 because it
+// yielded its GPUs to mining, instead of waiting for the next health poll (up to one
+// poll interval). Until then the registry still showed it idle, so every queue wait
+// handed the request straight back to it: a non-streaming request bounced off the same
+// yielding worker ~30 times, and a stream resume spent its whole retry budget on it in
+// one second and gave up — though the worker was back a minute later. The next poll
+// restores the real state (mining while the scheduler says so, idle once it resumes).
+func (r *Registry) MarkYielding(id string) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if w, ok := r.workers[id]; ok && (w.State == StateIdle || w.State == StateBusy) {
+		w.State = StateMining
+		// The last poll's countdown was "seconds until the next yield", measured while
+		// servable. Read as a mining estimate it would claim recovery hours away and
+		// make queued requests give up at once; until the next poll it is unknown.
+		w.SecondsUntilChange = -1
+		r.logger.Info("worker answered 503 (yielding to mining) — out of routing until its next poll", "worker", id)
+	}
+}
+
+func (r *Registry) MarkSwitching(id, targetModel string, by ...string) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	w, ok := r.workers[id]
@@ -464,9 +583,46 @@ func (r *Registry) MarkSwitching(id, targetModel string) {
 		w.SwitchingTo = targetModel
 		w.SwitchingSince = time.Now()
 	}
+	w.SwitchingBy = ""
+	if len(by) > 0 {
+		w.SwitchingBy = by[0]
+	}
+	if g := poolGroupFor(w, targetModel); g != nil {
+		// Multi-pool worker: only the switching pool's models are unavailable.
+		w.SwitchingModels = g
+		r.logger.Info("worker pool marked switching — its models excluded from routing during the switch",
+			"worker", id, "switching_to", targetModel, "models", g)
+		return
+	}
 	w.State = StateLoading
 	r.logger.Info("worker marked switching — excluded from routing during model switch",
 		"worker", id, "switching_to", targetModel)
+}
+
+// EndSwitchBy clears a switch mark set by request requestID, now that it completed.
+//
+// The poll alone clears a mark only once it sees the target resident and its pool
+// running. A switch that failed (rolled back to the old model), or whose target was
+// replaced by another switch before a poll saw it, never shows that, and the mark held
+// every request for the pool until the 5-minute timeout (a test worker: an SDXL -> SSD-1B switch
+// failed and three image requests waited 300 s; a yield-interrupted switch waited 301 s).
+// A mark re-set by a later request belongs to that request and is left alone.
+func (r *Registry) EndSwitchBy(requestID string) {
+	if requestID == "" {
+		return
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	for id, w := range r.workers {
+		if w.SwitchingTo == "" || w.SwitchingBy != requestID {
+			continue
+		}
+		r.logger.Info("model switch request completed — switch mark cleared",
+			"worker", id, "switching_to", w.SwitchingTo, "request_id", requestID)
+		// A worker-level mark also forced "loading"; the next poll derives the real
+		// state. A pool still reloading is kept out by its own reported engine_state.
+		w.SwitchingTo, w.SwitchingSince, w.SwitchingModels, w.SwitchingBy = "", time.Time{}, nil, ""
+	}
 }
 
 // RecordPollFailure increments the consecutive failure counter.

@@ -132,14 +132,49 @@ func (g *Gateway) handleWebConfig(w http.ResponseWriter, r *http.Request) {
 		// prompt, output = completion; USD per 1M tokens). Public so the UI can show
 		// a pricing table and the current model's rate WITHOUT a key. Same resolver
 		// the authed catalog + biller use, so displayed prices match what is charged.
+		//
+		// modality / context_window / max_output ride along for the same reason: the
+		// pre-login UI needs them to know whether the selected model accepts image
+		// parts (modality == "vision") and how large an input it can take before it
+		// uploads anything — attaching images to a text model, or past the context
+		// window, is a request the gateway will reject, so the UI should not offer
+		// it. Field names mirror /v1/catalog so a client can reuse one parser.
 		models := g.resolveModels()
 		if len(models) > 0 {
 			mp := make([]map[string]interface{}, 0, len(models))
 			for _, m := range models {
-				mp = append(mp, map[string]interface{}{
+				entry := map[string]interface{}{
 					"id": m.ID, "input_per_mtok": m.Input, "output_per_mtok": m.Output,
 					"cache_read_per_mtok": m.CacheRead, "available": m.Available,
-				})
+					"modality":       m.Modality,
+					"context_window": m.ContextWindow, "max_output": m.MaxOutput,
+				}
+				if m.MaxImages > 0 {
+					entry["max_images_per_request"] = m.MaxImages
+				}
+				// Image-generation models are priced per image, not per token: the UI
+				// must show "$X / image" and route the prompt to /v1/images/generations.
+				// price_unit always rides along so a client never has to infer it;
+				// the per-unit price and the per-request cap only when they exist
+				// (absent, not 0, so "unset" never reads as "free" or "zero allowed").
+				entry["price_unit"] = m.PriceUnit
+				if !m.PriceUnit.IsToken() {
+					// Never billed by tokens: no token price to show (see /v1/catalog).
+					entry["input_per_mtok"], entry["output_per_mtok"], entry["cache_read_per_mtok"] = "", "", ""
+				}
+				if m.UnitUSD != "" {
+					entry["unit_price_usd"] = m.UnitUSD
+				}
+				if m.MaxGenImages > 0 {
+					entry["max_images_per_generation"] = m.MaxGenImages
+				}
+				if m.MaxAudioSec > 0 {
+					entry["max_audio_sec"] = m.MaxAudioSec
+				}
+				if m.MaxChars > 0 {
+					entry["max_chars"] = m.MaxChars
+				}
+				mp = append(mp, entry)
 			}
 			resp["models_pricing"] = mp
 		}

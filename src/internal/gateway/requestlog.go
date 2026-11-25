@@ -5,7 +5,10 @@ import (
 	"fmt"
 	"log/slog"
 	"os"
+	"path/filepath"
 	"sync"
+	"sync/atomic"
+	"syscall"
 	"time"
 
 	"openmodel/sp-state-agent/internal/metrics"
@@ -36,6 +39,13 @@ type RequestRecord struct {
 	// Settlement commits a Merkle root over receipts into the on-chain batch hash,
 	// so its presence here makes the ledger row user-verifiable end-to-end.
 	Receipt *ReceiptInfo `json:"receipt,omitempty"`
+	// Quantity / AssetHash are what the GATEWAY counted and hashed in the response it
+	// delivered, for an asset-billed model (image, audio_second). They are first-hand
+	// and present whether or not the worker sent a receipt — the receipt only ever
+	// attests them. Settlement bills from these, never from the receipt alone, so a
+	// worker that omits its receipt cannot make a delivered image settle as zero.
+	Quantity  int    `json:"quantity,omitempty"`
+	AssetHash string `json:"asset_hash,omitempty"`
 }
 
 // RequestLogger writes structured request records to a JSONL file.
@@ -52,6 +62,47 @@ type RequestLogger struct {
 	maxSize     int64 // rotation threshold; defaults to maxFileSize (overridable in tests)
 	maxBackups  int   // numbered backups kept (.1 … .maxBackups)
 	logger      *slog.Logger
+
+	// Ledger-space gate: a request whose record cannot be written is served but
+	// never billed. With the data disk full every request was answered 200 and
+	// dropped from billing — free service for as long as the disk stayed full.
+	// Writable() lets the entry points refuse billable work up front instead.
+	spaceCheckedAt atomic.Int64                            // unix nanos of the last free-space probe
+	spaceOK        atomic.Bool                             // last probe found room and no write has failed since
+	freeBytes      func(dir string) (uint64, error)        // injectable for tests
+	write          func(f *os.File, b []byte) (int, error) // nil = f.Write; tests inject short writes
+}
+
+// minLedgerFreeBytes is the free space below which billable requests are
+// refused: comfortably more than any burst of records written between probes.
+const minLedgerFreeBytes = 8 << 20
+
+// spaceProbeInterval bounds how often free space is queried (one statfs).
+const spaceProbeInterval = time.Second
+
+// Writable reports whether request records can currently be persisted: enough
+// free space on the log's filesystem and no write failure since space was last
+// confirmed. A nil logger (logging disabled) is always writable.
+func (rl *RequestLogger) Writable() bool {
+	if rl == nil {
+		return true
+	}
+	now := time.Now().UnixNano()
+	if last := rl.spaceCheckedAt.Load(); now-last >= int64(spaceProbeInterval) &&
+		rl.spaceCheckedAt.CompareAndSwap(last, now) {
+		free, err := rl.freeBytes(filepath.Dir(rl.path))
+		rl.spaceOK.Store(err != nil || free >= minLedgerFreeBytes) // unknown → do not block
+	}
+	return rl.spaceOK.Load()
+}
+
+// statfsFree returns the bytes available to unprivileged writers under dir.
+func statfsFree(dir string) (uint64, error) {
+	var st syscall.Statfs_t
+	if err := syscall.Statfs(dir, &st); err != nil {
+		return 0, err
+	}
+	return uint64(st.Bavail) * uint64(st.Bsize), nil
 }
 
 // maxFileSize is the default rotation threshold (50 MB).
@@ -82,14 +133,17 @@ func NewRequestLogger(path string, logger *slog.Logger) *RequestLogger {
 	}
 
 	logger.Info("request logging enabled", "path", path, "current_size_mb", size>>20)
-	return &RequestLogger{
+	rl := &RequestLogger{
 		file:        f,
 		path:        path,
 		currentSize: size,
 		maxSize:     maxFileSize,
 		maxBackups:  defaultMaxBackups,
 		logger:      logger,
+		freeBytes:   statfsFree,
 	}
+	rl.spaceOK.Store(true)
+	return rl
 }
 
 // Log writes a request record as a single JSON line.
@@ -109,10 +163,25 @@ func (rl *RequestLogger) Log(rec RequestRecord) {
 	defer rl.mu.Unlock()
 
 	data = append(data, '\n')
-	n, err := rl.file.Write(data)
+	write := rl.write
+	if write == nil {
+		write = (*os.File).Write
+	}
+	n, err := write(rl.file, data)
 	if err != nil {
+		// A short write (disk full mid-record) leaves half a line with no newline;
+		// the next record that does get written is appended onto it and the whole
+		// line fails to parse — that later, successfully served request was lost
+		// from billing too (seen in the disk drill). Cut the fragment off.
+		if n > 0 {
+			if terr := rl.file.Truncate(rl.currentSize); terr != nil {
+				rl.logger.Error("failed to truncate a partial request record — the next record may be lost",
+					"error", terr)
+			}
+		}
 		metrics.RequestLogWriteErrors.Inc()
 		rl.logger.Error("failed to write request record — request dropped from billing", "error", err)
+		rl.spaceOK.Store(false) // closed until a probe finds room again
 		return
 	}
 	rl.currentSize += int64(n)
